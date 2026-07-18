@@ -17,6 +17,8 @@ pub struct Checker<'a> {
     pub signatures: HashMap<String, Signature>,
     pub structs: HashMap<String, Vec<Param>>,
     pub enums: HashMap<String, Vec<EnumVariant>>,
+    /// Type parameters in scope (for generic functions/structs).
+    pub type_params: Vec<String>,
     diags: Vec<Diagnostic>,
     loop_depth: u32,
 }
@@ -77,6 +79,7 @@ impl<'a> Checker<'a> {
             signatures: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
+            type_params: Vec::new(),
             diags: Vec::new(),
             loop_depth: 0,
         }
@@ -304,6 +307,15 @@ impl<'a> Checker<'a> {
 
     fn validate_type(&mut self, ty: &Type, span: Span) {
         match ty {
+            Type::TypeVar(name) => {
+                // Type variables must be declared in the current scope
+                if !self.type_params.contains(name) {
+                    self.diags.push(
+                        Diagnostic::new("E018", format!("unknown type parameter '{}'", name), span)
+                            .with_help("type parameters must be declared in the function/struct/enum signature"),
+                    );
+                }
+            }
             Type::Struct(name) => {
                 if !self.structs.contains_key(name) && !self.enums.contains_key(name) {
                     self.diags.push(

@@ -1,4 +1,4 @@
-# The machino Language Specification (v0.4)
+# The machino Language Specification (v0.5)
 
 machino is an AI-first programming language. It is designed for code that is
 *written and verified by machines*: the syntax is small and canonical, the

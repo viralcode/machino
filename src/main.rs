@@ -3,10 +3,14 @@ mod checker;
 mod diag;
 mod interp;
 mod lexer;
+mod mono;
 mod parser;
 mod pkg;
+mod registry;
+mod smt;
 mod synth;
 mod wasm;
+mod wasmgc;
 
 use diag::{line_col, Diagnostic, Span};
 use std::path::{Path, PathBuf};

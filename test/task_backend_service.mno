@@ -1,0 +1,740 @@
+# A stateful HTTP backend service in machino.
+#
+# Features:
+# - task CRUD-style workflow over HTTP
+# - API-key protection for mutating routes
+# - audit log and metrics endpoints
+# - file persistence with percent-escaped records
+# - inline tests for parsing, routing, and round-trips
+#
+# Run:
+#   machino run test/task_backend_service.mno 8080 test/task_backend.db
+#
+# Example:
+#   curl http://localhost:8080/health
+#   curl -X POST "http://localhost:8080/tasks?title=Ship+v1&owner=alice&priority=2" -H "X-API-Key: dev-secret"
+#   curl http://localhost:8080/tasks
+#   curl -X POST "http://localhost:8080/tasks/1/start" -H "X-API-Key: dev-secret"
+#   curl -X POST "http://localhost:8080/tasks/1/assign?owner=bob" -H "X-API-Key: dev-secret"
+#   curl -X POST "http://localhost:8080/tasks/1/close" -H "X-API-Key: dev-secret"
+#   curl http://localhost:8080/metrics
+#   curl -X POST http://localhost:8080/admin/shutdown -H "X-API-Key: dev-secret"
+
+extern fn tcp_listen(port: int) -> int
+extern fn tcp_accept(listener: int) -> int
+extern fn tcp_read(conn: int) -> str
+extern fn tcp_write(conn: int, data: str) -> int
+extern fn tcp_close(handle: int)
+extern fn args() -> [str]
+extern fn getenv(name: str) -> str
+extern fn read_file(path: str) -> str
+extern fn write_file(path: str, data: str) -> bool
+extern fn file_exists(path: str) -> bool
+
+struct Task {
+    id: int
+    title: str
+    owner: str
+    status: str
+    priority: int
+}
+
+struct AuditEntry {
+    task_id: int
+    action: str
+    detail: str
+}
+
+struct Response {
+    status: str
+    content_type: str
+    body: str
+    should_stop: bool
+}
+
+struct AppState {
+    tasks: [Task]
+    audit: [AuditEntry]
+    next_id: int
+    request_count: int
+}
+
+fn empty_state() -> AppState {
+    let tasks: [Task] = []
+    let audit: [AuditEntry] = []
+    return AppState(tasks, audit, 1, 0)
+}
+
+fn response(status: str, content_type: str, body: str, should_stop: bool) -> Response {
+    return Response(status, content_type, body, should_stop)
+}
+
+fn json_error(status: str, message: str) -> Response {
+    return response(status, "application/json", "{\"error\":\"" + escape_json(message) + "\"}", false)
+}
+
+fn escape_json(s: str) -> str {
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn hex_value(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    return -1
+}
+
+fn decode_component(s: str) -> str {
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c == 43 {
+            out = out + " "
+            i = i + 1
+        } else if c == 37 && i + 2 < len(s) {
+            let hi = hex_value(char_at(s, i + 1))
+            let lo = hex_value(char_at(s, i + 2))
+            if hi >= 0 && lo >= 0 {
+                out = out + chr(hi * 16 + lo)
+                i = i + 3
+            } else {
+                out = out + chr(c)
+                i = i + 1
+            }
+        } else {
+            out = out + chr(c)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn encode_field(s: str) -> str {
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c == 37 {
+            out = out + "%25"
+        } else if c == 124 {
+            out = out + "%7C"
+        } else if c == 10 {
+            out = out + "%0A"
+        } else if c == 13 {
+            out = out + "%0D"
+        } else if c == 9 {
+            out = out + "%09"
+        } else if c == 43 {
+            out = out + "%2B"
+        } else {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn request_line(request: str) -> str {
+    return split(request, "\r\n")[0]
+}
+
+fn request_method(request: str) -> str {
+    let parts = split(request_line(request), " ")
+    if len(parts) == 0 {
+        return ""
+    }
+    return parts[0]
+}
+
+fn request_target(request: str) -> str {
+    let parts = split(request_line(request), " ")
+    if len(parts) < 2 {
+        return "/"
+    }
+    return parts[1]
+}
+
+fn target_path(target: str) -> str {
+    let pos = find(target, "?")
+    if pos == -1 {
+        return target
+    }
+    return substr(target, 0, pos)
+}
+
+fn target_query(target: str) -> str {
+    let pos = find(target, "?")
+    if pos == -1 {
+        return ""
+    }
+    return substr(target, pos + 1, len(target))
+}
+
+fn query_value(query: str, wanted: str) -> str {
+    if len(query) == 0 {
+        return ""
+    }
+    let pairs = split(query, "&")
+    for i in 0..len(pairs) {
+        let pair = pairs[i]
+        if len(pair) == 0 {
+            continue
+        }
+        let bits = split(pair, "=")
+        if len(bits) > 0 && bits[0] == wanted {
+            if len(bits) > 1 {
+                return decode_component(bits[1])
+            }
+            return ""
+        }
+    }
+    return ""
+}
+
+fn header_value(request: str, wanted: str) -> str {
+    let prefix = to_lower(wanted) + ":"
+    let lines = split(request, "\r\n")
+    for i in 0..len(lines) {
+        let line = lines[i]
+        if starts_with(to_lower(line), prefix) {
+            return trim(substr(line, len(prefix), len(line)))
+        }
+    }
+    return ""
+}
+
+fn is_authorized(request: str, api_key: str) -> bool {
+    return header_value(request, "x-api-key") == api_key
+}
+
+fn append_audit(state: AppState, task_id: int, action: str, detail: str) {
+    state.audit = push(state.audit, AuditEntry(task_id, action, detail))
+}
+
+fn find_task_index(tasks: [Task], task_id: int) -> int {
+    for i in 0..len(tasks) {
+        if tasks[i].id == task_id {
+            return i
+        }
+    }
+    return -1
+}
+
+fn create_task(state: AppState, title: str, owner: str, priority: int) -> Task {
+    let clean_title = trim(title)
+    let clean_owner = trim(owner)
+    let final_owner = clean_owner
+    if len(final_owner) == 0 {
+        final_owner = "unassigned"
+    }
+    let task = Task(state.next_id, clean_title, final_owner, "open", priority)
+    state.tasks = push(state.tasks, task)
+    state.next_id = state.next_id + 1
+    append_audit(state, task.id, "create", "created for " + final_owner)
+    return task
+}
+
+fn set_task_owner(state: AppState, task_id: int, owner: str) -> bool {
+    let idx = find_task_index(state.tasks, task_id)
+    if idx == -1 {
+        return false
+    }
+    let task = state.tasks[idx]
+    task.owner = trim(owner)
+    if len(task.owner) == 0 {
+        task.owner = "unassigned"
+    }
+    append_audit(state, task_id, "assign", "owner=" + task.owner)
+    return true
+}
+
+fn set_task_status(state: AppState, task_id: int, status: str) -> bool {
+    let idx = find_task_index(state.tasks, task_id)
+    if idx == -1 {
+        return false
+    }
+    let task = state.tasks[idx]
+    task.status = status
+    append_audit(state, task_id, "status", "status=" + status)
+    return true
+}
+
+fn count_status(tasks: [Task], status: str) -> int {
+    let count = 0
+    for i in 0..len(tasks) {
+        if tasks[i].status == status {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+fn task_json(task: Task) -> str {
+    return ("{\"id\":" + str_of_int(task.id)
+        + ",\"title\":\"" + escape_json(task.title) + "\""
+        + ",\"owner\":\"" + escape_json(task.owner) + "\""
+        + ",\"status\":\"" + escape_json(task.status) + "\""
+        + ",\"priority\":" + str_of_int(task.priority)
+        + "}")
+}
+
+fn tasks_json(tasks: [Task]) -> str {
+    let out = "["
+    for i in 0..len(tasks) {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + task_json(tasks[i])
+    }
+    out = out + "]"
+    return out
+}
+
+fn audit_json(entries: [AuditEntry]) -> str {
+    let out = "["
+    for i in 0..len(entries) {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + ("{\"task_id\":" + str_of_int(entries[i].task_id)
+            + ",\"action\":\"" + escape_json(entries[i].action) + "\""
+            + ",\"detail\":\"" + escape_json(entries[i].detail) + "\"}")
+    }
+    out = out + "]"
+    return out
+}
+
+fn metrics_json(state: AppState) -> str {
+    return ("{\"requests\":" + str_of_int(state.request_count)
+        + ",\"tasks_total\":" + str_of_int(len(state.tasks))
+        + ",\"tasks_open\":" + str_of_int(count_status(state.tasks, "open"))
+        + ",\"tasks_in_progress\":" + str_of_int(count_status(state.tasks, "in_progress"))
+        + ",\"tasks_done\":" + str_of_int(count_status(state.tasks, "done"))
+        + ",\"audit_entries\":" + str_of_int(len(state.audit))
+        + "}")
+}
+
+fn serialize_state(state: AppState) -> str {
+    let out = "META|" + str_of_int(state.next_id) + "|" + str_of_int(state.request_count) + "\n"
+    for i in 0..len(state.tasks) {
+        let task = state.tasks[i]
+        out = out + ("TASK|"
+            + str_of_int(task.id) + "|"
+            + str_of_int(task.priority) + "|"
+            + encode_field(task.status) + "|"
+            + encode_field(task.owner) + "|"
+            + encode_field(task.title) + "\n")
+    }
+    for i in 0..len(state.audit) {
+        let entry = state.audit[i]
+        out = out + ("AUDIT|"
+            + str_of_int(entry.task_id) + "|"
+            + encode_field(entry.action) + "|"
+            + encode_field(entry.detail) + "\n")
+    }
+    return out
+}
+
+fn parse_state_text(data: str) -> AppState {
+    let state = empty_state()
+    if len(data) == 0 {
+        return state
+    }
+    let lines = split(data, "\n")
+    for i in 0..len(lines) {
+        let line = lines[i]
+        if len(line) == 0 {
+            continue
+        }
+        let parts = split(line, "|")
+        if len(parts) == 0 {
+            continue
+        }
+        if parts[0] == "META" {
+            if len(parts) >= 3 && is_int_str(parts[1]) && is_int_str(parts[2]) {
+                state.next_id = parse_int(parts[1])
+                state.request_count = parse_int(parts[2])
+            }
+        } else if parts[0] == "TASK" {
+            if len(parts) >= 6 && is_int_str(parts[1]) && is_int_str(parts[2]) {
+                state.tasks = push(
+                    state.tasks,
+                    Task(
+                        parse_int(parts[1]),
+                        decode_component(parts[5]),
+                        decode_component(parts[4]),
+                        decode_component(parts[3]),
+                        parse_int(parts[2])
+                    )
+                )
+            }
+        } else if parts[0] == "AUDIT" {
+            if len(parts) >= 4 && is_int_str(parts[1]) {
+                state.audit = push(
+                    state.audit,
+                    AuditEntry(parse_int(parts[1]), decode_component(parts[2]), decode_component(parts[3]))
+                )
+            }
+        }
+    }
+    return state
+}
+
+fn load_state(path: str) -> AppState {
+    if !file_exists(path) {
+        return empty_state()
+    }
+    return parse_state_text(read_file(path))
+}
+
+fn save_state(path: str, state: AppState) -> bool {
+    return write_file(path, serialize_state(state))
+}
+
+fn route_docs() -> str {
+    return ("{\"service\":\"task-backend\","
+        + "\"routes\":["
+        + "\"GET /health\","
+        + "\"GET /metrics\","
+        + "\"GET /tasks\","
+        + "\"GET /tasks/{id}\","
+        + "\"GET /audit\","
+        + "\"POST /tasks?title=...&owner=...&priority=...\","
+        + "\"POST /tasks/{id}/assign?owner=...\","
+        + "\"POST /tasks/{id}/start\","
+        + "\"POST /tasks/{id}/close\","
+        + "\"POST /tasks/{id}/reopen\","
+        + "\"POST /admin/save\","
+        + "\"POST /admin/load\","
+        + "\"POST /admin/shutdown\""
+        + "]}")
+}
+
+fn task_not_found(task_id: int) -> Response {
+    return json_error("404 Not Found", "task " + str_of_int(task_id) + " was not found")
+}
+
+fn unauthorized() -> Response {
+    return json_error("401 Unauthorized", "missing or invalid x-api-key header")
+}
+
+fn handle_request(state: AppState, request: str, storage_path: str, api_key: str) -> Response {
+    state.request_count = state.request_count + 1
+
+    let method = request_method(request)
+    let target = request_target(request)
+    let path = target_path(target)
+    let query = target_query(target)
+
+    if method == "GET" && path == "/" {
+        return response("200 OK", "application/json", route_docs(), false)
+    }
+    if method == "GET" && path == "/health" {
+        return response("200 OK", "application/json", "{\"ok\":true,\"service\":\"task-backend\"}", false)
+    }
+    if method == "GET" && path == "/metrics" {
+        return response("200 OK", "application/json", metrics_json(state), false)
+    }
+    if method == "GET" && path == "/tasks" {
+        return response("200 OK", "application/json", tasks_json(state.tasks), false)
+    }
+    if method == "GET" && path == "/audit" {
+        return response("200 OK", "application/json", audit_json(state.audit), false)
+    }
+    if method == "POST" && path == "/tasks" {
+        if !is_authorized(request, api_key) {
+            return unauthorized()
+        }
+        let title = query_value(query, "title")
+        if len(trim(title)) == 0 {
+            return json_error("400 Bad Request", "title is required")
+        }
+        let owner = query_value(query, "owner")
+        let priority = 3
+        let raw_priority = query_value(query, "priority")
+        if len(raw_priority) > 0 {
+            if !is_int_str(raw_priority) {
+                return json_error("400 Bad Request", "priority must be an int")
+            }
+            priority = parse_int(raw_priority)
+        }
+        let task = create_task(state, title, owner, priority)
+        return response("201 Created", "application/json", task_json(task), false)
+    }
+
+    if starts_with(path, "/tasks/") {
+        let rest = substr(path, 7, len(path))
+        let parts = split(rest, "/")
+        if len(parts) == 0 || !is_int_str(parts[0]) {
+            return json_error("400 Bad Request", "expected /tasks/{id}")
+        }
+        let task_id = parse_int(parts[0])
+
+        if len(parts) == 1 && method == "GET" {
+            let idx = find_task_index(state.tasks, task_id)
+            if idx == -1 {
+                return task_not_found(task_id)
+            }
+            return response("200 OK", "application/json", task_json(state.tasks[idx]), false)
+        }
+
+        if len(parts) != 2 || method != "POST" {
+            return json_error("404 Not Found", "unknown task route")
+        }
+        if !is_authorized(request, api_key) {
+            return unauthorized()
+        }
+
+        if parts[1] == "assign" {
+            let owner = query_value(query, "owner")
+            if len(trim(owner)) == 0 {
+                return json_error("400 Bad Request", "owner is required")
+            }
+            if !set_task_owner(state, task_id, owner) {
+                return task_not_found(task_id)
+            }
+            let idx = find_task_index(state.tasks, task_id)
+            return response("200 OK", "application/json", task_json(state.tasks[idx]), false)
+        }
+        if parts[1] == "start" {
+            if !set_task_status(state, task_id, "in_progress") {
+                return task_not_found(task_id)
+            }
+            let idx = find_task_index(state.tasks, task_id)
+            return response("200 OK", "application/json", task_json(state.tasks[idx]), false)
+        }
+        if parts[1] == "close" {
+            if !set_task_status(state, task_id, "done") {
+                return task_not_found(task_id)
+            }
+            let idx = find_task_index(state.tasks, task_id)
+            return response("200 OK", "application/json", task_json(state.tasks[idx]), false)
+        }
+        if parts[1] == "reopen" {
+            if !set_task_status(state, task_id, "open") {
+                return task_not_found(task_id)
+            }
+            let idx = find_task_index(state.tasks, task_id)
+            return response("200 OK", "application/json", task_json(state.tasks[idx]), false)
+        }
+        return json_error("404 Not Found", "unknown task route")
+    }
+
+    if method == "POST" && path == "/admin/save" {
+        if !is_authorized(request, api_key) {
+            return unauthorized()
+        }
+        if save_state(storage_path, state) {
+            append_audit(state, 0, "save", "saved to " + storage_path)
+            return response("200 OK", "application/json", "{\"saved\":true}", false)
+        }
+        return json_error("500 Internal Server Error", "write_file returned false")
+    }
+
+    if method == "POST" && path == "/admin/load" {
+        if !is_authorized(request, api_key) {
+            return unauthorized()
+        }
+        let loaded = load_state(storage_path)
+        state.tasks = loaded.tasks
+        state.audit = loaded.audit
+        state.next_id = loaded.next_id
+        state.request_count = loaded.request_count
+        append_audit(state, 0, "load", "loaded from " + storage_path)
+        return response("200 OK", "application/json", "{\"loaded\":true}", false)
+    }
+
+    if method == "POST" && path == "/admin/shutdown" {
+        if !is_authorized(request, api_key) {
+            return unauthorized()
+        }
+        let saved = save_state(storage_path, state)
+        append_audit(state, 0, "shutdown", "saved=" + str_of_bool(saved))
+        return response(
+            "200 OK",
+            "application/json",
+            "{\"stopping\":true,\"saved\":" + str_of_bool(saved) + "}",
+            true
+        )
+    }
+
+    return json_error("404 Not Found", "route not found")
+}
+
+fn write_response(conn: int, r: Response) {
+    let payload = ("HTTP/1.1 " + r.status + "\r\n"
+        + "Content-Type: " + r.content_type + "\r\n"
+        + "Content-Length: " + str_of_int(len(r.body)) + "\r\n"
+        + "Connection: close\r\n"
+        + "\r\n"
+        + r.body)
+    tcp_write(conn, payload)
+}
+
+fn fake_request(method: str, target: str, api_key: str) -> str {
+    let req = method + " " + target + " HTTP/1.1\r\nHost: test\r\n"
+    if len(api_key) == 0 {
+        return req + "\r\n"
+    }
+    return req + "X-API-Key: " + api_key + "\r\n\r\n"
+}
+
+fn main() {
+    let argv = args()
+    let port = 8080
+    let storage_path = "test/task_backend.db"
+    if len(argv) > 0 && is_int_str(argv[0]) {
+        port = parse_int(argv[0])
+    }
+    if len(argv) > 1 {
+        storage_path = argv[1]
+    }
+
+    let api_key = getenv("MACHINO_API_KEY")
+    if len(api_key) == 0 {
+        api_key = "dev-secret"
+    }
+
+    let state = load_state(storage_path)
+    append_audit(state, 0, "boot", "listening on port " + str_of_int(port))
+
+    let listener = tcp_listen(port)
+    print("task backend listening on http://localhost:" + str_of_int(port))
+    print("storage: " + storage_path)
+    print("api key: " + api_key)
+
+    let running = true
+    while running {
+        let conn = tcp_accept(listener)
+        let request = tcp_read(conn)
+        let r = handle_request(state, request, storage_path, api_key)
+        write_response(conn, r)
+        tcp_close(conn)
+        if r.should_stop {
+            running = false
+        }
+    }
+
+    save_state(storage_path, state)
+    tcp_close(listener)
+    print("task backend stopped after " + str_of_int(state.request_count) + " requests")
+}
+
+test "decode query components" {
+    assert decode_component("Ship+v1%21") == "Ship v1!"
+    assert decode_component("alice%2Bops") == "alice+ops"
+}
+
+test "handler enforces auth for writes" {
+    let state = empty_state()
+    let r = handle_request(state, fake_request("POST", "/tasks?title=Nope", ""), "ignored.db", "secret")
+    assert r.status == "401 Unauthorized"
+    assert len(state.tasks) == 0
+}
+
+test "task lifecycle through handler" {
+    let state = empty_state()
+
+    let created = handle_request(
+        state,
+        fake_request("POST", "/tasks?title=Fix+login&owner=alice&priority=2", "secret"),
+        "ignored.db",
+        "secret"
+    )
+    assert created.status == "201 Created"
+    assert len(state.tasks) == 1
+    let t1 = state.tasks[0]
+    assert t1.title == "Fix login"
+    assert t1.owner == "alice"
+    assert t1.status == "open"
+    assert t1.priority == 2
+
+    let assigned = handle_request(
+        state,
+        fake_request("POST", "/tasks/1/assign?owner=bob", "secret"),
+        "ignored.db",
+        "secret"
+    )
+    assert assigned.status == "200 OK"
+    let t2 = state.tasks[0]
+    assert t2.owner == "bob"
+
+    let started = handle_request(
+        state,
+        fake_request("POST", "/tasks/1/start", "secret"),
+        "ignored.db",
+        "secret"
+    )
+    assert started.status == "200 OK"
+    let t3 = state.tasks[0]
+    assert t3.status == "in_progress"
+
+    let closed = handle_request(
+        state,
+        fake_request("POST", "/tasks/1/close", "secret"),
+        "ignored.db",
+        "secret"
+    )
+    assert closed.status == "200 OK"
+    let t4 = state.tasks[0]
+    assert t4.status == "done"
+
+    let listed = handle_request(state, fake_request("GET", "/tasks", ""), "ignored.db", "secret")
+    assert contains(listed.body, "\"title\":\"Fix login\"")
+    assert contains(listed.body, "\"status\":\"done\"")
+}
+
+test "state round trip keeps tasks and audit" {
+    let state = empty_state()
+    let task = create_task(state, "Deploy\nv1", "alice+ops", 1)
+    assert task.id == 1
+    assert set_task_status(state, 1, "done")
+    let dump = serialize_state(state)
+    let loaded = parse_state_text(dump)
+
+    assert loaded.next_id == 2
+    assert len(loaded.tasks) == 1
+    assert len(loaded.audit) == 2
+
+    let task2 = loaded.tasks[0]
+    assert task2.title == "Deploy\nv1"
+    assert task2.owner == "alice+ops"
+    assert task2.status == "done"
+}
+
+test "metrics reflect current state" {
+    let state = empty_state()
+    create_task(state, "one", "a", 1)
+    create_task(state, "two", "b", 2)
+    assert set_task_status(state, 2, "in_progress")
+    let body = metrics_json(state)
+    assert contains(body, "\"tasks_total\":2")
+    assert contains(body, "\"tasks_open\":1")
+    assert contains(body, "\"tasks_in_progress\":1")
+}

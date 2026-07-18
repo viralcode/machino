@@ -1,11 +1,22 @@
 [package]
 name = "machino"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "An AI-first programming language that compiles to WebAssembly"
 license = "MIT"
 
 [dependencies]
+# SHA-256 for package content hashing
+sha2 = "0.10"
+# HTTP client for package registry
+ureq = { version = "2.9", optional = true }
+# Z3 SMT solver for contract verification
+z3 = { version = "0.12", optional = true }
+
+[features]
+default = []
+smt = ["z3"]
+registry = ["ureq"]
 
 [profile.release]
 opt-level = 3

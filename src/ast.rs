@@ -2,7 +2,7 @@
 
 use crate::diag::Span;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Int,
     Float,
@@ -15,6 +15,8 @@ pub enum Type {
     Enum(String),
     /// A function value type: fn(params) -> ret.
     Fn(Vec<Type>, Box<Type>),
+    /// A type parameter (e.g., T in fn<T>).
+    TypeVar(String),
     /// Only valid as a function return type.
     Unit,
 }
@@ -29,6 +31,7 @@ impl std::fmt::Display for Type {
             Type::Array(inner) => write!(f, "[{}]", inner),
             Type::Struct(name) => write!(f, "{}", name),
             Type::Enum(name) => write!(f, "{}", name),
+            Type::TypeVar(name) => write!(f, "{}", name),
             Type::Fn(params, ret) => {
                 write!(f, "fn(")?;
                 for (i, p) in params.iter().enumerate() {
@@ -341,6 +344,8 @@ pub struct Contract {
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
+    /// Generic type parameters (e.g., ["T", "U"] for fn<T, U>).
+    pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Type,
     pub requires: Vec<Contract>,
@@ -355,6 +360,8 @@ pub struct Function {
 #[derive(Debug, Clone)]
 pub struct StructDef {
     pub name: String,
+    /// Generic type parameters (e.g., ["T"] for struct<T>).
+    pub type_params: Vec<String>,
     pub fields: Vec<Param>,
     pub is_std: bool,
     pub span: Span,
@@ -363,6 +370,8 @@ pub struct StructDef {
 #[derive(Debug, Clone)]
 pub struct EnumDef {
     pub name: String,
+    /// Generic type parameters (e.g., ["T"] for enum<T>).
+    pub type_params: Vec<String>,
     pub variants: Vec<EnumVariant>,
     pub is_std: bool,
     pub span: Span,

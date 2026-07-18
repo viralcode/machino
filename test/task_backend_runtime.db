@@ -1,0 +1,5 @@
+META|2|5
+TASK|1|2|open|alice|Ship v1
+AUDIT|0|boot|listening on port 8091
+AUDIT|1|create|created for alice
+AUDIT|0|shutdown|saved=true

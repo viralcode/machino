@@ -147,6 +147,20 @@ impl<'a> Parser<'a> {
     fn parse_struct(&mut self) -> PResult<StructDef> {
         let struct_tok = self.expect(Tok::Struct, "'struct'")?;
         let name = self.parse_ident("struct name")?;
+        
+        // Parse optional type parameters: struct<T, U>
+        let mut type_params = Vec::new();
+        if self.eat(&Tok::Lt) {
+            loop {
+                let tparam = self.parse_ident("type parameter")?;
+                type_params.push(tparam);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::Gt, "'>' after type parameters")?;
+        }
+        
         self.skip_newlines();
         self.expect(Tok::LBrace, "'{' to open struct body")?;
         let mut fields = Vec::new();
@@ -178,6 +192,7 @@ impl<'a> Parser<'a> {
         }
         Ok(StructDef {
             name,
+            type_params,
             fields,
             is_std: false,
             span: struct_tok.span.merge(end),
@@ -187,6 +202,20 @@ impl<'a> Parser<'a> {
     fn parse_enum(&mut self) -> PResult<EnumDef> {
         let enum_tok = self.expect(Tok::Enum, "'enum'")?;
         let name = self.parse_ident("enum name")?;
+        
+        // Parse optional type parameters: enum<T>
+        let mut type_params = Vec::new();
+        if self.eat(&Tok::Lt) {
+            loop {
+                let tparam = self.parse_ident("type parameter")?;
+                type_params.push(tparam);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::Gt, "'>' after type parameters")?;
+        }
+        
         self.skip_newlines();
         self.expect(Tok::LBrace, "'{' to open enum body")?;
         let mut variants = Vec::new();
@@ -223,6 +252,7 @@ impl<'a> Parser<'a> {
         }
         Ok(EnumDef {
             name,
+            type_params,
             variants,
             is_std: false,
             span: enum_tok.span.merge(end),
@@ -232,6 +262,20 @@ impl<'a> Parser<'a> {
     fn parse_function(&mut self, is_extern: bool) -> PResult<Function> {
         let fn_tok = self.expect(Tok::Fn, "'fn'")?;
         let name = self.parse_ident("function name")?;
+        
+        // Parse optional type parameters: fn<T, U>
+        let mut type_params = Vec::new();
+        if self.eat(&Tok::Lt) {
+            loop {
+                let tparam = self.parse_ident("type parameter")?;
+                type_params.push(tparam);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::Gt, "'>' after type parameters")?;
+        }
+        
         self.expect(Tok::LParen, "'(' after function name")?;
         let mut params = Vec::new();
         if !matches!(self.peek(), Tok::RParen) {
@@ -286,6 +330,7 @@ impl<'a> Parser<'a> {
             let end = self.peek_span();
             return Ok(Function {
                 name,
+                type_params,
                 params,
                 ret,
                 requires,
@@ -301,6 +346,7 @@ impl<'a> Parser<'a> {
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         Ok(Function {
             name,
+            type_params,
             params,
             ret,
             requires,

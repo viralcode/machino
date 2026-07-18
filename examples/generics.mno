@@ -1,0 +1,12 @@
+# Example demonstrating generic functions (partial implementation)
+
+fn identity<T>(x: T) -> T {
+    return x
+}
+
+fn main() {
+    let a = identity(42)
+    let b = identity("hello")
+    print(a)
+    print(b)
+}

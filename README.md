@@ -150,9 +150,17 @@ Full details in [SPEC.md](SPEC.md).
 
 ## Status and roadmap
 
-This is **v0.4** — a real, working end-to-end system, intentionally small enough to hold in a model's context window: capturing closures, a garbage collector in every compiled binary, a package system, and **enums with exhaustive pattern matching**, all covered by wasm-vs-interpreter equivalence tests (including a GC stress test that churns gigabytes under a 1 GiB memory cap). Honest limits, documented in the spec: no generics yet, enum variants carry at most one payload, structs cap at 60 fields, and compiled-module memory tops out at 1 GiB.
+This is **v0.5** — a comprehensive system with capturing closures, garbage collection, package management, **enums with pattern matching**, and experimental support for **generics**, **SMT verification**, **WASM-GC backend**, and an **HTTP-based package registry**. All covered by wasm-vs-interpreter equivalence tests.
 
-Planned for v0.5+: generics, a WASM-GC-proposal backend, static contract verification (SMT) for a decidable subset, and a package registry.
+**New in v0.5:**
+- Generic function/struct/enum syntax (monomorphization in progress)
+- SMT-based contract verification using Z3 (optional `smt` feature)
+- WASM-GC backend using reference types (experimental)
+- Package registry with SHA-256 content hashing and HTTP client
+
+Honest limits: generics are syntactically supported but full type inference is still in development, SMT verification works for int/bool contracts, WASM-GC requires newer runtimes, structs cap at 60 fields, compiled memory tops out at 1 GiB.
+
+Planned for v0.6+: complete generics with full type inference, expanded SMT decidable subset, mature WASM-GC backend, public registry service.
 
 ## License
 
