@@ -150,6 +150,10 @@ impl FnBuilder {
         self.op(0x02);
         self.op(BLOCK_VOID);
     }
+    fn block_typed(&mut self, vt: u8) {
+        self.op(0x02);
+        self.op(vt);
+    }
     fn loop_void(&mut self) {
         self.op(0x03);
         self.op(BLOCK_VOID);
@@ -453,6 +457,7 @@ pub struct WasmCompiler<'a> {
     signatures: HashMap<&'a str, (Vec<Type>, Type)>,
     struct_fields: HashMap<&'a str, &'a [Param]>,
     struct_bitmap: HashMap<&'a str, u64>,
+    enum_variants: HashMap<&'a str, &'a [EnumVariant]>,
     types: Vec<Vec<u8>>,
     type_index: HashMap<Vec<u8>, u32>,
     data: Vec<u8>,
@@ -543,6 +548,9 @@ fn can_gc(expr: &Expr) -> bool {
         ExprKind::Field(a, _) => can_gc(a),
         ExprKind::Bin(_, a, b) => can_gc(a) || can_gc(b),
         ExprKind::Un(_, a) => can_gc(a),
+        ExprKind::Match(m) => {
+            can_gc(&m.scrutinee) || m.arms.iter().any(|arm| can_gc(&arm.body))
+        }
         _ => false,
     }
 }
@@ -645,6 +653,12 @@ fn collect_fn_names<'e>(expr: &'e Expr, out: &mut Vec<&'e str>) {
             }
         }
         ExprKind::Lambda(l) => collect_fn_names_stmts(&l.body, out),
+        ExprKind::Match(m) => {
+            collect_fn_names(&m.scrutinee, out);
+            for arm in &m.arms {
+                collect_fn_names(&arm.body, out);
+            }
+        }
         _ => {}
     }
 }
@@ -718,6 +732,12 @@ fn collect_lambdas<'e>(expr: &'e Expr, out: &mut BTreeMap<usize, &'e Lambda>) {
             out.insert(l.id, l);
             collect_lambdas_stmts(&l.body, out);
         }
+        ExprKind::Match(m) => {
+            collect_lambdas(&m.scrutinee, out);
+            for arm in &m.arms {
+                collect_lambdas(&arm.body, out);
+            }
+        }
         _ => {}
     }
 }
@@ -730,6 +750,7 @@ impl<'a> WasmCompiler<'a> {
             signatures: HashMap::new(),
             struct_fields: HashMap::new(),
             struct_bitmap: HashMap::new(),
+            enum_variants: HashMap::new(),
             types: Vec::new(),
             type_index: HashMap::new(),
             data: Vec::new(),
@@ -853,6 +874,9 @@ impl<'a> WasmCompiler<'a> {
                 }
             }
             self.struct_bitmap.insert(s.name.as_str(), bm);
+        }
+        for e in &self.program.enums {
+            self.enum_variants.insert(e.name.as_str(), &e.variants);
         }
 
         let reachable = reachable_functions(self.program);
@@ -2825,6 +2849,44 @@ impl<'a> WasmCompiler<'a> {
             ExprKind::Var(name) => {
                 if let Some((idx, _)) = lookup(scope, name) {
                     ctx.b.local_get(idx);
+                } else if let Some(colon_pos) = name.find("::") {
+                    // enum variant without payload (Enum::Variant)
+                    let enum_name = &name[..colon_pos];
+                    let variant_name = &name[colon_pos + 2..];
+                    if let Some(variants) = self.enum_variants.get(enum_name) {
+                        let variant_idx = variants
+                            .iter()
+                            .position(|v| v.name == variant_name)
+                            .expect("variant exists (checked)");
+                        
+                        // allocate enum object: header + tag + unused payload
+                        ctx.b.i64_const(HDR + 16);
+                        ctx.b.call(self.h_alloc);
+                        let tmp = ctx.b.new_local(VT_I64);
+                        ctx.b.local_tee(tmp);
+                        
+                        // write header
+                        ctx.b.local_get(tmp);
+                        ctx.b.i32_wrap_i64();
+                        ctx.b.i64_const(2 << 4 | TAG_STRUCT);
+                        ctx.b.i64_store(0);
+                        ctx.b.local_get(tmp);
+                        ctx.b.i32_wrap_i64();
+                        ctx.b.i64_const(0); // bitmap: no pointers
+                        ctx.b.i64_store(8);
+                        
+                        // write tag
+                        ctx.b.local_get(tmp);
+                        ctx.b.i32_wrap_i64();
+                        ctx.b.i64_const(variant_idx as i64);
+                        ctx.b.i64_store(HDR as u32);
+                        
+                        ctx.b.local_get(tmp);
+                    } else {
+                        // a bare function name: its static singleton closure
+                        let addr = self.singleton_addrs[name.as_str()];
+                        ctx.b.i64_const(addr as i64);
+                    }
                 } else {
                     // a bare function name: its static singleton closure
                     let addr = self.singleton_addrs[name.as_str()];
@@ -2965,6 +3027,154 @@ impl<'a> WasmCompiler<'a> {
                     }
                 }
                 ctx.b.local_get(tmp);
+            }
+            ExprKind::Match(m) => {
+                // Compile match expression as nested if-else
+                self.expr(ctx, scope, &m.scrutinee, None);
+                let scrut_ty = self.type_of(&m.scrutinee, scope);
+                let scrut_local = ctx.b.new_local(valtype(&scrut_ty));
+                ctx.b.local_set(scrut_local);
+                
+                let result_ty = expected.cloned().or_else(|| {
+                    m.arms.first().map(|arm| self.type_of(&arm.body, scope))
+                }).unwrap_or(Type::Unit);
+                
+                // Generate nested if-else for each arm
+                let mut opened_ifs = 0;
+                for (arm_idx, arm) in m.arms.iter().enumerate() {
+                    let is_last = arm_idx == m.arms.len() - 1;
+                    let has_check = !matches!(arm.pattern, Pattern::Wildcard | Pattern::Var(_));
+                    
+                    if has_check && !is_last {
+                        // Generate pattern check
+                        self.compile_pattern_check(ctx, scope, &arm.pattern, scrut_local, &scrut_ty);
+                        
+                        if result_ty == Type::Unit {
+                            ctx.b.if_void();
+                        } else {
+                            ctx.b.if_typed(valtype(&result_ty));
+                        }
+                        ctx.nesting += 1;
+                        opened_ifs += 1;
+                    }
+                    
+                    // Bind pattern variables and evaluate body
+                    let mut arm_scope = scope.clone();
+                    arm_scope.push(HashMap::new());
+                    self.bind_pattern_vars(ctx, &mut arm_scope, &arm.pattern, scrut_local, &scrut_ty);
+                    self.expr(ctx, &arm_scope, &arm.body, Some(&result_ty));
+                    
+                    if has_check && !is_last {
+                        ctx.b.else_();
+                    }
+                }
+                
+                // Close all opened if blocks
+                for _ in 0..opened_ifs {
+                    ctx.nesting -= 1;
+                    ctx.b.end();
+                }
+            }
+        }
+    }
+
+    /// Compile a pattern check, leaving an i32 (0 or 1) on the stack.
+    fn compile_pattern_check(
+        &mut self,
+        ctx: &mut FnCtx,
+        _scope: &Scope,
+        pattern: &Pattern,
+        scrut_local: u32,
+        _scrut_ty: &Type,
+    ) {
+        match pattern {
+            Pattern::Wildcard | Pattern::Var(_) => {
+                // Always matches
+                ctx.b.i32_const(1);
+            }
+            Pattern::Int(v) => {
+                ctx.b.local_get(scrut_local);
+                ctx.b.i64_const(*v);
+                ctx.b.i64_eq();
+            }
+            Pattern::Bool(v) => {
+                ctx.b.local_get(scrut_local);
+                ctx.b.i64_const(if *v { 1 } else { 0 });
+                ctx.b.i64_eq();
+            }
+            Pattern::Str(s) => {
+                ctx.b.local_get(scrut_local);
+                let addr = self.intern(s);
+                ctx.b.i64_const(addr as i64);
+                ctx.b.call(self.h_str_eq);
+                ctx.b.i64_const(1);
+                ctx.b.i64_eq();
+            }
+            Pattern::Variant(enum_name, variant_name) | Pattern::VariantPayload(enum_name, variant_name, _) => {
+                let variants = self.enum_variants[enum_name.as_str()];
+                let variant_idx = variants
+                    .iter()
+                    .position(|v| v.name == *variant_name)
+                    .expect("variant exists");
+                
+                // Check tag
+                ctx.b.local_get(scrut_local);
+                ctx.b.i32_wrap_i64();
+                ctx.b.i64_load(HDR as u32);
+                ctx.b.i64_const(variant_idx as i64);
+                ctx.b.i64_eq();
+            }
+        }
+    }
+
+    /// Bind pattern variables to the scope
+    fn bind_pattern_vars(
+        &mut self,
+        ctx: &mut FnCtx,
+        scope: &mut Scope,
+        pattern: &Pattern,
+        scrut_local: u32,
+        scrut_ty: &Type,
+    ) {
+        match pattern {
+            Pattern::Wildcard => {
+                // No bindings
+            }
+            Pattern::Var(name) => {
+                // Bind the whole scrutinee
+                let idx = ctx.b.new_local(valtype(scrut_ty));
+                ctx.b.local_get(scrut_local);
+                ctx.b.local_set(idx);
+                scope.last_mut().unwrap().insert(name.clone(), (idx, scrut_ty.clone()));
+            }
+            Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => {
+                // No bindings
+            }
+            Pattern::Variant(_, _) => {
+                // Unit variant, no bindings
+            }
+            Pattern::VariantPayload(enum_name, variant_name, inner) => {
+                let variants = self.enum_variants[enum_name.as_str()];
+                let variant = variants
+                    .iter()
+                    .find(|v| v.name == *variant_name)
+                    .expect("variant exists");
+                
+                if let Some(ref payload_ty) = variant.payload {
+                    // Extract payload from enum object
+                    let payload_local = ctx.b.new_local(valtype(payload_ty));
+                    ctx.b.local_get(scrut_local);
+                    ctx.b.i32_wrap_i64();
+                    if *payload_ty == Type::Float {
+                        ctx.b.f64_load(HDR as u32 + 8);
+                    } else {
+                        ctx.b.i64_load(HDR as u32 + 8);
+                    }
+                    ctx.b.local_set(payload_local);
+                    
+                    // Recursively bind inner pattern
+                    self.bind_pattern_vars(ctx, scope, inner, payload_local, payload_ty);
+                }
             }
         }
     }
@@ -3185,6 +3395,63 @@ impl<'a> WasmCompiler<'a> {
                 ctx.b.call(self.h_chr);
             }
             _ => {
+                // check if this is an enum variant constructor (Enum::Variant)
+                if let Some(colon_pos) = name.find("::") {
+                    let enum_name = &name[..colon_pos];
+                    let variant_name = &name[colon_pos + 2..];
+                    if let Some(variants) = self.enum_variants.get(enum_name) {
+                        let variant_idx = variants
+                            .iter()
+                            .position(|v| v.name == variant_name)
+                            .expect("variant exists (checked)");
+                        let variant = &variants[variant_idx];
+                        
+                        // allocate enum object: header + tag + payload
+                        ctx.b.i64_const(HDR + 16);
+                        ctx.b.call(self.h_alloc);
+                        let tmp = ctx.b.new_local(VT_I64);
+                        ctx.b.local_tee(tmp);
+                        let root = ctx.alloc_temp();
+                        self.frame_store(ctx, root);
+                        
+                        // write header: count=2 (tag+payload), tag=STRUCT
+                        // bitmap: bit 0 = 1 if payload is pointer
+                        let bitmap = if variant.payload.as_ref().map(is_ptr).unwrap_or(false) {
+                            1i64
+                        } else {
+                            0i64
+                        };
+                        ctx.b.local_get(tmp);
+                        ctx.b.i32_wrap_i64();
+                        ctx.b.i64_const(2 << 4 | TAG_STRUCT);
+                        ctx.b.i64_store(0);
+                        ctx.b.local_get(tmp);
+                        ctx.b.i32_wrap_i64();
+                        ctx.b.i64_const(bitmap);
+                        ctx.b.i64_store(8);
+                        
+                        // write tag
+                        ctx.b.local_get(tmp);
+                        ctx.b.i32_wrap_i64();
+                        ctx.b.i64_const(variant_idx as i64);
+                        ctx.b.i64_store(HDR as u32);
+                        
+                        // write payload
+                        if let Some(ref payload_ty) = variant.payload {
+                            ctx.b.local_get(tmp);
+                            ctx.b.i32_wrap_i64();
+                            self.expr(ctx, scope, &args[0], Some(payload_ty));
+                            if *payload_ty == Type::Float {
+                                ctx.b.f64_store(HDR as u32 + 8);
+                            } else {
+                                ctx.b.i64_store(HDR as u32 + 8);
+                            }
+                        }
+                        
+                        ctx.b.local_get(tmp);
+                        return;
+                    }
+                }
                 // struct constructor
                 if let Some(fields) = self.struct_fields.get(name).map(|f| f.to_vec()) {
                     let bitmap = self.struct_bitmap[name] as i64;
@@ -3239,6 +3506,12 @@ impl<'a> WasmCompiler<'a> {
             ExprKind::Var(name) => match lookup(scope, name) {
                 Some((_, t)) => t,
                 None => {
+                    if let Some(colon_pos) = name.find("::") {
+                        let enum_name = &name[..colon_pos];
+                        if self.enum_variants.contains_key(enum_name) {
+                            return Type::Enum(enum_name.to_string());
+                        }
+                    }
                     let (params, ret) = self.signatures[name.as_str()].clone();
                     Type::Fn(params, Box::new(ret))
                 }
@@ -3285,12 +3558,27 @@ impl<'a> WasmCompiler<'a> {
                         _ => Type::Array(Box::new(Type::Int)),
                     },
                     other => {
+                        if let Some(colon_pos) = other.find("::") {
+                            let enum_name = &other[..colon_pos];
+                            if self.enum_variants.contains_key(enum_name) {
+                                return Type::Enum(enum_name.to_string());
+                            }
+                        }
                         if self.struct_fields.contains_key(other) {
                             Type::Struct(other.to_string())
                         } else {
                             self.signatures[other].1.clone()
                         }
                     }
+                }
+            }
+            ExprKind::Match(m) => {
+                // match expression type is the type of the first arm body
+                // (checker ensures all arms have the same type)
+                if let Some(arm) = m.arms.first() {
+                    self.type_of(&arm.body, scope)
+                } else {
+                    Type::Unit
                 }
             }
         }

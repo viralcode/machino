@@ -87,6 +87,7 @@ impl<'a> Parser<'a> {
     pub fn parse_program(&mut self) -> PResult<Program> {
         let mut functions = Vec::new();
         let mut structs = Vec::new();
+        let mut enums = Vec::new();
         let mut tests = Vec::new();
         let mut imports = Vec::new();
         loop {
@@ -99,6 +100,7 @@ impl<'a> Parser<'a> {
                     functions.push(self.parse_function(true)?);
                 }
                 Tok::Struct => structs.push(self.parse_struct()?),
+                Tok::Enum => enums.push(self.parse_enum()?),
                 Tok::Test => tests.push(self.parse_test()?),
                 Tok::Import => {
                     let tok = self.advance();
@@ -136,6 +138,7 @@ impl<'a> Parser<'a> {
         Ok(Program {
             functions,
             structs,
+            enums,
             tests,
             imports,
         })
@@ -178,6 +181,51 @@ impl<'a> Parser<'a> {
             fields,
             is_std: false,
             span: struct_tok.span.merge(end),
+        })
+    }
+
+    fn parse_enum(&mut self) -> PResult<EnumDef> {
+        let enum_tok = self.expect(Tok::Enum, "'enum'")?;
+        let name = self.parse_ident("enum name")?;
+        self.skip_newlines();
+        self.expect(Tok::LBrace, "'{' to open enum body")?;
+        let mut variants = Vec::new();
+        loop {
+            self.skip_newlines();
+            if matches!(self.peek(), Tok::RBrace) {
+                self.advance();
+                break;
+            }
+            let vspan = self.peek_span();
+            let vname = self.parse_ident("variant name")?;
+            let payload = if self.eat(&Tok::LParen) {
+                let ty = self.parse_type()?;
+                self.expect(Tok::RParen, "')' after variant payload type")?;
+                Some(ty)
+            } else {
+                None
+            };
+            variants.push(EnumVariant {
+                name: vname,
+                payload,
+                span: vspan,
+            });
+            self.expect_stmt_end()?;
+        }
+        let end = self.tokens[self.pos.saturating_sub(1)].span;
+        if variants.is_empty() {
+            return Err(Diagnostic::new(
+                "E051",
+                format!("enum '{}' has no variants", name),
+                enum_tok.span.merge(end),
+            )
+            .with_help("declare at least one variant: enum Option { None }")); 
+        }
+        Ok(EnumDef {
+            name,
+            variants,
+            is_std: false,
+            span: enum_tok.span.merge(end),
         })
     }
 
@@ -485,6 +533,16 @@ impl<'a> Parser<'a> {
                     span,
                 })
             }
+            Tok::Match => {
+                // Parse match as an expression statement
+                let expr = self.parse_expr()?;
+                let span = start.merge(expr.span);
+                self.expect_stmt_end()?;
+                Ok(Stmt {
+                    kind: StmtKind::Expr(expr),
+                    span,
+                })
+            }
             other => Err(Diagnostic::new(
                 "E016",
                 format!("expected a statement, found {}", describe(&other)),
@@ -501,6 +559,39 @@ impl<'a> Parser<'a> {
             t => Err(Diagnostic::new(
                 "E017",
                 format!("expected {}, found {}", what, describe(&t.tok)),
+                t.span,
+            )),
+        }
+    }
+
+    fn parse_pattern(&mut self) -> PResult<Pattern> {
+        let t = self.advance();
+        match t.tok {
+            Tok::Ident(ref name) if name == "_" => Ok(Pattern::Wildcard),
+            Tok::Ident(name) => {
+                // could be: variable binding, or Enum::Variant
+                if self.eat(&Tok::Colon) && self.eat(&Tok::Colon) {
+                    // Enum::Variant or Enum::Variant(pat)
+                    let variant = self.parse_ident("variant name")?;
+                    if self.eat(&Tok::LParen) {
+                        let inner = Box::new(self.parse_pattern()?);
+                        self.expect(Tok::RParen, "')' after variant payload pattern")?;
+                        Ok(Pattern::VariantPayload(name, variant, inner))
+                    } else {
+                        Ok(Pattern::Variant(name, variant))
+                    }
+                } else {
+                    // variable binding
+                    Ok(Pattern::Var(name))
+                }
+            }
+            Tok::Int(v) => Ok(Pattern::Int(v)),
+            Tok::True => Ok(Pattern::Bool(true)),
+            Tok::False => Ok(Pattern::Bool(false)),
+            Tok::Str(s) => Ok(Pattern::Str(s)),
+            other => Err(Diagnostic::new(
+                "E053",
+                format!("expected a pattern, found {}", describe(&other)),
                 t.span,
             )),
         }
@@ -737,7 +828,12 @@ impl<'a> Parser<'a> {
                 kind: ExprKind::Bool(false),
                 span,
             }),
-            Tok::Ident(name) => {
+            Tok::Ident(mut name) => {
+                // check for qualified names like Enum::Variant
+                while self.eat(&Tok::Colon) && self.eat(&Tok::Colon) {
+                    let variant = self.parse_ident("variant name after '::'")?;
+                    name = format!("{}::{}", name, variant);
+                }
                 if matches!(self.peek(), Tok::LParen) {
                     self.advance();
                     let mut args = Vec::new();
@@ -803,6 +899,46 @@ impl<'a> Parser<'a> {
                     span: span.merge(end),
                 })
             }
+            Tok::Match => {
+                // match expression: match expr { Pattern => expr, ... }
+                let scrutinee = Box::new(self.parse_expr()?);
+                self.skip_newlines();
+                self.expect(Tok::LBrace, "'{' to open match arms")?;
+                let mut arms = Vec::new();
+                loop {
+                    self.skip_newlines();
+                    if matches!(self.peek(), Tok::RBrace) {
+                        self.advance();
+                        break;
+                    }
+                    let arm_span = self.peek_span();
+                    let pattern = self.parse_pattern()?;
+                    self.expect(Tok::FatArrow, "'=>' after match pattern")?;
+                    let body = self.parse_expr()?;
+                    arms.push(MatchArm {
+                        pattern,
+                        body,
+                        span: arm_span,
+                    });
+                    self.expect_stmt_end()?;
+                }
+                let end = self.tokens[self.pos.saturating_sub(1)].span;
+                if arms.is_empty() {
+                    return Err(Diagnostic::new(
+                        "E052",
+                        "match expression has no arms".to_string(),
+                        span.merge(end),
+                    )
+                    .with_help("add at least one pattern: match x { _ => 0 }"));
+                }
+                Ok(Expr {
+                    kind: ExprKind::Match(Box::new(Match {
+                        scrutinee: *scrutinee,
+                        arms,
+                    })),
+                    span: span.merge(end),
+                })
+            }
             Tok::LParen => {
                 let inner = self.parse_expr()?;
                 let rp = self.expect(Tok::RParen, "')'")?;
@@ -861,6 +997,8 @@ fn describe(tok: &Tok) -> String {
         Tok::Assert => "'assert'".to_string(),
         Tok::Struct => "'struct'".to_string(),
         Tok::Import => "'import'".to_string(),
+        Tok::Enum => "'enum'".to_string(),
+        Tok::Match => "'match'".to_string(),
         Tok::LParen => "'('".to_string(),
         Tok::RParen => "')'".to_string(),
         Tok::LBrace => "'{'".to_string(),
@@ -872,6 +1010,7 @@ fn describe(tok: &Tok) -> String {
         Tok::Dot => "'.'".to_string(),
         Tok::DotDot => "'..'".to_string(),
         Tok::Arrow => "'->'".to_string(),
+        Tok::FatArrow => "'=>'".to_string(),
         Tok::Assign => "'='".to_string(),
         Tok::Plus => "'+'".to_string(),
         Tok::Minus => "'-'".to_string(),

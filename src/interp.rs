@@ -24,6 +24,8 @@ pub enum Value {
     Str(Rc<Vec<u8>>),
     Array(Rc<RefCell<Vec<Value>>>),
     Struct(Rc<RefCell<HashMap<String, Value>>>),
+    /// An enum variant: (enum_name, variant_name, optional_payload)
+    EnumVariant(String, String, Option<Box<Value>>),
     /// A first-class named function value.
     Fn(String),
     /// A lambda with its by-value captured environment.
@@ -52,6 +54,13 @@ impl Value {
             Value::Str(s) => String::from_utf8_lossy(s).into_owned(),
             Value::Array(_) => "<array>".to_string(),
             Value::Struct(_) => "<struct>".to_string(),
+            Value::EnumVariant(enum_name, variant_name, payload) => {
+                if payload.is_some() {
+                    format!("{}::{}(...)", enum_name, variant_name)
+                } else {
+                    format!("{}::{}", enum_name, variant_name)
+                }
+            }
             Value::Fn(name) => format!("<fn {}>", name),
             Value::Closure(_) => "<fn>".to_string(),
             Value::Unit => "<unit>".to_string(),
@@ -95,6 +104,7 @@ fn max_call_depth() -> usize {
 pub struct Interp<'a> {
     functions: HashMap<&'a str, &'a Function>,
     struct_fields: HashMap<&'a str, &'a [Param]>,
+    enum_variants: HashMap<&'a str, &'a [EnumVariant]>,
     lambdas: HashMap<usize, &'a Lambda>,
     depth: usize,
     max_depth: usize,
@@ -118,6 +128,10 @@ impl<'a> Interp<'a> {
         for s in &program.structs {
             struct_fields.insert(s.name.as_str(), s.fields.as_slice());
         }
+        let mut enum_variants = HashMap::new();
+        for e in &program.enums {
+            enum_variants.insert(e.name.as_str(), e.variants.as_slice());
+        }
         let mut lambdas = HashMap::new();
         for f in &program.functions {
             collect_lambdas_stmts(&f.body, &mut lambdas);
@@ -131,6 +145,7 @@ impl<'a> Interp<'a> {
         Interp {
             functions,
             struct_fields,
+            enum_variants,
             lambdas,
             depth: 0,
             max_depth: max_call_depth(),
@@ -645,6 +660,22 @@ impl<'a> Interp<'a> {
         if self.functions.contains_key(name) {
             return Ok(Value::Fn(name.to_string()));
         }
+        // check if this is an enum variant without payload (Enum::Variant)
+        if let Some(colon_pos) = name.find("::") {
+            let enum_name = &name[..colon_pos];
+            let variant_name = &name[colon_pos + 2..];
+            if let Some(variants) = self.enum_variants.get(enum_name) {
+                if let Some(variant) = variants.iter().find(|v| v.name == variant_name) {
+                    if variant.payload.is_none() {
+                        return Ok(Value::EnumVariant(
+                            enum_name.to_string(),
+                            variant_name.to_string(),
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
         Err(RuntimeError::new(
             format!("unknown variable '{}'", name),
             span,
@@ -859,6 +890,38 @@ impl<'a> Interp<'a> {
                         _ => unreachable!(),
                     },
                     other => {
+                        // check if this is an enum variant constructor (Enum::Variant)
+                        if let Some(colon_pos) = other.find("::") {
+                            let enum_name = &other[..colon_pos];
+                            let variant_name = &other[colon_pos + 2..];
+                            if let Some(variants) = self.enum_variants.get(enum_name) {
+                                let variant = variants.iter().find(|v| v.name == variant_name);
+                                if let Some(v) = variant {
+                                    let payload = if v.payload.is_some() {
+                                        if vals.len() != 1 {
+                                            return Err(RuntimeError::new(
+                                                format!("{}::{} expects 1 argument, found {}", enum_name, variant_name, vals.len()),
+                                                expr.span,
+                                            ));
+                                        }
+                                        Some(Box::new(vals.into_iter().next().unwrap()))
+                                    } else {
+                                        if !vals.is_empty() {
+                                            return Err(RuntimeError::new(
+                                                format!("{}::{} expects 0 arguments, found {}", enum_name, variant_name, vals.len()),
+                                                expr.span,
+                                            ));
+                                        }
+                                        None
+                                    };
+                                    return Ok(Value::EnumVariant(
+                                        enum_name.to_string(),
+                                        variant_name.to_string(),
+                                        payload,
+                                    ));
+                                }
+                            }
+                        }
                         if let Some(fields) = self.struct_fields.get(other) {
                             // struct constructor
                             let mut map = HashMap::with_capacity(fields.len());
@@ -874,6 +937,57 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
+            ExprKind::Match(m) => {
+                let scrutinee = self.eval(&m.scrutinee, env)?;
+                for arm in &m.arms {
+                    if let Some(bindings) = self.match_pattern(&arm.pattern, &scrutinee) {
+                        // pattern matched, evaluate body with bindings
+                        env.push(bindings);
+                        let result = self.eval(&arm.body, env)?;
+                        env.pop();
+                        return Ok(result);
+                    }
+                }
+                // should be caught by exhaustiveness checking, but just in case:
+                Err(RuntimeError::new(
+                    "match expression did not match any pattern",
+                    expr.span,
+                ))
+            }
+        }
+    }
+
+    /// Try to match a pattern against a value. Returns Some(bindings) if match succeeds.
+    fn match_pattern(&self, pattern: &Pattern, value: &Value) -> Option<HashMap<String, Value>> {
+        match (pattern, value) {
+            (Pattern::Wildcard, _) => Some(HashMap::new()),
+            (Pattern::Var(name), v) => {
+                let mut bindings = HashMap::new();
+                bindings.insert(name.clone(), v.clone());
+                Some(bindings)
+            }
+            (Pattern::Int(p), Value::Int(v)) if p == v => Some(HashMap::new()),
+            (Pattern::Bool(p), Value::Bool(v)) if p == v => Some(HashMap::new()),
+            (Pattern::Str(p), Value::Str(v)) if p.as_bytes() == v.as_slice() => Some(HashMap::new()),
+            (Pattern::Variant(enum_name, variant_name), Value::EnumVariant(e, v, payload)) => {
+                if enum_name == e && variant_name == v && payload.is_none() {
+                    Some(HashMap::new())
+                } else {
+                    None
+                }
+            }
+            (Pattern::VariantPayload(enum_name, variant_name, inner), Value::EnumVariant(e, v, payload)) => {
+                if enum_name == e && variant_name == v {
+                    if let Some(p) = payload {
+                        self.match_pattern(inner, p)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 

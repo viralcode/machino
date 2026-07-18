@@ -1,4 +1,4 @@
-# The machino Language Specification (v0.3)
+# The machino Language Specification (v0.4)
 
 machino is an AI-first programming language. It is designed for code that is
 *written and verified by machines*: the syntax is small and canonical, the
@@ -31,7 +31,7 @@ formally specified machine language that runs everywhere.
   by adding parentheses.
 - Identifiers match `[A-Za-z_][A-Za-z0-9_]*`.
 - Keywords: `fn extern let if else while for in break continue return true
-  false requires ensures test assert struct import`.
+  false requires ensures test assert struct import enum match`.
 - Reserved names: `result` (bound in `ensures`), `memory`, `alloc`, the
   builtins, and every std-prelude function and struct (see below).
 
@@ -45,6 +45,7 @@ formally specified machine language that runs everywhere.
 | `str`       | immutable byte string (usually UTF-8)         | `i64` pointer       |
 | `[T]`       | array of `T` (fixed length; `push` copies)    | `i64` pointer       |
 | `StructName`| a declared struct (nominal, reference type)   | `i64` pointer       |
+| `EnumName`  | a declared enum (sum type)                    | `i64` pointer       |
 | `fn(T...) -> R` | a function value (named fn or closure)    | `i64` closure ptr   |
 
 There are **no implicit conversions**. `int` + `float` is a type error; use
@@ -56,8 +57,8 @@ for scalars and `str` only.
 ## Programs, modules, and packages
 
 A program is a sequence of `import` declarations, function definitions,
-`struct` definitions, `extern` declarations, and `test` blocks. The entry
-point is `fn main()` (no parameters, no return value).
+`struct` definitions, `enum` definitions, `extern` declarations, and `test` 
+blocks. The entry point is `fn main()` (no parameters, no return value).
 
 ```
 import "lib/util.mno"
@@ -151,6 +152,55 @@ assigned as `p.x = 3.0` (including nested paths like `rect.a.x = 0.0`).
 Structs are reference types with nominal typing. Machino has no methods: write
 plain functions that take the struct as an argument.
 
+### Enums
+
+```
+enum Option {
+    None
+    Some(int)
+}
+
+enum Result {
+    Ok(str)
+    Err(str)
+}
+```
+
+Enums are sum types (tagged unions). Each variant may carry:
+- **nothing** (unit variant): `Option::None`
+- **a single payload** of any type: `Option::Some(42)`
+
+Variants are constructed by calling them like functions:
+- `Option::None` for unit variants
+- `Option::Some(42)` for variants with payloads
+
+Enums are deconstructed using `match` expressions.
+
+### Pattern matching
+
+```
+let opt = Option::Some(42)
+let value = match opt {
+    Option::Some(v) => v
+    Option::None => 0
+}
+```
+
+Match expressions take a scrutinee and a list of arms. Each arm has a pattern
+and a body. The first matching arm's body is evaluated, and its value is the
+match result.
+
+Patterns:
+- `_` — wildcard, matches anything
+- `var` — binds to a variable
+- `42`, `true`, `"hello"` — literal matches
+- `Enum::Variant` — matches a unit variant
+- `Enum::Variant(pattern)` — matches a variant with payload, binds nested pattern
+
+Match expressions must be **exhaustive** — the type checker verifies that all
+possible values are covered. Match can be used as an expression (in `let` or
+`return`) or as a statement (for side effects).
+
 ### Extern functions
 
 ```
@@ -212,6 +262,7 @@ break                    # exit the innermost loop
 continue                 # next iteration (for-loops still increment)
 return expr              # or bare 'return' in a unit function
 assert expr              # trap with location if false
+match expr { arms }      # pattern match (can be statement or expression)
 expr                     # expression statement (e.g. print(x))
 ```
 
@@ -263,7 +314,9 @@ Values are 8 bytes each. Every heap object carries a 16-byte header:
 `[meta: i64][bitmap: i64][payload]`, where `meta` packs a type tag (bits
 0–2: bytes / scalar array / pointer array / struct / free block), a GC mark
 bit (bit 3), and a count (bits 4+). For structs and closures the bitmap
-flags which payload words are pointers. Function values are closure objects
+flags which payload words are pointers. Enums are represented as struct-like
+objects with a tag field (variant index) and a payload field (variant data
+if present). Function values are closure objects
 `[header][table_slot][captures...]`; calls through them use a `funcref`
 table and `call_indirect` with a hidden environment parameter (named
 functions used as values get a static singleton closure and a wrapper).
@@ -291,9 +344,10 @@ that create objects (strings, arrays) must write the 16-byte header — see
 Positions map to the correct file across imports. Error codes are stable:
 `E001–E005` lexical, `E010–E019` syntax, `E020–E050` types and semantics.
 
-## Known limits (v0.3)
+## Known limits (v0.4)
 
 - No generics; `StrMap` is `str → str` (encode other value types).
+- Enum variants can carry at most one payload value.
 - Structs are limited to 60 fields (`E050`); GC bitmaps are one word.
 - Contracts on `extern fn`s are enforced by the interpreter but not in
   compiled WASM.
@@ -303,9 +357,9 @@ Positions map to the correct file across imports. Error codes are stable:
 - Reference cycles are reclaimed by the compiled GC but leak in the
   interpreter (they require deliberately circular data).
 
-## Roadmap (v0.4+)
+## Roadmap (v0.5+)
 
-- enums and pattern matching, generics
+- generics
 - WASM-GC proposal backend (engine-managed heap instead of the built-in
   collector)
 - static contract verification (SMT) for a decidable subset

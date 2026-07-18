@@ -35,6 +35,16 @@ struct Point {               # structs: nominal record types
     y: float
 }
 
+enum Option {                # enums: sum types (tagged unions)
+    None
+    Some(int)
+}
+
+enum Result {
+    Ok(str)
+    Err(str)
+}
+
 # functions; statements end at NEWLINES, there are no semicolons
 fn dist2(a: Point, b: Point) -> float {
     let dx = b.x - a.x
@@ -61,6 +71,14 @@ fn map_ints(xs: [int], f: fn(int) -> int) -> [int] {
 
 fn make_adder(n: int) -> fn(int) -> int {
     return fn(x: int) -> int { return x + n }   # captures n by value
+}
+
+# pattern matching on enums (exhaustive check at compile-time)
+fn unwrap_or(opt: Option, default: int) -> int {
+    return match opt {
+        Option::Some(v) => v
+        Option::None => default
+    }
 }
 
 # host imports (FFI/capabilities); the host must provide them
@@ -93,11 +111,16 @@ test "math" {
 ## Types and rules that trip models up
 
 - Types: `int` (i64, **checked arithmetic** — overflow traps), `float` (f64),
-  `bool`, `str` (byte string), `[T]`, struct names, `fn(T...) -> R`.
+  `bool`, `str` (byte string), `[T]`, struct names, enum names, `fn(T...) -> R`.
 - **No implicit conversions.** `1 + 2.0` is an error. Use `to_float(i)` /
   `to_int(f)`. Float literals need digits on both sides: `2.0`, not `2.`.
 - `+` on strings concatenates. `%` is int-only. Comparisons don't chain.
 - `push(xs, v)` does NOT mutate; always rebind: `xs = push(xs, v)`.
+- **Enums:** construct with `Enum::Variant` (unit) or `Enum::Variant(payload)`.
+  Deconstruct with `match`.
+- **Match expressions must be exhaustive.** The type checker ensures all cases
+  are covered. Patterns: `_` (wildcard), `var` (binding), literals, 
+  `Enum::Variant`, `Enum::Variant(pattern)`.
 - Structs/arrays are references; `==` works only on scalars and `str`.
 - No methods: `p.dist()` is an error; write `dist(p)`.
 - Lambdas: `fn(x: int) -> int { return x + n }` is an expression; it

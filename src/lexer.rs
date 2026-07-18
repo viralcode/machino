@@ -31,6 +31,8 @@ pub enum Tok {
     Assert,
     Struct,
     Import,
+    Enum,
+    Match,
     // punctuation
     LParen,
     RParen,
@@ -43,6 +45,7 @@ pub enum Tok {
     Dot,     // .
     DotDot,  // ..
     Arrow,   // ->
+    FatArrow, // =>
     Assign,  // =
     // operators
     Plus,
@@ -180,6 +183,9 @@ pub fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                     i += 2;
                     push!(Tok::EqEq, start, i);
+                } else if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+                    i += 2;
+                    push!(Tok::FatArrow, start, i);
                 } else {
                     i += 1;
                     push!(Tok::Assign, start, i);
@@ -372,6 +378,8 @@ pub fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
                     "assert" => Tok::Assert,
                     "struct" => Tok::Struct,
                     "import" => Tok::Import,
+                    "enum" => Tok::Enum,
+                    "match" => Tok::Match,
                     _ => Tok::Ident(word.to_string()),
                 };
                 push!(tok, i, end);

@@ -16,6 +16,7 @@ pub struct Checker<'a> {
     pub program: &'a Program,
     pub signatures: HashMap<String, Signature>,
     pub structs: HashMap<String, Vec<Param>>,
+    pub enums: HashMap<String, Vec<EnumVariant>>,
     diags: Vec<Diagnostic>,
     loop_depth: u32,
 }
@@ -75,6 +76,7 @@ impl<'a> Checker<'a> {
             program,
             signatures: HashMap::new(),
             structs: HashMap::new(),
+            enums: HashMap::new(),
             diags: Vec::new(),
             loop_depth: 0,
         }
@@ -133,6 +135,68 @@ impl<'a> Checker<'a> {
             }
         }
 
+        // pass 0b: collect enums
+        for e in &self.program.enums {
+            if BUILTINS.contains(&e.name.as_str()) || e.name == "result" || e.name == "memory" {
+                self.diags.push(Diagnostic::new(
+                    "E020",
+                    format!("'{}' is a reserved name and cannot be used for an enum", e.name),
+                    e.span,
+                ));
+                continue;
+            }
+            if self.structs.contains_key(&e.name) {
+                self.diags.push(Diagnostic::new(
+                    "E021",
+                    format!("'{}' is already the name of a struct", e.name),
+                    e.span,
+                ));
+                continue;
+            }
+            if self.enums.contains_key(&e.name) {
+                self.diags.push(Diagnostic::new(
+                    "E021",
+                    format!("enum '{}' is defined more than once", e.name),
+                    e.span,
+                ));
+                continue;
+            }
+            if e.variants.len() > 255 {
+                self.diags.push(
+                    Diagnostic::new(
+                        "E054",
+                        format!(
+                            "enum '{}' has {} variants; the maximum is 255",
+                            e.name,
+                            e.variants.len()
+                        ),
+                        e.span,
+                    )
+                    .with_help("split large enums or use a different data structure"),
+                );
+                continue;
+            }
+            let mut seen: HashMap<&str, ()> = HashMap::new();
+            for v in &e.variants {
+                if seen.insert(&v.name, ()).is_some() {
+                    self.diags.push(Diagnostic::new(
+                        "E055",
+                        format!("duplicate variant '{}' in enum '{}'", v.name, e.name),
+                        v.span,
+                    ));
+                }
+            }
+            self.enums.insert(e.name.clone(), e.variants.clone());
+        }
+        // validate variant payload types now that all type names are known
+        for e in &self.program.enums {
+            for v in &e.variants {
+                if let Some(ref ty) = v.payload {
+                    self.validate_type(ty, v.span);
+                }
+            }
+        }
+
         // pass 1: collect function signatures
         let mut first_def: HashMap<String, (Span, bool)> = HashMap::new();
         for f in &self.program.functions {
@@ -162,6 +226,14 @@ impl<'a> Checker<'a> {
                 self.diags.push(Diagnostic::new(
                     "E021",
                     format!("'{}' is already the name of a struct", f.name),
+                    f.span,
+                ));
+                continue;
+            }
+            if self.enums.contains_key(&f.name) {
+                self.diags.push(Diagnostic::new(
+                    "E021",
+                    format!("'{}' is already the name of an enum", f.name),
                     f.span,
                 ));
                 continue;
@@ -233,10 +305,19 @@ impl<'a> Checker<'a> {
     fn validate_type(&mut self, ty: &Type, span: Span) {
         match ty {
             Type::Struct(name) => {
-                if !self.structs.contains_key(name) {
+                if !self.structs.contains_key(name) && !self.enums.contains_key(name) {
                     self.diags.push(
                         Diagnostic::new("E018", format!("unknown type '{}'", name), span).with_help(
-                            "valid types: int, float, bool, str, [T], fn(T...) -> R, or a declared struct",
+                            "valid types: int, float, bool, str, [T], fn(T...) -> R, or a declared struct/enum",
+                        ),
+                    );
+                }
+            }
+            Type::Enum(name) => {
+                if !self.enums.contains_key(name) {
+                    self.diags.push(
+                        Diagnostic::new("E018", format!("unknown enum '{}'", name), span).with_help(
+                            "valid types: int, float, bool, str, [T], fn(T...) -> R, or a declared struct/enum",
                         ),
                     );
                 }
@@ -350,6 +431,26 @@ impl<'a> Checker<'a> {
             self.check_stmt(s, scope, ret, in_test);
         }
         scope.pop();
+    }
+
+    /// Normalize a type: Type::Struct(name) becomes Type::Enum(name) if name is an enum.
+    /// This allows the parser to use Type::Struct for all user-defined types,
+    /// and we fix them up during type checking.
+    fn normalize_type(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Struct(name) if self.enums.contains_key(name) => Type::Enum(name.clone()),
+            Type::Array(inner) => Type::Array(Box::new(self.normalize_type(inner))),
+            Type::Fn(params, ret) => Type::Fn(
+                params.iter().map(|p| self.normalize_type(p)).collect(),
+                Box::new(self.normalize_type(ret)),
+            ),
+            _ => ty.clone(),
+        }
+    }
+
+    /// Check if two types are equal, normalizing them first.
+    fn types_equal(&self, a: &Type, b: &Type) -> bool {
+        self.normalize_type(a) == self.normalize_type(b)
     }
 
     fn check_stmt(&mut self, stmt: &Stmt, scope: &mut Scope, ret: &Type, in_test: bool) {
@@ -586,12 +687,12 @@ impl<'a> Checker<'a> {
                                 .with_help("add '-> <type>' to the function signature"),
                             );
                         } else if let Some(actual) = self.infer(e, scope, Some(expected)) {
-                            if actual != *expected {
+                            if !self.types_equal(&actual, expected) {
                                 self.diags.push(Diagnostic::new(
                                     "E030",
                                     format!(
                                         "type mismatch: function returns '{}' but this value has type '{}'",
-                                        expected, actual
+                                        self.normalize_type(expected), self.normalize_type(&actual)
                                     ),
                                     e.span,
                                 ));
@@ -664,6 +765,27 @@ impl<'a> Checker<'a> {
                 // a bare function name is a first-class function value
                 if let Some(sig) = self.signatures.get(name) {
                     return Some(Type::Fn(sig.params.clone(), Box::new(sig.ret.clone())));
+                }
+                // check if this is an enum variant without payload (Enum::Variant)
+                if let Some(colon_pos) = name.find("::") {
+                    let enum_name = &name[..colon_pos];
+                    let variant_name = &name[colon_pos + 2..];
+                    if let Some(variants) = self.enums.get(enum_name) {
+                        if let Some(variant) = variants.iter().find(|v| v.name == variant_name) {
+                            if variant.payload.is_some() {
+                                self.diags.push(Diagnostic::new(
+                                    "E063",
+                                    format!(
+                                        "variant '{}::{}' has a payload and must be called as a function",
+                                        enum_name, variant_name
+                                    ),
+                                    expr.span,
+                                ).with_help(format!("use {}::{}(value)", enum_name, variant_name)));
+                                return None;
+                            }
+                            return Some(Type::Enum(enum_name.to_string()));
+                        }
+                    }
                 }
                 let mut d =
                     Diagnostic::new("E035", format!("unknown variable '{}'", name), expr.span);
@@ -920,6 +1042,201 @@ impl<'a> Checker<'a> {
                     Box::new(lambda.ret.clone()),
                 ))
             }
+            ExprKind::Match(m) => {
+                // infer scrutinee type
+                let scrutinee_ty = self.infer(&m.scrutinee, scope, None)?;
+                
+                if m.arms.is_empty() {
+                    self.diags.push(Diagnostic::new(
+                        "E052",
+                        "match expression has no arms".to_string(),
+                        expr.span,
+                    ));
+                    return None;
+                }
+                
+                // check patterns and collect result types
+                let mut result_type: Option<Type> = None;
+                let mut seen_patterns = Vec::new();
+                
+                for arm in &m.arms {
+                    // check pattern against scrutinee type and get bindings
+                    self.check_pattern(&arm.pattern, &scrutinee_ty, arm.span, scope)?;
+                    let bindings = self.extract_pattern_bindings(&arm.pattern, &scrutinee_ty, arm.span)?;
+                    
+                    // collect pattern bindings
+                    scope.push();
+                    for (name, ty) in bindings {
+                        scope.declare(&name, ty);
+                    }
+                    
+                    // check arm body
+                    let arm_ty = self.infer(&arm.body, scope, result_type.as_ref())?;
+                    scope.pop();
+                    
+                    // unify result types
+                    match result_type {
+                        None => result_type = Some(arm_ty),
+                        Some(ref rt) if rt != &arm_ty => {
+                            self.diags.push(Diagnostic::new(
+                                "E056",
+                                format!(
+                                    "match arms have inconsistent types: first arm returns '{}', this arm returns '{}'",
+                                    rt, arm_ty
+                                ),
+                                arm.body.span,
+                            ));
+                            return None;
+                        }
+                        _ => {}
+                    }
+                    
+                    seen_patterns.push(arm.pattern.clone());
+                }
+                
+                // check exhaustiveness
+                if !is_exhaustive(&scrutinee_ty, &seen_patterns, &self.enums) {
+                    self.diags.push(
+                        Diagnostic::new(
+                            "E057",
+                            format!("match is not exhaustive for type '{}'", scrutinee_ty),
+                            expr.span,
+                        )
+                        .with_help("add arms to cover all cases, or add a wildcard '_' arm"),
+                    );
+                }
+                
+                result_type
+            }
+        }
+    }
+
+    fn check_pattern(
+        &mut self,
+        pattern: &Pattern,
+        scrutinee_ty: &Type,
+        span: Span,
+        scope: &Scope,
+    ) -> Option<Type> {
+        match pattern {
+            Pattern::Wildcard | Pattern::Var(_) => Some(scrutinee_ty.clone()),
+            Pattern::Int(_) => {
+                if scrutinee_ty != &Type::Int {
+                    self.diags.push(Diagnostic::new(
+                        "E058",
+                        format!("pattern expects 'int', but scrutinee has type '{}'", scrutinee_ty),
+                        span,
+                    ));
+                    None
+                } else {
+                    Some(Type::Int)
+                }
+            }
+            Pattern::Bool(_) => {
+                if scrutinee_ty != &Type::Bool {
+                    self.diags.push(Diagnostic::new(
+                        "E058",
+                        format!("pattern expects 'bool', but scrutinee has type '{}'", scrutinee_ty),
+                        span,
+                    ));
+                    None
+                } else {
+                    Some(Type::Bool)
+                }
+            }
+            Pattern::Str(_) => {
+                if scrutinee_ty != &Type::Str {
+                    self.diags.push(Diagnostic::new(
+                        "E058",
+                        format!("pattern expects 'str', but scrutinee has type '{}'", scrutinee_ty),
+                        span,
+                    ));
+                    None
+                } else {
+                    Some(Type::Str)
+                }
+            }
+            Pattern::Variant(enum_name, variant_name) | Pattern::VariantPayload(enum_name, variant_name, _) => {
+                // check that scrutinee is the expected enum type
+                let expected_ty = Type::Enum(enum_name.clone());
+                if scrutinee_ty != &expected_ty && scrutinee_ty != &Type::Struct(enum_name.clone()) {
+                    self.diags.push(Diagnostic::new(
+                        "E058",
+                        format!("pattern expects '{}', but scrutinee has type '{}'", expected_ty, scrutinee_ty),
+                        span,
+                    ));
+                    return None;
+                }
+                
+                // validate variant exists
+                let Some(variants) = self.enums.get(enum_name).cloned() else {
+                    self.diags.push(Diagnostic::new(
+                        "E059",
+                        format!("unknown enum '{}'", enum_name),
+                        span,
+                    ));
+                    return None;
+                };
+                
+                let Some(var_def) = variants.iter().find(|v| v.name == *variant_name).cloned() else {
+                    self.diags.push(Diagnostic::new(
+                        "E060",
+                        format!("enum '{}' has no variant '{}'", enum_name, variant_name),
+                        span,
+                    ));
+                    return None;
+                };
+                
+                // check payload
+                match pattern {
+                    Pattern::Variant(_, _) => {
+                        if var_def.payload.is_some() {
+                            self.diags.push(Diagnostic::new(
+                                "E061",
+                                format!("variant '{}::{}' has a payload but pattern does not bind it", enum_name, variant_name),
+                                span,
+                            ).with_help(format!("use {}::{}(x) to bind the payload", enum_name, variant_name)));
+                            None
+                        } else {
+                            Some(expected_ty)
+                        }
+                    }
+                    Pattern::VariantPayload(_, _, inner) => {
+                        if let Some(ref payload_ty) = var_def.payload {
+                            self.check_pattern(inner, payload_ty, span, scope)?;
+                            Some(expected_ty)
+                        } else {
+                            self.diags.push(Diagnostic::new(
+                                "E062",
+                                format!("variant '{}::{}' has no payload but pattern expects one", enum_name, variant_name),
+                                span,
+                            ).with_help(format!("use {}::{} without parentheses", enum_name, variant_name)));
+                            None
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    fn extract_pattern_bindings(
+        &self,
+        pattern: &Pattern,
+        ty: &Type,
+        span: Span,
+    ) -> Option<Vec<(String, Type)>> {
+        match pattern {
+            Pattern::Wildcard => Some(vec![]),
+            Pattern::Var(name) => Some(vec![(name.clone(), ty.clone())]),
+            Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => Some(vec![]),
+            Pattern::Variant(_, _) => Some(vec![]),
+            Pattern::VariantPayload(enum_name, variant_name, inner) => {
+                let variants = self.enums.get(enum_name)?;
+                let var_def = variants.iter().find(|v| v.name == *variant_name)?;
+                let payload_ty = var_def.payload.as_ref()?;
+                self.extract_pattern_bindings(inner, payload_ty, span)
+            }
         }
     }
 
@@ -939,15 +1256,15 @@ impl<'a> Checker<'a> {
         for (i, arg) in args.iter().enumerate() {
             if let Some(param_ty) = params.get(i) {
                 if let Some(actual) = self.infer(arg, scope, Some(param_ty)) {
-                    if actual != *param_ty {
+                    if !self.types_equal(&actual, param_ty) {
                         self.diags.push(Diagnostic::new(
                             "E030",
                             format!(
                                 "type mismatch: argument {} of '{}' expects '{}', found '{}'",
                                 i + 1,
                                 name,
-                                param_ty,
-                                actual
+                                self.normalize_type(param_ty),
+                                self.normalize_type(&actual)
                             ),
                             arg.span,
                         ));
@@ -1080,6 +1397,50 @@ impl<'a> Checker<'a> {
             ),
             "chr" => self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Str, "chr"),
             _ => {
+                // check if this is an enum variant constructor (Enum::Variant)
+                if let Some(colon_pos) = name.find("::") {
+                    let enum_name = &name[..colon_pos];
+                    let variant_name = &name[colon_pos + 2..];
+                    if let Some(variants) = self.enums.get(enum_name).cloned() {
+                        if let Some(variant) = variants.iter().find(|v| v.name == variant_name) {
+                            if let Some(ref payload_ty) = variant.payload {
+                                if args.len() != 1 {
+                                    self.diags.push(Diagnostic::new(
+                                        "E045",
+                                        format!(
+                                            "{}::{} takes exactly 1 argument, found {}",
+                                            enum_name,
+                                            variant_name,
+                                            args.len()
+                                        ),
+                                        span,
+                                    ));
+                                } else {
+                                    self.check_args(name, &[payload_ty.clone()], args, span, scope);
+                                }
+                            } else {
+                                if !args.is_empty() {
+                                    self.diags.push(Diagnostic::new(
+                                        "E045",
+                                        format!(
+                                            "{}::{} takes no arguments, found {}",
+                                            enum_name, variant_name, args.len()
+                                        ),
+                                        span,
+                                    ));
+                                }
+                            }
+                            return Some(Type::Enum(enum_name.to_string()));
+                        } else {
+                            self.diags.push(Diagnostic::new(
+                                "E060",
+                                format!("enum '{}' has no variant '{}'", enum_name, variant_name),
+                                span,
+                            ));
+                            return None;
+                        }
+                    }
+                }
                 // 2. struct constructor
                 if let Some(fields) = self.structs.get(name).cloned() {
                     let params: Vec<Type> = fields.iter().map(|f| f.ty.clone()).collect();
@@ -1200,4 +1561,69 @@ pub fn always_returns(stmts: &[Stmt]) -> bool {
         }
     }
     false
+}
+
+/// Extract variable bindings from a pattern.
+/// The type is determined contextually by the scrutinee type.
+fn pattern_bindings_with_type(pat: &Pattern, ty: &Type) -> Vec<(String, Type)> {
+    match pat {
+        Pattern::Wildcard => vec![],
+        Pattern::Var(name) => vec![(name.clone(), ty.clone())],
+        Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => vec![],
+        Pattern::Variant(_, _) => vec![],
+        Pattern::VariantPayload(_enum_name, _variant_name, inner) => {
+            // the inner pattern binds to the payload type
+            // we need to look up the payload type, but for now we'll handle it in the caller
+            pattern_bindings_with_type(inner, ty)
+        }
+    }
+}
+
+/// Check if a set of patterns exhaustively covers a type.
+/// Simplified exhaustiveness checking:
+/// - For int/float/str/bool: only accept if there's a wildcard or var
+/// - For enums: check that all variants are covered or there's a wildcard
+fn is_exhaustive(
+    ty: &Type,
+    patterns: &[Pattern],
+    enums: &HashMap<String, Vec<EnumVariant>>,
+) -> bool {
+    // wildcard or variable catches everything
+    if patterns
+        .iter()
+        .any(|p| matches!(p, Pattern::Wildcard | Pattern::Var(_)))
+    {
+        return true;
+    }
+
+    match ty {
+        Type::Int | Type::Float | Type::Str | Type::Bool => {
+            // for primitive types, we require a wildcard since we can't enumerate all values
+            false
+        }
+        Type::Enum(enum_name) | Type::Struct(enum_name) => {
+            // check if it's actually an enum
+            let Some(variants) = enums.get(enum_name) else {
+                return false;
+            };
+            
+            // collect covered variants
+            let mut covered = std::collections::HashSet::new();
+            for p in patterns {
+                match p {
+                    Pattern::Variant(e, v) | Pattern::VariantPayload(e, v, _) if e == enum_name => {
+                        covered.insert(v.as_str());
+                    }
+                    _ => {}
+                }
+            }
+            
+            // check that all variants are covered
+            variants.iter().all(|v| covered.contains(v.name.as_str()))
+        }
+        _ => {
+            // arrays, functions, unit: require wildcard
+            false
+        }
+    }
 }

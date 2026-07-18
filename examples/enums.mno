@@ -1,0 +1,87 @@
+# Example demonstrating enums and pattern matching
+
+enum Option {
+    None
+    Some(int)
+}
+
+enum Result {
+    Ok(str)
+    Err(str)
+}
+
+fn divide(a: int, b: int) -> Result {
+    if b == 0 {
+        return Result::Err("division by zero")
+    }
+    let q = a / b
+    return Result::Ok(str_of_int(q))
+}
+
+fn unwrap_or(opt: Option, default: int) -> int {
+    return match opt {
+        Option::Some(v) => v
+        Option::None => default
+    }
+}
+
+fn is_some(opt: Option) -> bool {
+    return match opt {
+        Option::Some(_) => true
+        Option::None => false
+    }
+}
+
+fn main() {
+    let opt1 = Option::Some(42)
+    let opt2 = Option::None
+    
+    print("opt1 is_some: ")
+    print(is_some(opt1))
+    print("opt2 is_some: ")
+    print(is_some(opt2))
+    
+    print("unwrap_or opt1 with default 0: ")
+    print(unwrap_or(opt1, 0))
+    print("unwrap_or opt2 with default 99: ")
+    print(unwrap_or(opt2, 99))
+    
+    let r1 = divide(10, 2)
+    let r2 = divide(10, 0)
+    
+    let msg1 = match r1 {
+        Result::Ok(s) => "10 / 2 = " + s
+        Result::Err(e) => "Error: " + e
+    }
+    print(msg1)
+    
+    let msg2 = match r2 {
+        Result::Ok(s) => "10 / 0 = " + s
+        Result::Err(e) => "Error: " + e
+    }
+    print(msg2)
+}
+
+test "option unwrap_or" {
+    let opt = Option::Some(5)
+    assert unwrap_or(opt, 0) == 5
+    
+    let none = Option::None
+    assert unwrap_or(none, 10) == 10
+}
+
+test "result match" {
+    let ok = divide(20, 4)
+    let is_ok = match ok {
+        Result::Ok(s) => s == "5"
+        Result::Err(_) => false
+    }
+    assert is_ok
+    
+    let err = divide(10, 0)
+    let is_err = match err {
+        Result::Ok(_) => false
+        Result::Err(e) => e == "division by zero"
+    }
+    assert is_err
+}

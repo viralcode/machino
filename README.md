@@ -134,8 +134,9 @@ The `machino run` interpreter doubles as a **native runtime** with files, stdin,
 
 ## Language at a glance
 
-- **Types:** `int` (i64, checked arithmetic), `float` (f64), `bool`, `str`, `[T]`, structs, `fn(T...) -> R` function values — no implicit conversions, ever
-- **Data modeling:** nominal `struct`s with positional constructors and field assignment, string-keyed maps (`StrMap`) in the prelude
+- **Types:** `int` (i64, checked arithmetic), `float` (f64), `bool`, `str`, `[T]`, structs, enums, `fn(T...) -> R` function values — no implicit conversions, ever
+- **Data modeling:** nominal `struct`s with positional constructors and field assignment, sum types (`enum`) with pattern matching, string-keyed maps (`StrMap`) in the prelude
+- **Pattern matching:** exhaustive `match` expressions over enums and literals with compile-time coverage checks
 - **Closures:** lambdas capture enclosing variables by value — `fn(x: int) -> int { return x + n }` — compiled to lifted functions + closure objects, GC-managed
 - **Memory:** precise mark-sweep garbage collector compiled *into* every binary; allocation-heavy programs run in bounded memory on any WASM host
 - **Control flow:** `if` / `else`, `while`, `for i in a..b`, `break`, `continue`, `return`
@@ -149,9 +150,9 @@ Full details in [SPEC.md](SPEC.md).
 
 ## Status and roadmap
 
-This is **v0.3** — a real, working end-to-end system, intentionally small enough to hold in a model's context window: capturing closures, a garbage collector in every compiled binary, and a package system, all covered by wasm-vs-interpreter equivalence tests (including a GC stress test that churns gigabytes under a 1 GiB memory cap). Honest limits, documented in the spec: no generics yet, structs cap at 60 fields, and compiled-module memory tops out at 1 GiB.
+This is **v0.4** — a real, working end-to-end system, intentionally small enough to hold in a model's context window: capturing closures, a garbage collector in every compiled binary, a package system, and **enums with exhaustive pattern matching**, all covered by wasm-vs-interpreter equivalence tests (including a GC stress test that churns gigabytes under a 1 GiB memory cap). Honest limits, documented in the spec: no generics yet, enum variants carry at most one payload, structs cap at 60 fields, and compiled-module memory tops out at 1 GiB.
 
-Planned for v0.4+: enums and pattern matching, generics, a WASM-GC-proposal backend, static contract verification (SMT) for a decidable subset, and a package registry.
+Planned for v0.5+: generics, a WASM-GC-proposal backend, static contract verification (SMT) for a decidable subset, and a package registry.
 
 ## License
 

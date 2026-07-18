@@ -238,6 +238,7 @@ fn load(path: &str, json: bool) -> Option<Loaded> {
                 program: ast::Program {
                     functions: vec![],
                     structs: vec![],
+                    enums: vec![],
                     tests: vec![],
                     imports: vec![],
                 },

@@ -11,6 +11,8 @@ pub enum Type {
     Array(Box<Type>),
     /// A named struct type.
     Struct(String),
+    /// A named enum type.
+    Enum(String),
     /// A function value type: fn(params) -> ret.
     Fn(Vec<Type>, Box<Type>),
     /// Only valid as a function return type.
@@ -26,6 +28,7 @@ impl std::fmt::Display for Type {
             Type::Str => write!(f, "str"),
             Type::Array(inner) => write!(f, "[{}]", inner),
             Type::Struct(name) => write!(f, "{}", name),
+            Type::Enum(name) => write!(f, "{}", name),
             Type::Fn(params, ret) => {
                 write!(f, "fn(")?;
                 for (i, p) in params.iter().enumerate() {
@@ -91,6 +94,39 @@ pub enum ExprKind {
     /// A lambda expression: fn(x: int) -> int { ... }
     /// Captures enclosing variables by value at creation.
     Lambda(Box<Lambda>),
+    /// A match expression: match expr { Pattern => expr, ... }
+    Match(Box<Match>),
+}
+
+#[derive(Debug, Clone)]
+pub struct Match {
+    pub scrutinee: Expr,
+    pub arms: Vec<MatchArm>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    /// Wildcard pattern: _
+    Wildcard,
+    /// Variable binding: x (binds the value to x)
+    Var(String),
+    /// Integer literal: 42
+    Int(i64),
+    /// Boolean literal: true or false
+    Bool(bool),
+    /// String literal: "hello"
+    Str(String),
+    /// Enum variant without payload: Option::None
+    Variant(String, String),
+    /// Enum variant with payload: Option::Some(x)
+    VariantPayload(String, String, Box<Pattern>),
 }
 
 #[derive(Debug, Clone)]
@@ -218,7 +254,24 @@ fn free_in_expr(expr: &Expr, bound: &mut Vec<Vec<String>>, free: &mut Vec<String
                 }
             }
         }
+        ExprKind::Match(m) => {
+            free_in_expr(&m.scrutinee, bound, free);
+            for arm in &m.arms {
+                // pattern bindings are scoped to the arm body
+                bound.push(pattern_bindings(&arm.pattern));
+                free_in_expr(&arm.body, bound, free);
+                bound.pop();
+            }
+        }
         _ => {}
+    }
+}
+
+fn pattern_bindings(pat: &Pattern) -> Vec<String> {
+    match pat {
+        Pattern::Var(name) => vec![name.clone()],
+        Pattern::VariantPayload(_, _, inner) => pattern_bindings(inner),
+        _ => vec![],
     }
 }
 
@@ -308,6 +361,21 @@ pub struct StructDef {
 }
 
 #[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<EnumVariant>,
+    pub is_std: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumVariant {
+    pub name: String,
+    pub payload: Option<Type>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
 pub struct TestBlock {
     pub name: String,
     pub body: Vec<Stmt>,
@@ -318,6 +386,7 @@ pub struct TestBlock {
 pub struct Program {
     pub functions: Vec<Function>,
     pub structs: Vec<StructDef>,
+    pub enums: Vec<EnumDef>,
     pub tests: Vec<TestBlock>,
     /// Import paths declared with `import "..."`; resolved by the loader,
     /// ignored when the bundled source is re-parsed.
