@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>machino — run .wasm in the browser</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0e14;
+    --panel: #131826;
+    --border: #232a3d;
+    --text: #d6dcec;
+    --dim: #8b94ab;
+    --accent: #6ee7b7;
+    --error: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+  }
+  main { width: min(720px, 100%); }
+  h1 { font-size: 1.4rem; margin: 0 0 0.25rem; letter-spacing: 0.02em; }
+  h1 .dot { color: var(--accent); }
+  p.sub { color: var(--dim); margin: 0 0 1.5rem; font-size: 0.9rem; }
+  .drop {
+    border: 1.5px dashed var(--border);
+    border-radius: 12px;
+    background: var(--panel);
+    padding: 2.5rem 1.5rem;
+    text-align: center;
+    color: var(--dim);
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .drop.hover { border-color: var(--accent); background: #16203000; }
+  .drop input { display: none; }
+  pre#out {
+    margin-top: 1.25rem;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1rem 1.25rem;
+    min-height: 8rem;
+    max-height: 50vh;
+    overflow: auto;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.85rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+  }
+  .err { color: var(--error); }
+  .meta { color: var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <h1>machino<span class="dot">.</span>wasm runner</h1>
+  <p class="sub">Compile with <code>machino build program.mno</code>, then drop the .wasm here. Everything runs sandboxed, in this tab.</p>
+  <label class="drop" id="drop">
+    drop a .wasm file — or click to choose
+    <input type="file" id="file" accept=".wasm" />
+  </label>
+  <pre id="out"><span class="meta">output will appear here</span></pre>
+</main>
+<script type="module">
+const out = document.getElementById("out");
+const drop = document.getElementById("drop");
+const fileInput = document.getElementById("file");
+
+let memory;
+function readStr(addr) {
+  const a = Number(addr);
+  const view = new DataView(memory.buffer);
+  const len = Number(view.getBigInt64(a, true));
+  return new TextDecoder().decode(new Uint8Array(memory.buffer, a + 8, len));
+}
+function line(text, cls) {
+  const span = document.createElement("span");
+  if (cls) span.className = cls;
+  span.textContent = text + "\n";
+  out.appendChild(span);
+}
+
+async function run(bytes, name) {
+  out.textContent = "";
+  line(`running ${name}`, "meta");
+  const imports = {
+    env: {
+      fail: (addr) => line(readStr(addr), "err"),
+      print_i64: (v) => line(v.toString()),
+      print_f64: (v) => line(Number.isInteger(v) && Number.isFinite(v) ? v.toFixed(1) : String(v)),
+      print_bool: (v) => line(v === 0n ? "false" : "true"),
+      print_str: (addr) => line(readStr(addr)),
+      clock_ms: () => BigInt(Date.now()),
+    },
+  };
+  try {
+    const { instance } = await WebAssembly.instantiate(bytes, imports);
+    memory = instance.exports.memory;
+    instance.exports.main();
+    line("— finished —", "meta");
+  } catch (e) {
+    if (!(e instanceof WebAssembly.RuntimeError)) line(String(e), "err");
+    line("— trapped —", "meta");
+  }
+}
+
+async function handleFile(f) {
+  if (!f) return;
+  run(new Uint8Array(await f.arrayBuffer()), f.name);
+}
+fileInput.addEventListener("change", () => handleFile(fileInput.files[0]));
+["dragover", "dragenter"].forEach((ev) =>
+  drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("hover"); })
+);
+["dragleave", "drop"].forEach((ev) =>
+  drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("hover"); })
+);
+drop.addEventListener("drop", (e) => handleFile(e.dataTransfer.files[0]));
+</script>
+</body>
+</html>

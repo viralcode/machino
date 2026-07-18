@@ -1,0 +1,12 @@
+[package]
+name = "machino"
+version = "0.1.0"
+edition = "2021"
+description = "An AI-first programming language that compiles to WebAssembly"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true

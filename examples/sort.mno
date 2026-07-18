@@ -1,0 +1,59 @@
+# Arrays, index assignment, and a sortedness contract expressed as a
+# verification function.
+
+fn is_sorted(xs: [int]) -> bool {
+    let i = 0
+    while i + 1 < len(xs) {
+        if xs[i] > xs[i + 1] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn insertion_sort(xs: [int]) -> [int] {
+    let out: [int] = []
+    let i = 0
+    while i < len(xs) {
+        out = push(out, xs[i])
+        let j = len(out) - 1
+        while j > 0 && out[j - 1] > out[j] {
+            let tmp = out[j]
+            out[j] = out[j - 1]
+            out[j - 1] = tmp
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn main() {
+    let data = [9, 3, 7, 1, 8, 2, 5, 4, 6, 0]
+    let sorted = insertion_sort(data)
+    let i = 0
+    while i < len(sorted) {
+        print(sorted[i])
+        i = i + 1
+    }
+}
+
+test "sorting works" {
+    let sorted = insertion_sort([5, 2, 9, 1, 3])
+    assert is_sorted(sorted)
+    assert len(sorted) == 5
+    assert sorted[0] == 1
+    assert sorted[4] == 9
+}
+
+test "already sorted stays sorted" {
+    let xs = insertion_sort([1, 2, 3])
+    assert is_sorted(xs)
+}
+
+test "empty and single" {
+    let e: [int] = []
+    assert is_sorted(insertion_sort(e))
+    assert is_sorted(insertion_sort([42]))
+}

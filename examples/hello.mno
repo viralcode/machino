@@ -1,0 +1,5 @@
+# The smallest machino program.
+
+fn main() {
+    print("hello from machino")
+}

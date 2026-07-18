@@ -1,0 +1,42 @@
+# Strings, floats, explicit conversions, and contract-guarded math.
+
+fn safe_div(a: int, b: int) -> int
+    requires b != 0
+{
+    return a / b
+}
+
+fn average(total: float, count: float) -> float
+    requires count > 0.0
+{
+    return total / count
+}
+
+fn greet(name: str) -> str
+    ensures len(result) > len(name)
+{
+    return "hello, " + name + "!"
+}
+
+fn main() {
+    print(greet("world"))
+    print(safe_div(84, 2))
+    print(average(10.0, 4.0))
+    print(to_float(7))
+    print(to_int(3.9))
+}
+
+test "division respects contract" {
+    assert safe_div(10, 2) == 5
+    assert safe_div(-9, 3) == -3
+}
+
+test "greeting" {
+    assert greet("ai") == "hello, ai!"
+    assert len(greet("ai")) == 10
+}
+
+test "conversions" {
+    assert to_int(3.9) == 3
+    assert to_float(2) == 2.0
+}

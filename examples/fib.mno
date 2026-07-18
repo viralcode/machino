@@ -1,0 +1,38 @@
+# Contracts (requires/ensures) are machine-checked at runtime, in both the
+# interpreter and the compiled WebAssembly.
+
+fn fib(n: int) -> int
+    requires n >= 0
+    ensures result >= 0
+{
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() {
+    let i = 0
+    while i <= 15 {
+        print(fib(i))
+        i = i + 1
+    }
+}
+
+test "fib base cases" {
+    assert fib(0) == 0
+    assert fib(1) == 1
+}
+
+test "fib values" {
+    assert fib(10) == 55
+    assert fib(15) == 610
+}
+
+test "fib is monotonic from 1" {
+    let i = 1
+    while i < 12 {
+        assert fib(i + 1) >= fib(i)
+        i = i + 1
+    }
+}
