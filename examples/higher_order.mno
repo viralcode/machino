@@ -1,0 +1,57 @@
+# First-class functions: named functions are values with fn(...) types.
+# (machino has no capturing closures; pass state as arguments instead.)
+
+fn map_ints(xs: [int], f: fn(int) -> int) -> [int] {
+    let out: [int] = []
+    for i in 0..len(xs) {
+        out = push(out, f(xs[i]))
+    }
+    return out
+}
+
+fn filter_ints(xs: [int], keep: fn(int) -> bool) -> [int] {
+    let out: [int] = []
+    for i in 0..len(xs) {
+        if keep(xs[i]) {
+            out = push(out, xs[i])
+        }
+    }
+    return out
+}
+
+fn fold_ints(xs: [int], f: fn(int, int) -> int, init: int) -> int {
+    let acc = init
+    for i in 0..len(xs) {
+        acc = f(acc, xs[i])
+    }
+    return acc
+}
+
+fn double(n: int) -> int {
+    return n * 2
+}
+
+fn is_even(n: int) -> bool {
+    return n % 2 == 0
+}
+
+fn add(a: int, b: int) -> int {
+    return a + b
+}
+
+fn main() {
+    let xs = [1, 2, 3, 4, 5, 6]
+    let doubled = map_ints(xs, double)
+    let evens = filter_ints(xs, is_even)
+    print(fold_ints(doubled, add, 0))   # 42
+    print(fold_ints(evens, add, 0))     # 12
+
+    let op = double
+    print(op(21))                       # 42
+}
+
+test "map filter fold" {
+    assert fold_ints(map_ints([1, 2, 3], double), add, 0) == 12
+    assert len(filter_ints([1, 2, 3, 4], is_even)) == 2
+    assert fold_ints([10, 20], add, 5) == 35
+}

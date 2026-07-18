@@ -1,0 +1,348 @@
+# ============================================================
+# machino standard prelude
+# Compiled into every program. Written in machino itself, on
+# top of three string primitives: char_at, substr, chr.
+# ============================================================
+
+# ---- number formatting and parsing ----
+
+fn str_of_int(n: int) -> str {
+    if n == 0 {
+        return "0"
+    }
+    let neg = n < 0
+    let out = ""
+    let m = n
+    if neg {
+        # peel one digit while still negative, so i64 min does not overflow
+        out = chr(48 - m % 10)
+        m = -(m / 10)
+    }
+    while m > 0 {
+        out = chr(48 + m % 10) + out
+        m = m / 10
+    }
+    if neg {
+        return "-" + out
+    }
+    return out
+}
+
+fn str_of_bool(b: bool) -> str {
+    if b {
+        return "true"
+    }
+    return "false"
+}
+
+fn str_of_float(f: float, decimals: int) -> str
+    requires decimals >= 0 && decimals <= 9
+{
+    let neg = f < 0.0
+    let a = f
+    if neg {
+        a = 0.0 - a
+    }
+    let scale = 1
+    for i in 0..decimals {
+        scale = scale * 10
+    }
+    let scaled = to_int(a * to_float(scale) + 0.5)
+    let out = str_of_int(scaled / scale)
+    if decimals > 0 {
+        let fs = str_of_int(scaled % scale)
+        while len(fs) < decimals {
+            fs = "0" + fs
+        }
+        out = out + "." + fs
+    }
+    if neg {
+        return "-" + out
+    }
+    return out
+}
+
+fn is_digit(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn is_int_str(s: str) -> bool {
+    if len(s) == 0 {
+        return false
+    }
+    let i = 0
+    if char_at(s, 0) == 45 {
+        if len(s) == 1 {
+            return false
+        }
+        i = 1
+    }
+    while i < len(s) {
+        if !is_digit(char_at(s, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn parse_int(s: str) -> int
+    requires is_int_str(s)
+{
+    let neg = char_at(s, 0) == 45
+    let i = 0
+    if neg {
+        i = 1
+    }
+    # accumulate negatively so i64 min parses without overflow
+    let out = 0
+    while i < len(s) {
+        out = out * 10 - (char_at(s, i) - 48)
+        i = i + 1
+    }
+    if neg {
+        return out
+    }
+    return -out
+}
+
+# ---- string searching and slicing ----
+
+fn find_from(s: str, needle: str, start: int) -> int
+    requires start >= 0
+{
+    let n = len(s)
+    let m = len(needle)
+    if m == 0 {
+        if start <= n {
+            return start
+        }
+        return -1
+    }
+    let i = start
+    while i + m <= n {
+        let hit = true
+        for j in 0..m {
+            if char_at(s, i + j) != char_at(needle, j) {
+                hit = false
+                break
+            }
+        }
+        if hit {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn find(s: str, needle: str) -> int {
+    return find_from(s, needle, 0)
+}
+
+fn contains(s: str, needle: str) -> bool {
+    return find(s, needle) >= 0
+}
+
+fn starts_with(s: str, prefix: str) -> bool {
+    if len(prefix) > len(s) {
+        return false
+    }
+    return substr(s, 0, len(prefix)) == prefix
+}
+
+fn ends_with(s: str, suffix: str) -> bool {
+    if len(suffix) > len(s) {
+        return false
+    }
+    return substr(s, len(s) - len(suffix), len(s)) == suffix
+}
+
+fn split(s: str, sep: str) -> [str]
+    requires len(sep) > 0
+{
+    let out: [str] = []
+    let start = 0
+    while true {
+        let idx = find_from(s, sep, start)
+        if idx < 0 {
+            out = push(out, substr(s, start, len(s)))
+            break
+        }
+        out = push(out, substr(s, start, idx))
+        start = idx + len(sep)
+    }
+    return out
+}
+
+fn join(parts: [str], sep: str) -> str {
+    let out = ""
+    for i in 0..len(parts) {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + parts[i]
+    }
+    return out
+}
+
+fn is_space(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn trim(s: str) -> str {
+    let a = 0
+    let b = len(s)
+    while a < b && is_space(char_at(s, a)) {
+        a = a + 1
+    }
+    while b > a && is_space(char_at(s, b - 1)) {
+        b = b - 1
+    }
+    return substr(s, a, b)
+}
+
+fn to_upper(s: str) -> str {
+    let out = ""
+    for i in 0..len(s) {
+        let c = char_at(s, i)
+        if c >= 97 && c <= 122 {
+            c = c - 32
+        }
+        out = out + chr(c)
+    }
+    return out
+}
+
+fn to_lower(s: str) -> str {
+    let out = ""
+    for i in 0..len(s) {
+        let c = char_at(s, i)
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        out = out + chr(c)
+    }
+    return out
+}
+
+fn repeat(s: str, n: int) -> str
+    requires n >= 0
+{
+    let out = ""
+    for i in 0..n {
+        out = out + s
+    }
+    return out
+}
+
+# ---- StrMap: string-keyed map of strings ----
+
+struct StrMap {
+    keys: [str]
+    vals: [str]
+}
+
+fn strmap_new() -> StrMap {
+    let ks: [str] = []
+    let vs: [str] = []
+    return StrMap(ks, vs)
+}
+
+fn strmap_index(m: StrMap, key: str) -> int {
+    for i in 0..len(m.keys) {
+        if m.keys[i] == key {
+            return i
+        }
+    }
+    return -1
+}
+
+fn strmap_has(m: StrMap, key: str) -> bool {
+    return strmap_index(m, key) >= 0
+}
+
+fn strmap_set(m: StrMap, key: str, val: str) {
+    let i = strmap_index(m, key)
+    if i >= 0 {
+        m.vals[i] = val
+        return
+    }
+    m.keys = push(m.keys, key)
+    m.vals = push(m.vals, val)
+}
+
+fn strmap_get(m: StrMap, key: str) -> str
+    requires strmap_has(m, key)
+{
+    return m.vals[strmap_index(m, key)]
+}
+
+fn strmap_get_or(m: StrMap, key: str, default: str) -> str {
+    let i = strmap_index(m, key)
+    if i < 0 {
+        return default
+    }
+    return m.vals[i]
+}
+
+fn strmap_len(m: StrMap) -> int {
+    return len(m.keys)
+}
+
+# ---- int helpers ----
+
+fn abs_int(n: int) -> int
+    ensures result >= 0
+{
+    if n < 0 {
+        return -n
+    }
+    return n
+}
+
+fn min_int(a: int, b: int) -> int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn max_int(a: int, b: int) -> int {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn sum_ints(xs: [int]) -> int {
+    let out = 0
+    for i in 0..len(xs) {
+        out = out + xs[i]
+    }
+    return out
+}
+
+fn index_of_int(xs: [int], v: int) -> int {
+    for i in 0..len(xs) {
+        if xs[i] == v {
+            return i
+        }
+    }
+    return -1
+}
+
+fn sort_ints(xs: [int]) -> [int] {
+    let out: [int] = []
+    for i in 0..len(xs) {
+        out = push(out, xs[i])
+        let j = len(out) - 1
+        while j > 0 && out[j - 1] > out[j] {
+            let tmp = out[j]
+            out[j] = out[j - 1]
+            out[j - 1] = tmp
+            j = j - 1
+        }
+    }
+    return out
+}

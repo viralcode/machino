@@ -6,6 +6,7 @@ use crate::ast::*;
 use crate::diag::{Diagnostic, Span};
 use std::collections::HashMap;
 
+#[derive(Clone)]
 pub struct Signature {
     pub params: Vec<Type>,
     pub ret: Type,
@@ -14,10 +15,14 @@ pub struct Signature {
 pub struct Checker<'a> {
     pub program: &'a Program,
     pub signatures: HashMap<String, Signature>,
+    pub structs: HashMap<String, Vec<Param>>,
     diags: Vec<Diagnostic>,
+    loop_depth: u32,
 }
 
-const BUILTINS: &[&str] = &["print", "len", "push", "to_float", "to_int"];
+pub const BUILTINS: &[&str] = &[
+    "print", "len", "push", "to_float", "to_int", "char_at", "substr", "chr",
+];
 
 struct Scope {
     vars: Vec<HashMap<String, Type>>,
@@ -52,12 +57,52 @@ impl<'a> Checker<'a> {
         Checker {
             program,
             signatures: HashMap::new(),
+            structs: HashMap::new(),
             diags: Vec::new(),
+            loop_depth: 0,
         }
     }
 
     pub fn check(mut self) -> Result<(), Vec<Diagnostic>> {
-        // pass 1: collect signatures
+        // pass 0: collect structs
+        for s in &self.program.structs {
+            if BUILTINS.contains(&s.name.as_str()) || s.name == "result" || s.name == "memory" {
+                self.diags.push(Diagnostic::new(
+                    "E020",
+                    format!("'{}' is a reserved name and cannot be used for a struct", s.name),
+                    s.span,
+                ));
+                continue;
+            }
+            if self.structs.contains_key(&s.name) {
+                self.diags.push(Diagnostic::new(
+                    "E021",
+                    format!("struct '{}' is defined more than once", s.name),
+                    s.span,
+                ));
+                continue;
+            }
+            let mut seen: HashMap<&str, ()> = HashMap::new();
+            for f in &s.fields {
+                if seen.insert(&f.name, ()).is_some() {
+                    self.diags.push(Diagnostic::new(
+                        "E023",
+                        format!("duplicate field '{}' in struct '{}'", f.name, s.name),
+                        f.span,
+                    ));
+                }
+            }
+            self.structs.insert(s.name.clone(), s.fields.clone());
+        }
+        // validate field types now that all struct names are known
+        for s in &self.program.structs {
+            for f in &s.fields {
+                self.validate_type(&f.ty, f.span);
+            }
+        }
+
+        // pass 1: collect function signatures
+        let mut first_def: HashMap<String, (Span, bool)> = HashMap::new();
         for f in &self.program.functions {
             if BUILTINS.contains(&f.name.as_str()) {
                 self.diags.push(
@@ -66,7 +111,7 @@ impl<'a> Checker<'a> {
                         format!("'{}' is a builtin function and cannot be redefined", f.name),
                         f.span,
                     )
-                    .with_help("builtins: print, len, push, to_float, to_int"),
+                    .with_help(format!("builtins: {}", BUILTINS.join(", "))),
                 );
                 continue;
             }
@@ -81,13 +126,44 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             }
-            if self.signatures.contains_key(&f.name) {
+            if self.structs.contains_key(&f.name) {
                 self.diags.push(Diagnostic::new(
                     "E021",
-                    format!("function '{}' is defined more than once", f.name),
+                    format!("'{}' is already the name of a struct", f.name),
                     f.span,
                 ));
                 continue;
+            }
+            if let Some((orig_span, orig_is_std)) = first_def.get(&f.name).cloned() {
+                // report std collisions at the user's definition, not inside the prelude
+                if f.is_std && !orig_is_std {
+                    self.diags.push(
+                        Diagnostic::new(
+                            "E021",
+                            format!(
+                                "'{}' is a machino standard library function and cannot be redefined",
+                                f.name
+                            ),
+                            orig_span,
+                        )
+                        .with_help("pick a different name; std names are listed in docs/agent-guide.md"),
+                    );
+                } else {
+                    self.diags.push(Diagnostic::new(
+                        "E021",
+                        format!("function '{}' is defined more than once", f.name),
+                        f.span,
+                    ));
+                }
+                continue;
+            }
+            first_def.insert(f.name.clone(), (f.span, f.is_std));
+            for p in &f.params {
+                self.validate_type(&p.ty, p.span);
+            }
+            self.validate_type(&f.ret, f.span);
+            if f.is_extern {
+                self.validate_extern_types(f);
             }
             self.signatures.insert(
                 f.name.clone(),
@@ -119,6 +195,56 @@ impl<'a> Checker<'a> {
             Ok(())
         } else {
             Err(self.diags)
+        }
+    }
+
+    fn validate_type(&mut self, ty: &Type, span: Span) {
+        match ty {
+            Type::Struct(name) => {
+                if !self.structs.contains_key(name) {
+                    self.diags.push(
+                        Diagnostic::new("E018", format!("unknown type '{}'", name), span).with_help(
+                            "valid types: int, float, bool, str, [T], fn(T...) -> R, or a declared struct",
+                        ),
+                    );
+                }
+            }
+            Type::Array(inner) => self.validate_type(inner, span),
+            Type::Fn(params, ret) => {
+                for p in params {
+                    self.validate_type(p, span);
+                }
+                self.validate_type(ret, span);
+            }
+            _ => {}
+        }
+    }
+
+    fn validate_extern_types(&mut self, f: &Function) {
+        let ok = |t: &Type| {
+            matches!(
+                t,
+                Type::Int | Type::Float | Type::Bool | Type::Str | Type::Unit
+            ) || matches!(t, Type::Array(inner) if matches!(**inner, Type::Int | Type::Float | Type::Bool | Type::Str))
+        };
+        for p in &f.params {
+            if !ok(&p.ty) {
+                self.diags.push(
+                    Diagnostic::new(
+                        "E026",
+                        format!("extern parameter type '{}' is not host-transferable", p.ty),
+                        p.span,
+                    )
+                    .with_help("extern signatures may use int, float, bool, str, and arrays of those"),
+                );
+            }
+        }
+        if !ok(&f.ret) {
+            self.diags.push(Diagnostic::new(
+                "E026",
+                format!("extern return type '{}' is not host-transferable", f.ret),
+                f.span,
+            ));
         }
     }
 
@@ -197,6 +323,9 @@ impl<'a> Checker<'a> {
     fn check_stmt(&mut self, stmt: &Stmt, scope: &mut Scope, ret: &Type, in_test: bool) {
         match &stmt.kind {
             StmtKind::Let { name, ty, value } => {
+                if let Some(t) = ty {
+                    self.validate_type(t, stmt.span);
+                }
                 let inferred = self.infer(value, scope, ty.as_ref());
                 let final_ty = match (ty, inferred) {
                     (Some(annotated), Some(actual)) => {
@@ -259,26 +388,26 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            StmtKind::IndexAssign { name, index, value } => {
-                let var_ty = scope.lookup(name).cloned();
-                match var_ty {
+            StmtKind::IndexAssign { base, index, value } => {
+                let base_ty = self.infer(base, scope, None);
+                if let Some(ity) = self.infer(index, scope, Some(&Type::Int)) {
+                    if ity != Type::Int {
+                        self.diags.push(Diagnostic::new(
+                            "E033",
+                            format!("array index must be 'int', found '{}'", ity),
+                            index.span,
+                        ));
+                    }
+                }
+                match base_ty {
                     Some(Type::Array(elem)) => {
-                        if let Some(ity) = self.infer(index, scope, Some(&Type::Int)) {
-                            if ity != Type::Int {
-                                self.diags.push(Diagnostic::new(
-                                    "E033",
-                                    format!("array index must be 'int', found '{}'", ity),
-                                    index.span,
-                                ));
-                            }
-                        }
                         if let Some(vty) = self.infer(value, scope, Some(&elem)) {
                             if vty != *elem {
                                 self.diags.push(Diagnostic::new(
                                     "E030",
                                     format!(
-                                        "type mismatch: elements of '{}' are '{}' but the value has type '{}'",
-                                        name, elem, vty
+                                        "type mismatch: array elements are '{}' but the value has type '{}'",
+                                        elem, vty
                                     ),
                                     value.span,
                                 ));
@@ -288,17 +417,45 @@ impl<'a> Checker<'a> {
                     Some(other) => {
                         self.diags.push(Diagnostic::new(
                             "E034",
-                            format!("cannot index-assign into '{}' of type '{}'", name, other),
+                            format!("cannot index-assign into a value of type '{}'", other),
                             stmt.span,
                         ));
                     }
-                    None => {
+                    None => {}
+                }
+            }
+            StmtKind::FieldAssign { base, field, value } => {
+                let base_ty = self.infer(base, scope, None);
+                match base_ty {
+                    Some(Type::Struct(sname)) => {
+                        match self.field_type(&sname, field) {
+                            Some(fty) => {
+                                if let Some(vty) = self.infer(value, scope, Some(&fty)) {
+                                    if vty != fty {
+                                        self.diags.push(Diagnostic::new(
+                                            "E030",
+                                            format!(
+                                                "type mismatch: field '{}.{}' is '{}' but the value has type '{}'",
+                                                sname, field, fty, vty
+                                            ),
+                                            value.span,
+                                        ));
+                                    }
+                                }
+                            }
+                            None => {
+                                self.diags.push(self.no_field(&sname, field, stmt.span));
+                            }
+                        }
+                    }
+                    Some(other) => {
                         self.diags.push(Diagnostic::new(
-                            "E035",
-                            format!("unknown variable '{}'", name),
+                            "E034",
+                            format!("type '{}' has no fields to assign", other),
                             stmt.span,
                         ));
                     }
+                    None => {}
                 }
             }
             StmtKind::If {
@@ -314,7 +471,47 @@ impl<'a> Checker<'a> {
             StmtKind::While { cond, body } => {
                 let cty = self.infer(cond, scope, Some(&Type::Bool));
                 self.expect_bool(cty, cond.span, "while condition");
+                self.loop_depth += 1;
                 self.check_stmts(body, scope, ret, in_test);
+                self.loop_depth -= 1;
+            }
+            StmtKind::For {
+                var,
+                start,
+                end,
+                body,
+            } => {
+                for (e, what) in [(start, "range start"), (end, "range end")] {
+                    if let Some(t) = self.infer(e, scope, Some(&Type::Int)) {
+                        if t != Type::Int {
+                            self.diags.push(Diagnostic::new(
+                                "E033",
+                                format!("{} must be 'int', found '{}'", what, t),
+                                e.span,
+                            ));
+                        }
+                    }
+                }
+                scope.push();
+                scope.declare(var, Type::Int);
+                self.loop_depth += 1;
+                self.check_stmts(body, scope, ret, in_test);
+                self.loop_depth -= 1;
+                scope.pop();
+            }
+            StmtKind::Break | StmtKind::Continue => {
+                if self.loop_depth == 0 {
+                    let word = if matches!(stmt.kind, StmtKind::Break) {
+                        "break"
+                    } else {
+                        "continue"
+                    };
+                    self.diags.push(Diagnostic::new(
+                        "E027",
+                        format!("'{}' outside of a loop", word),
+                        stmt.span,
+                    ));
+                }
             }
             StmtKind::Return(value) => {
                 if in_test {
@@ -381,6 +578,33 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn field_type(&self, struct_name: &str, field: &str) -> Option<Type> {
+        self.structs
+            .get(struct_name)?
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| f.ty.clone())
+    }
+
+    fn no_field(&self, struct_name: &str, field: &str, span: Span) -> Diagnostic {
+        let fields = self
+            .structs
+            .get(struct_name)
+            .map(|fs| {
+                fs.iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        Diagnostic::new(
+            "E048",
+            format!("struct '{}' has no field '{}'", struct_name, field),
+            span,
+        )
+        .with_help(format!("fields of {}: {}", struct_name, fields))
+    }
+
     /// Infers an expression type. Returns None if an error was already
     /// reported for this subtree (to avoid cascading diagnostics).
     fn infer(&mut self, expr: &Expr, scope: &Scope, expected: Option<&Type>) -> Option<Type> {
@@ -389,21 +613,25 @@ impl<'a> Checker<'a> {
             ExprKind::Float(_) => Some(Type::Float),
             ExprKind::Bool(_) => Some(Type::Bool),
             ExprKind::Str(_) => Some(Type::Str),
-            ExprKind::Var(name) => match scope.lookup(name) {
-                Some(t) => Some(t.clone()),
-                None => {
-                    let mut d = Diagnostic::new(
-                        "E035",
-                        format!("unknown variable '{}'", name),
-                        expr.span,
-                    );
-                    if self.signatures.contains_key(name) {
-                        d = d.with_help(format!("'{}' is a function; call it: {}(...)", name, name));
-                    }
-                    self.diags.push(d);
-                    None
+            ExprKind::Var(name) => {
+                if let Some(t) = scope.lookup(name) {
+                    return Some(t.clone());
                 }
-            },
+                // a bare function name is a first-class function value
+                if let Some(sig) = self.signatures.get(name) {
+                    return Some(Type::Fn(sig.params.clone(), Box::new(sig.ret.clone())));
+                }
+                let mut d =
+                    Diagnostic::new("E035", format!("unknown variable '{}'", name), expr.span);
+                if self.structs.contains_key(name) {
+                    d = d.with_help(format!(
+                        "'{}' is a struct; construct it: {}(...)",
+                        name, name
+                    ));
+                }
+                self.diags.push(d);
+                None
+            }
             ExprKind::Array(elems) => {
                 let expected_elem = match expected {
                     Some(Type::Array(e)) => Some(e.as_ref()),
@@ -462,8 +690,28 @@ impl<'a> Checker<'a> {
                                 format!("cannot index into a value of type '{}'", other),
                                 base.span,
                             )
-                            .with_help("only arrays [T] can be indexed"),
+                            .with_help("only arrays [T] can be indexed; use char_at(s, i) for strings"),
                         );
+                        None
+                    }
+                }
+            }
+            ExprKind::Field(base, field) => {
+                let base_ty = self.infer(base, scope, None)?;
+                match base_ty {
+                    Type::Struct(sname) => match self.field_type(&sname, field) {
+                        Some(t) => Some(t),
+                        None => {
+                            self.diags.push(self.no_field(&sname, field, expr.span));
+                            None
+                        }
+                    },
+                    other => {
+                        self.diags.push(Diagnostic::new(
+                            "E034",
+                            format!("type '{}' has no fields", other),
+                            expr.span,
+                        ));
                         None
                     }
                 }
@@ -551,14 +799,14 @@ impl<'a> Checker<'a> {
                             ));
                             return None;
                         }
-                        if matches!(lt, Type::Array(_)) {
+                        if matches!(lt, Type::Array(_) | Type::Struct(_) | Type::Fn(_, _)) {
                             self.diags.push(
                                 Diagnostic::new(
                                     "E044",
-                                    "arrays cannot be compared with '==' or '!='",
+                                    format!("values of type '{}' cannot be compared with '==' or '!='", lt),
                                     expr.span,
                                 )
-                                .with_help("compare element-by-element in a loop"),
+                                .with_help("compare field-by-field or element-by-element"),
                             );
                             return None;
                         }
@@ -586,6 +834,42 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn check_args(&mut self, name: &str, params: &[Type], args: &[Expr], span: Span, scope: &Scope) {
+        if args.len() != params.len() {
+            self.diags.push(Diagnostic::new(
+                "E045",
+                format!(
+                    "'{}' takes {} argument(s), found {}",
+                    name,
+                    params.len(),
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        for (i, arg) in args.iter().enumerate() {
+            if let Some(param_ty) = params.get(i) {
+                if let Some(actual) = self.infer(arg, scope, Some(param_ty)) {
+                    if actual != *param_ty {
+                        self.diags.push(Diagnostic::new(
+                            "E030",
+                            format!(
+                                "type mismatch: argument {} of '{}' expects '{}', found '{}'",
+                                i + 1,
+                                name,
+                                param_ty,
+                                actual
+                            ),
+                            arg.span,
+                        ));
+                    }
+                }
+            } else {
+                self.infer(arg, scope, None);
+            }
+        }
+    }
+
     fn check_call(
         &mut self,
         name: &str,
@@ -594,6 +878,11 @@ impl<'a> Checker<'a> {
         scope: &Scope,
         expected: Option<&Type>,
     ) -> Option<Type> {
+        // 1. a local variable holding a function value shadows everything
+        if let Some(Type::Fn(params, ret)) = scope.lookup(name).cloned() {
+            self.check_args(name, &params, args, span, scope);
+            return Some(*ret);
+        }
         match name {
             "print" => {
                 if args.len() != 1 {
@@ -605,14 +894,14 @@ impl<'a> Checker<'a> {
                     return Some(Type::Unit);
                 }
                 let ty = self.infer(&args[0], scope, None)?;
-                if matches!(ty, Type::Array(_)) {
+                if matches!(ty, Type::Array(_) | Type::Struct(_) | Type::Fn(_, _)) {
                     self.diags.push(
                         Diagnostic::new(
                             "E046",
-                            "print does not accept arrays",
+                            format!("print does not accept values of type '{}'", ty),
                             args[0].span,
                         )
-                        .with_help("print elements individually in a loop"),
+                        .with_help("print scalar fields/elements, or build a str with str_of_int and '+'"),
                     );
                 }
                 Some(Type::Unit)
@@ -679,12 +968,36 @@ impl<'a> Checker<'a> {
                 }
             }
             "to_float" => {
-                self.check_conversion(args, span, scope, Type::Int, Type::Float, "to_float")
+                self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Float, "to_float")
             }
             "to_int" => {
-                self.check_conversion(args, span, scope, Type::Float, Type::Int, "to_int")
+                self.check_builtin_sig(args, span, scope, &[Type::Float], Type::Int, "to_int")
             }
+            "char_at" => self.check_builtin_sig(
+                args,
+                span,
+                scope,
+                &[Type::Str, Type::Int],
+                Type::Int,
+                "char_at",
+            ),
+            "substr" => self.check_builtin_sig(
+                args,
+                span,
+                scope,
+                &[Type::Str, Type::Int, Type::Int],
+                Type::Str,
+                "substr",
+            ),
+            "chr" => self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Str, "chr"),
             _ => {
+                // 2. struct constructor
+                if let Some(fields) = self.structs.get(name).cloned() {
+                    let params: Vec<Type> = fields.iter().map(|f| f.ty.clone()).collect();
+                    self.check_args(name, &params, args, span, scope);
+                    return Some(Type::Struct(name.to_string()));
+                }
+                // 3. named function or extern
                 let (params, ret) = match self.signatures.get(name) {
                     Some(sig) => (sig.params.clone(), sig.ret.clone()),
                     None => {
@@ -694,76 +1007,51 @@ impl<'a> Checker<'a> {
                                 format!("unknown function '{}'", name),
                                 span,
                             )
-                            .with_help("builtins: print, len, push, to_float, to_int"),
+                            .with_help(format!("builtins: {}", BUILTINS.join(", "))),
                         );
                         return None;
                     }
                 };
-                if args.len() != params.len() {
-                    self.diags.push(Diagnostic::new(
-                        "E045",
-                        format!(
-                            "'{}' takes {} argument(s), found {}",
-                            name,
-                            params.len(),
-                            args.len()
-                        ),
-                        span,
-                    ));
-                }
-                for (i, arg) in args.iter().enumerate() {
-                    if let Some(param_ty) = params.get(i) {
-                        if let Some(actual) = self.infer(arg, scope, Some(param_ty)) {
-                            if actual != *param_ty {
-                                self.diags.push(Diagnostic::new(
-                                    "E030",
-                                    format!(
-                                        "type mismatch: argument {} of '{}' expects '{}', found '{}'",
-                                        i + 1,
-                                        name,
-                                        param_ty,
-                                        actual
-                                    ),
-                                    arg.span,
-                                ));
-                            }
-                        }
-                    } else {
-                        self.infer(arg, scope, None);
-                    }
-                }
+                self.check_args(name, &params, args, span, scope);
                 Some(ret)
             }
         }
     }
 
-    fn check_conversion(
+    fn check_builtin_sig(
         &mut self,
         args: &[Expr],
         span: Span,
         scope: &Scope,
-        from: Type,
-        to: Type,
+        params: &[Type],
+        ret: Type,
         name: &str,
     ) -> Option<Type> {
-        if args.len() != 1 {
+        if args.len() != params.len() {
             self.diags.push(Diagnostic::new(
                 "E045",
-                format!("{} takes exactly 1 argument, found {}", name, args.len()),
+                format!(
+                    "{} takes exactly {} argument(s), found {}",
+                    name,
+                    params.len(),
+                    args.len()
+                ),
                 span,
             ));
-            return Some(to);
+            return Some(ret);
         }
-        if let Some(ty) = self.infer(&args[0], scope, Some(&from)) {
-            if ty != from {
-                self.diags.push(Diagnostic::new(
-                    "E030",
-                    format!("{} requires '{}', found '{}'", name, from, ty),
-                    args[0].span,
-                ));
+        for (arg, want) in args.iter().zip(params) {
+            if let Some(ty) = self.infer(arg, scope, Some(want)) {
+                if &ty != want {
+                    self.diags.push(Diagnostic::new(
+                        "E030",
+                        format!("{} requires '{}', found '{}'", name, want, ty),
+                        arg.span,
+                    ));
+                }
             }
         }
-        Some(to)
+        Some(ret)
     }
 
     fn numeric_mismatch(&self, op: &str, lt: &Type, rt: &Type, span: Span) -> Diagnostic {

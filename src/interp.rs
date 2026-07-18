@@ -1,11 +1,18 @@
 //! Tree-walking interpreter. This is the reference semantics of machino and
 //! the engine behind `machino run` and `machino test`. Contracts (requires /
 //! ensures) and asserts are always enforced here.
+//!
+//! The interpreter doubles as machino's **native runtime**: it provides a set
+//! of host externs (files, stdin, environment, TCP sockets, clock) so that
+//! programs — including long-running servers — can run directly with
+//! `machino run`, no WASM host required.
 
 use crate::ast::*;
 use crate::diag::Span;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::{BufRead, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
@@ -13,8 +20,12 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Str(Rc<String>),
+    /// Strings are byte strings (usually UTF-8), matching the WASM backend.
+    Str(Rc<Vec<u8>>),
     Array(Rc<RefCell<Vec<Value>>>),
+    Struct(Rc<RefCell<HashMap<String, Value>>>),
+    /// A first-class (named, non-capturing) function value.
+    Fn(String),
     Unit,
 }
 
@@ -30,10 +41,16 @@ impl Value {
                 }
             }
             Value::Bool(v) => v.to_string(),
-            Value::Str(s) => s.as_ref().clone(),
+            Value::Str(s) => String::from_utf8_lossy(s).into_owned(),
             Value::Array(_) => "<array>".to_string(),
+            Value::Struct(_) => "<struct>".to_string(),
+            Value::Fn(name) => format!("<fn {}>", name),
             Value::Unit => "<unit>".to_string(),
         }
+    }
+
+    fn str_value(text: &str) -> Value {
+        Value::Str(Rc::new(text.as_bytes().to_vec()))
     }
 }
 
@@ -54,15 +71,29 @@ impl RuntimeError {
 
 enum Flow {
     Normal,
+    Break,
+    Continue,
     Return(Value),
 }
 
-const MAX_CALL_DEPTH: usize = 4096;
+fn max_call_depth() -> usize {
+    std::env::var("MACHINO_MAX_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096)
+}
 
 pub struct Interp<'a> {
     functions: HashMap<&'a str, &'a Function>,
+    struct_fields: HashMap<&'a str, &'a [Param]>,
     depth: usize,
+    max_depth: usize,
     pub output: Box<dyn FnMut(&str) + 'a>,
+    /// Program arguments exposed through the args() extern.
+    pub args: Vec<String>,
+    listeners: HashMap<i64, TcpListener>,
+    conns: HashMap<i64, TcpStream>,
+    next_handle: i64,
 }
 
 type RResult<T> = Result<T, RuntimeError>;
@@ -73,10 +104,20 @@ impl<'a> Interp<'a> {
         for f in &program.functions {
             functions.insert(f.name.as_str(), f);
         }
+        let mut struct_fields = HashMap::new();
+        for s in &program.structs {
+            struct_fields.insert(s.name.as_str(), s.fields.as_slice());
+        }
         Interp {
             functions,
+            struct_fields,
             depth: 0,
+            max_depth: max_call_depth(),
             output: Box::new(|line| println!("{}", line)),
+            args: Vec::new(),
+            listeners: HashMap::new(),
+            conns: HashMap::new(),
+            next_handle: 1,
         }
     }
 
@@ -98,42 +139,50 @@ impl<'a> Interp<'a> {
     }
 
     fn call_function(&mut self, f: &'a Function, args: Vec<Value>, call_span: Span) -> RResult<Value> {
-        if self.depth >= MAX_CALL_DEPTH {
+        if self.depth >= self.max_depth {
             return Err(RuntimeError::new(
-                format!("stack overflow: call depth exceeded {}", MAX_CALL_DEPTH),
+                format!(
+                    "stack overflow: call depth exceeded {} (override with MACHINO_MAX_DEPTH)",
+                    self.max_depth
+                ),
                 call_span,
             ));
         }
 
-        if f.is_extern {
-            return self.call_extern(f, args, call_span);
-        }
-
-        let mut env: Vec<HashMap<String, Value>> = vec![HashMap::new()];
-        for (p, v) in f.params.iter().zip(args.iter()) {
-            env[0].insert(p.name.clone(), v.clone());
-        }
-
-        for c in &f.requires {
-            let ok = self.eval(&c.expr, &mut env)?;
-            if !matches!(ok, Value::Bool(true)) {
-                return Err(RuntimeError::new(
-                    format!(
-                        "contract violation: requires '{}' failed when calling '{}'",
-                        c.text, f.name
-                    ),
-                    call_span,
-                ));
+        // requires clauses run against the incoming arguments, for externs too
+        if !f.requires.is_empty() {
+            let mut env: Vec<HashMap<String, Value>> = vec![HashMap::new()];
+            for (p, v) in f.params.iter().zip(args.iter()) {
+                env[0].insert(p.name.clone(), v.clone());
+            }
+            for c in &f.requires {
+                let ok = self.eval(&c.expr, &mut env)?;
+                if !matches!(ok, Value::Bool(true)) {
+                    return Err(RuntimeError::new(
+                        format!(
+                            "contract violation: requires '{}' failed when calling '{}'",
+                            c.text, f.name
+                        ),
+                        call_span,
+                    ));
+                }
             }
         }
 
-        self.depth += 1;
-        let flow = self.exec_block(&f.body, &mut env);
-        self.depth -= 1;
-
-        let result = match flow? {
-            Flow::Return(v) => v,
-            Flow::Normal => Value::Unit,
+        let result = if f.is_extern {
+            self.call_extern(f, &args, call_span)?
+        } else {
+            let mut env: Vec<HashMap<String, Value>> = vec![HashMap::new()];
+            for (p, v) in f.params.iter().zip(args.iter()) {
+                env[0].insert(p.name.clone(), v.clone());
+            }
+            self.depth += 1;
+            let flow = self.exec_block(&f.body, &mut env);
+            self.depth -= 1;
+            match flow? {
+                Flow::Return(v) => v,
+                _ => Value::Unit,
+            }
         };
 
         if !f.ensures.is_empty() {
@@ -160,19 +209,215 @@ impl<'a> Interp<'a> {
         Ok(result)
     }
 
-    fn call_extern(&mut self, f: &'a Function, _args: Vec<Value>, call_span: Span) -> RResult<Value> {
+    // ---- native externs (the machino native runtime) ----
+
+    fn call_extern(&mut self, f: &'a Function, args: &[Value], call_span: Span) -> RResult<Value> {
+        let sig_err = |expected: &str| {
+            RuntimeError::new(
+                format!(
+                    "extern '{}' is declared with the wrong signature; the native runtime provides: {}",
+                    f.name, expected
+                ),
+                f.span,
+            )
+        };
+        macro_rules! check_sig {
+            ($params:expr, $ret:expr, $desc:expr) => {
+                if f.params.iter().map(|p| &p.ty).ne($params.iter()) || f.ret != $ret {
+                    return Err(sig_err($desc));
+                }
+            };
+        }
+
         match f.name.as_str() {
             "clock_ms" => {
+                check_sig!(Vec::<Type>::new(), Type::Int, "extern fn clock_ms() -> int");
                 let ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
                 Ok(Value::Int(ms))
             }
+            "sleep_ms" => {
+                check_sig!(vec![Type::Int], Type::Unit, "extern fn sleep_ms(ms: int)");
+                if let Value::Int(ms) = &args[0] {
+                    std::thread::sleep(std::time::Duration::from_millis((*ms).max(0) as u64));
+                }
+                Ok(Value::Unit)
+            }
+            "read_file" => {
+                check_sig!(vec![Type::Str], Type::Str, "extern fn read_file(path: str) -> str");
+                let path = as_string(&args[0]);
+                match std::fs::read(&path) {
+                    Ok(bytes) => Ok(Value::Str(Rc::new(bytes))),
+                    Err(e) => Err(RuntimeError::new(
+                        format!("read_file: cannot read '{}': {}", path, e),
+                        call_span,
+                    )),
+                }
+            }
+            "write_file" => {
+                check_sig!(
+                    vec![Type::Str, Type::Str],
+                    Type::Bool,
+                    "extern fn write_file(path: str, data: str) -> bool"
+                );
+                let path = as_string(&args[0]);
+                let data = match &args[1] {
+                    Value::Str(b) => b.as_ref().clone(),
+                    _ => Vec::new(),
+                };
+                Ok(Value::Bool(std::fs::write(&path, data).is_ok()))
+            }
+            "file_exists" => {
+                check_sig!(
+                    vec![Type::Str],
+                    Type::Bool,
+                    "extern fn file_exists(path: str) -> bool"
+                );
+                Ok(Value::Bool(
+                    std::path::Path::new(&as_string(&args[0])).exists(),
+                ))
+            }
+            "read_line" => {
+                check_sig!(Vec::<Type>::new(), Type::Str, "extern fn read_line() -> str");
+                let mut line = String::new();
+                let n = std::io::stdin().lock().read_line(&mut line).unwrap_or(0);
+                if n == 0 {
+                    return Ok(Value::str_value(""));
+                }
+                while line.ends_with('\n') || line.ends_with('\r') {
+                    line.pop();
+                }
+                Ok(Value::str_value(&line))
+            }
+            "getenv" => {
+                check_sig!(
+                    vec![Type::Str],
+                    Type::Str,
+                    "extern fn getenv(name: str) -> str"
+                );
+                let val = std::env::var(as_string(&args[0])).unwrap_or_default();
+                Ok(Value::str_value(&val))
+            }
+            "args" => {
+                check_sig!(
+                    Vec::<Type>::new(),
+                    Type::Array(Box::new(Type::Str)),
+                    "extern fn args() -> [str]"
+                );
+                let vals: Vec<Value> = self.args.iter().map(|a| Value::str_value(a)).collect();
+                Ok(Value::Array(Rc::new(RefCell::new(vals))))
+            }
+            "exit" => {
+                check_sig!(vec![Type::Int], Type::Unit, "extern fn exit(code: int)");
+                let code = match &args[0] {
+                    Value::Int(c) => *c as i32,
+                    _ => 0,
+                };
+                std::process::exit(code);
+            }
+            "tcp_listen" => {
+                check_sig!(
+                    vec![Type::Int],
+                    Type::Int,
+                    "extern fn tcp_listen(port: int) -> int"
+                );
+                let port = match &args[0] {
+                    Value::Int(p) => *p,
+                    _ => 0,
+                };
+                let listener = TcpListener::bind(("0.0.0.0", port as u16)).map_err(|e| {
+                    RuntimeError::new(
+                        format!("tcp_listen: cannot bind port {}: {}", port, e),
+                        call_span,
+                    )
+                })?;
+                let h = self.next_handle;
+                self.next_handle += 1;
+                self.listeners.insert(h, listener);
+                Ok(Value::Int(h))
+            }
+            "tcp_accept" => {
+                check_sig!(
+                    vec![Type::Int],
+                    Type::Int,
+                    "extern fn tcp_accept(listener: int) -> int"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let listener = self.listeners.get(&h).ok_or_else(|| {
+                    RuntimeError::new(format!("tcp_accept: invalid listener handle {}", h), call_span)
+                })?;
+                let (stream, _) = listener.accept().map_err(|e| {
+                    RuntimeError::new(format!("tcp_accept: {}", e), call_span)
+                })?;
+                let ch = self.next_handle;
+                self.next_handle += 1;
+                self.conns.insert(ch, stream);
+                Ok(Value::Int(ch))
+            }
+            "tcp_read" => {
+                check_sig!(
+                    vec![Type::Int],
+                    Type::Str,
+                    "extern fn tcp_read(conn: int) -> str"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let stream = self.conns.get_mut(&h).ok_or_else(|| {
+                    RuntimeError::new(format!("tcp_read: invalid connection handle {}", h), call_span)
+                })?;
+                let mut buf = vec![0u8; 65536];
+                let n = stream.read(&mut buf).map_err(|e| {
+                    RuntimeError::new(format!("tcp_read: {}", e), call_span)
+                })?;
+                buf.truncate(n);
+                Ok(Value::Str(Rc::new(buf)))
+            }
+            "tcp_write" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Int,
+                    "extern fn tcp_write(conn: int, data: str) -> int"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let data = match &args[1] {
+                    Value::Str(b) => b.clone(),
+                    _ => Rc::new(Vec::new()),
+                };
+                let stream = self.conns.get_mut(&h).ok_or_else(|| {
+                    RuntimeError::new(format!("tcp_write: invalid connection handle {}", h), call_span)
+                })?;
+                stream.write_all(&data).map_err(|e| {
+                    RuntimeError::new(format!("tcp_write: {}", e), call_span)
+                })?;
+                Ok(Value::Int(data.len() as i64))
+            }
+            "tcp_close" => {
+                check_sig!(vec![Type::Int], Type::Unit, "extern fn tcp_close(handle: int)");
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                self.conns.remove(&h);
+                self.listeners.remove(&h);
+                Ok(Value::Unit)
+            }
             other => Err(RuntimeError::new(
                 format!(
-                    "extern '{}' is not provided by the machino interpreter (built-in externs: clock_ms). \
-                     Compile with 'machino build' and provide it from your host runtime.",
+                    "extern '{}' is not provided by the machino native runtime. Available externs: \
+                     clock_ms, sleep_ms, read_file, write_file, file_exists, read_line, getenv, \
+                     args, exit, tcp_listen, tcp_accept, tcp_read, tcp_write, tcp_close. \
+                     For other capabilities, compile with 'machino build' and provide the import \
+                     from your own host.",
                     other
                 ),
                 call_span,
@@ -185,9 +430,9 @@ impl<'a> Interp<'a> {
         for s in stmts {
             match self.exec_stmt(s, env)? {
                 Flow::Normal => {}
-                ret => {
+                other => {
                     env.pop();
-                    return Ok(ret);
+                    return Ok(other);
                 }
             }
         }
@@ -215,14 +460,14 @@ impl<'a> Interp<'a> {
                     stmt.span,
                 ))
             }
-            StmtKind::IndexAssign { name, index, value } => {
+            StmtKind::IndexAssign { base, index, value } => {
+                let b = self.eval(base, env)?;
                 let idx = match self.eval(index, env)? {
                     Value::Int(i) => i,
                     _ => unreachable!("type checker guarantees int index"),
                 };
                 let v = self.eval(value, env)?;
-                let arr = self.lookup(env, name, stmt.span)?;
-                match arr {
+                match b {
                     Value::Array(cells) => {
                         let mut vec = cells.borrow_mut();
                         if idx < 0 || idx as usize >= vec.len() {
@@ -239,6 +484,17 @@ impl<'a> Interp<'a> {
                         Ok(Flow::Normal)
                     }
                     _ => unreachable!("type checker guarantees array"),
+                }
+            }
+            StmtKind::FieldAssign { base, field, value } => {
+                let b = self.eval(base, env)?;
+                let v = self.eval(value, env)?;
+                match b {
+                    Value::Struct(fields) => {
+                        fields.borrow_mut().insert(field.clone(), v);
+                        Ok(Flow::Normal)
+                    }
+                    _ => unreachable!("type checker guarantees struct"),
                 }
             }
             StmtKind::If {
@@ -260,12 +516,54 @@ impl<'a> Interp<'a> {
                         break;
                     }
                     match self.exec_block(body, env)? {
-                        Flow::Normal => {}
-                        ret => return Ok(ret),
+                        Flow::Normal | Flow::Continue => {}
+                        Flow::Break => break,
+                        ret @ Flow::Return(_) => return Ok(ret),
                     }
                 }
                 Ok(Flow::Normal)
             }
+            StmtKind::For {
+                var,
+                start,
+                end,
+                body,
+            } => {
+                let s = match self.eval(start, env)? {
+                    Value::Int(v) => v,
+                    _ => unreachable!(),
+                };
+                let e = match self.eval(end, env)? {
+                    Value::Int(v) => v,
+                    _ => unreachable!(),
+                };
+                env.push(HashMap::new());
+                let mut i = s;
+                while i < e {
+                    env.last_mut().unwrap().insert(var.clone(), Value::Int(i));
+                    match self.exec_block(body, env)? {
+                        Flow::Normal | Flow::Continue => {}
+                        Flow::Break => break,
+                        ret @ Flow::Return(_) => {
+                            env.pop();
+                            return Ok(ret);
+                        }
+                    }
+                    // read the variable back: assignments to the loop variable
+                    // inside the body affect iteration (same as compiled code)
+                    let current = match env.last().unwrap().get(var) {
+                        Some(Value::Int(v)) => *v,
+                        _ => i,
+                    };
+                    i = current.checked_add(1).ok_or_else(|| {
+                        RuntimeError::new("integer overflow in for-loop counter", stmt.span)
+                    })?;
+                }
+                env.pop();
+                Ok(Flow::Normal)
+            }
+            StmtKind::Break => Ok(Flow::Break),
+            StmtKind::Continue => Ok(Flow::Continue),
             StmtKind::Return(value) => {
                 let v = match value {
                     Some(e) => self.eval(e, env)?,
@@ -294,6 +592,10 @@ impl<'a> Interp<'a> {
                 return Ok(v.clone());
             }
         }
+        // a bare function name evaluates to a function value
+        if self.functions.contains_key(name) {
+            return Ok(Value::Fn(name.to_string()));
+        }
         Err(RuntimeError::new(
             format!("unknown variable '{}'", name),
             span,
@@ -305,7 +607,7 @@ impl<'a> Interp<'a> {
             ExprKind::Int(v) => Ok(Value::Int(*v)),
             ExprKind::Float(v) => Ok(Value::Float(*v)),
             ExprKind::Bool(v) => Ok(Value::Bool(*v)),
-            ExprKind::Str(s) => Ok(Value::Str(Rc::new(s.clone()))),
+            ExprKind::Str(s) => Ok(Value::str_value(s)),
             ExprKind::Var(name) => self.lookup(env, name, expr.span),
             ExprKind::Array(elems) => {
                 let mut vals = Vec::with_capacity(elems.len());
@@ -335,6 +637,17 @@ impl<'a> Interp<'a> {
                         }
                         Ok(vec[idx as usize].clone())
                     }
+                    _ => unreachable!(),
+                }
+            }
+            ExprKind::Field(base, field) => {
+                let b = self.eval(base, env)?;
+                match b {
+                    Value::Struct(fields) => Ok(fields
+                        .borrow()
+                        .get(field)
+                        .cloned()
+                        .expect("type checker guarantees field exists")),
                     _ => unreachable!(),
                 }
             }
@@ -375,6 +688,21 @@ impl<'a> Interp<'a> {
                 for a in args {
                     vals.push(self.eval(a, env)?);
                 }
+                // a local variable holding a function value shadows everything
+                let local_fn = env
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.get(name.as_str()))
+                    .and_then(|v| match v {
+                        Value::Fn(fname) => Some(fname.clone()),
+                        _ => None,
+                    });
+                if let Some(fname) = local_fn {
+                    let f = self.functions.get(fname.as_str()).copied().ok_or_else(|| {
+                        RuntimeError::new(format!("unknown function '{}'", fname), expr.span)
+                    })?;
+                    return self.call_function(f, vals, expr.span);
+                }
                 match name.as_str() {
                     "print" => {
                         let s = vals[0].display();
@@ -383,7 +711,7 @@ impl<'a> Interp<'a> {
                     }
                     "len" => match &vals[0] {
                         Value::Array(cells) => Ok(Value::Int(cells.borrow().len() as i64)),
-                        Value::Str(s) => Ok(Value::Int(s.as_bytes().len() as i64)),
+                        Value::Str(s) => Ok(Value::Int(s.len() as i64)),
                         _ => unreachable!(),
                     },
                     "push" => match &vals[0] {
@@ -400,7 +728,7 @@ impl<'a> Interp<'a> {
                     },
                     "to_int" => match vals[0] {
                         Value::Float(f) => {
-                            if !f.is_finite() || f < i64::MIN as f64 || f > i64::MAX as f64 {
+                            if !f.is_finite() || f < i64::MIN as f64 || f >= i64::MAX as f64 {
                                 return Err(RuntimeError::new(
                                     format!("to_int: value {} is out of int range", f),
                                     expr.span,
@@ -410,7 +738,60 @@ impl<'a> Interp<'a> {
                         }
                         _ => unreachable!(),
                     },
+                    "char_at" => match (&vals[0], &vals[1]) {
+                        (Value::Str(s), Value::Int(i)) => {
+                            if *i < 0 || *i as usize >= s.len() {
+                                return Err(RuntimeError::new(
+                                    format!(
+                                        "char_at out of bounds: index {} but length is {}",
+                                        i,
+                                        s.len()
+                                    ),
+                                    expr.span,
+                                ));
+                            }
+                            Ok(Value::Int(s[*i as usize] as i64))
+                        }
+                        _ => unreachable!(),
+                    },
+                    "substr" => match (&vals[0], &vals[1], &vals[2]) {
+                        (Value::Str(s), Value::Int(a), Value::Int(b)) => {
+                            if *a < 0 || a > b || *b as usize > s.len() {
+                                return Err(RuntimeError::new(
+                                    format!(
+                                        "substr out of range: [{}, {}) on a string of length {}",
+                                        a,
+                                        b,
+                                        s.len()
+                                    ),
+                                    expr.span,
+                                ));
+                            }
+                            Ok(Value::Str(Rc::new(s[*a as usize..*b as usize].to_vec())))
+                        }
+                        _ => unreachable!(),
+                    },
+                    "chr" => match vals[0] {
+                        Value::Int(c) => {
+                            if !(0..=255).contains(&c) {
+                                return Err(RuntimeError::new(
+                                    format!("chr: byte value {} is out of range 0..=255", c),
+                                    expr.span,
+                                ));
+                            }
+                            Ok(Value::Str(Rc::new(vec![c as u8])))
+                        }
+                        _ => unreachable!(),
+                    },
                     other => {
+                        if let Some(fields) = self.struct_fields.get(other) {
+                            // struct constructor
+                            let mut map = HashMap::with_capacity(fields.len());
+                            for (fld, v) in fields.iter().zip(vals) {
+                                map.insert(fld.name.clone(), v);
+                            }
+                            return Ok(Value::Struct(Rc::new(RefCell::new(map))));
+                        }
                         let f = self.functions.get(other).copied().ok_or_else(|| {
                             RuntimeError::new(format!("unknown function '{}'", other), expr.span)
                         })?;
@@ -461,7 +842,7 @@ impl<'a> Interp<'a> {
             (Div, Float(a), Float(b)) => Ok(Float(a / b)),
             (Add, Str(a), Str(b)) => {
                 let mut s = a.as_ref().clone();
-                s.push_str(&b);
+                s.extend_from_slice(&b);
                 Ok(Str(Rc::new(s)))
             }
             (Eq, a, b) => Ok(Bool(values_eq(&a, &b))),
@@ -476,6 +857,13 @@ impl<'a> Interp<'a> {
             (Ge, Float(a), Float(b)) => Ok(Bool(a >= b)),
             _ => unreachable!("type checker rejects other operand combinations"),
         }
+    }
+}
+
+fn as_string(v: &Value) -> String {
+    match v {
+        Value::Str(b) => String::from_utf8_lossy(b).into_owned(),
+        _ => String::new(),
     }
 }
 

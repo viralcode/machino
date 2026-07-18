@@ -7,15 +7,19 @@ mod parser;
 mod synth;
 mod wasm;
 
-use diag::{line_col, Diagnostic};
+use diag::{line_col, Diagnostic, Span};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+/// The standard prelude, compiled into every program.
+const STD_PRELUDE: &str = include_str!("std.mno");
 
 const USAGE: &str = "machino — an AI-first language that compiles to WebAssembly
 
 USAGE:
-  machino check <file.mno> [--json]     type-check; emit structured diagnostics
-  machino test  <file.mno> [--json]     run test blocks (contracts enforced)
-  machino run   <file.mno>              run fn main() in the sandboxed interpreter
+  machino check <file.mno> [--json]      type-check; emit structured diagnostics
+  machino test  <file.mno> [--json]      run test blocks (contracts enforced)
+  machino run   <file.mno> [args...]     run fn main() in the native runtime
   machino build <file.mno> [-o out.wasm] compile to a portable .wasm module
   machino synth [--count N] [--seed S] [--out DIR]  generate a verified corpus
 
@@ -47,40 +51,182 @@ fn main() -> ExitCode {
     }
 }
 
+// ---- source bundling (imports + prelude) ----
+
+struct Segment {
+    path: String,
+    start: u32,
+    len: u32,
+}
+
 struct Loaded {
-    source: String,
+    bundle: String,
+    segments: Vec<Segment>,
     program: ast::Program,
 }
 
-/// Lex + parse + type-check. Prints diagnostics and returns None on failure.
-fn load(path: &str, json: bool) -> Option<Loaded> {
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read '{}': {}", path, e);
-            return None;
+impl Loaded {
+    /// Maps a bundle-relative span to (file path, file source, local span).
+    fn locate(&self, span: Span) -> (&str, &str, Span) {
+        for seg in &self.segments {
+            if span.start >= seg.start && span.start < seg.start + seg.len.max(1) {
+                let src = &self.bundle[seg.start as usize..(seg.start + seg.len) as usize];
+                let local = Span::new(
+                    span.start - seg.start,
+                    span.end.saturating_sub(seg.start).min(seg.len),
+                );
+                return (&seg.path, src, local);
+            }
         }
-    };
-    let diags: Vec<Diagnostic> = match compile_front(&source) {
-        Ok(program) => return Some(Loaded { source, program }),
-        Err(d) => d,
-    };
-    report(&diags, &source, path, json);
-    None
+        ("<unknown>", &self.bundle, span)
+    }
+
+    fn render_error(&self, d: &Diagnostic) -> String {
+        let (path, src, local) = self.locate(d.span);
+        let mut mapped = Diagnostic::new(d.code, d.message.clone(), local);
+        mapped.help = d.help.clone();
+        mapped.render_human(src, path)
+    }
+
+    fn error_json(&self, d: &Diagnostic) -> String {
+        let (path, src, local) = self.locate(d.span);
+        let mut mapped = Diagnostic::new(d.code, d.message.clone(), local);
+        mapped.help = d.help.clone();
+        mapped.to_json(src, path)
+    }
+
+    fn runtime_location(&self, span: Span) -> String {
+        let (path, src, local) = self.locate(span);
+        let (line, col) = line_col(src, local.start);
+        format!("{}:{}:{}", path, line, col)
+    }
 }
 
-fn compile_front(source: &str) -> Result<ast::Program, Vec<Diagnostic>> {
-    let tokens = lexer::lex(source).map_err(|d| vec![d])?;
+/// Parses one file just enough to discover its imports.
+fn discover_imports(source: &str, path: &str) -> Result<Vec<String>, String> {
+    let tokens = lexer::lex(source)
+        .map_err(|d| d.render_human(source, path))?;
     let program = parser::Parser::new(&tokens, source)
         .parse_program()
+        .map_err(|d| d.render_human(source, path))?;
+    Ok(program.imports.into_iter().map(|(p, _)| p).collect())
+}
+
+/// Reads the entry file plus its transitive imports and appends the std
+/// prelude, producing a single bundle with a segment map for diagnostics.
+fn bundle_sources(entry: &str) -> Result<(String, Vec<Segment>), String> {
+    let mut ordered: Vec<(String, String)> = Vec::new(); // (display path, source)
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut queue: Vec<(PathBuf, String)> = Vec::new();
+
+    let entry_path = PathBuf::from(entry);
+    queue.push((entry_path.clone(), entry.to_string()));
+
+    while let Some((path, display)) = queue.pop() {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !visited.insert(canon) {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .map_err(|e| format!("error: cannot read '{}': {}", display, e))?;
+        let imports = discover_imports(&source, &display)?;
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        for imp in imports {
+            let ipath = dir.join(&imp);
+            if !ipath.exists() {
+                return Err(format!(
+                    "error: cannot resolve import \"{}\" (from {}): file not found at {}",
+                    imp,
+                    display,
+                    ipath.display()
+                ));
+            }
+            queue.push((ipath.clone(), ipath.display().to_string()));
+        }
+        ordered.push((display, source));
+    }
+
+    let mut bundle = String::new();
+    let mut segments = Vec::new();
+    for (path, source) in &ordered {
+        segments.push(Segment {
+            path: path.clone(),
+            start: bundle.len() as u32,
+            len: source.len() as u32 + 1,
+        });
+        bundle.push_str(source);
+        bundle.push('\n');
+    }
+    segments.push(Segment {
+        path: "<machino std>".to_string(),
+        start: bundle.len() as u32,
+        len: STD_PRELUDE.len() as u32,
+    });
+    bundle.push_str(STD_PRELUDE);
+    Ok((bundle, segments))
+}
+
+/// Lex + parse + type-check a bundle. The std segment starts at `std_start`.
+fn compile_bundle(bundle: &str, std_start: u32) -> Result<ast::Program, Vec<Diagnostic>> {
+    let tokens = lexer::lex(bundle).map_err(|d| vec![d])?;
+    let mut program = parser::Parser::new(&tokens, bundle)
+        .parse_program()
         .map_err(|d| vec![d])?;
+    for f in &mut program.functions {
+        f.is_std = f.span.start >= std_start;
+    }
+    for s in &mut program.structs {
+        s.is_std = s.span.start >= std_start;
+    }
     checker::Checker::new(&program).check()?;
     Ok(program)
 }
 
-fn report(diags: &[Diagnostic], source: &str, path: &str, json: bool) {
+/// Used by synth, where there are no imports: source + prelude.
+fn compile_front(source: &str) -> Result<ast::Program, Vec<Diagnostic>> {
+    let mut bundle = String::with_capacity(source.len() + STD_PRELUDE.len() + 1);
+    bundle.push_str(source);
+    bundle.push('\n');
+    let std_start = bundle.len() as u32;
+    bundle.push_str(STD_PRELUDE);
+    compile_bundle(&bundle, std_start)
+}
+
+fn load(path: &str, json: bool) -> Option<Loaded> {
+    let (bundle, segments) = match bundle_sources(path) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            return None;
+        }
+    };
+    let std_start = segments.last().map(|s| s.start).unwrap_or(0);
+    match compile_bundle(&bundle, std_start) {
+        Ok(program) => Some(Loaded {
+            bundle,
+            segments,
+            program,
+        }),
+        Err(diags) => {
+            let loaded = Loaded {
+                bundle,
+                segments,
+                program: ast::Program {
+                    functions: vec![],
+                    structs: vec![],
+                    tests: vec![],
+                    imports: vec![],
+                },
+            };
+            report(&diags, &loaded, json);
+            None
+        }
+    }
+}
+
+fn report(diags: &[Diagnostic], loaded: &Loaded, json: bool) {
     if json {
-        let items: Vec<String> = diags.iter().map(|d| d.to_json(source, path)).collect();
+        let items: Vec<String> = diags.iter().map(|d| loaded.error_json(d)).collect();
         println!(
             "{{\"ok\":false,\"errors\":{},\"diagnostics\":[{}]}}",
             diags.len(),
@@ -88,7 +234,7 @@ fn report(diags: &[Diagnostic], source: &str, path: &str, json: bool) {
         );
     } else {
         for d in diags {
-            eprintln!("{}", d.render_human(source, path));
+            eprintln!("{}", loaded.render_error(d));
         }
         eprintln!(
             "check failed: {} error{}",
@@ -115,19 +261,27 @@ fn cmd_check(rest: &[String]) -> ExitCode {
     };
     match load(path, json) {
         Some(loaded) => {
-            let n_fns = loaded.program.functions.len();
+            let n_fns = loaded
+                .program
+                .functions
+                .iter()
+                .filter(|f| !f.is_std)
+                .count();
+            let n_structs = loaded.program.structs.iter().filter(|s| !s.is_std).count();
             let n_tests = loaded.program.tests.len();
             if json {
                 println!(
-                    "{{\"ok\":true,\"errors\":0,\"functions\":{},\"tests\":{}}}",
-                    n_fns, n_tests
+                    "{{\"ok\":true,\"errors\":0,\"functions\":{},\"structs\":{},\"tests\":{}}}",
+                    n_fns, n_structs, n_tests
                 );
             } else {
                 println!(
-                    "ok: {} ({} function{}, {} test{})",
+                    "ok: {} ({} function{}, {} struct{}, {} test{})",
                     path,
                     n_fns,
                     if n_fns == 1 { "" } else { "s" },
+                    n_structs,
+                    if n_structs == 1 { "" } else { "s" },
                     n_tests,
                     if n_tests == 1 { "" } else { "s" }
                 );
@@ -172,18 +326,17 @@ fn cmd_test(rest: &[String]) -> ExitCode {
                 }
             }
             Err(e) => {
-                let (line, col) = line_col(&loaded.source, e.span.start);
+                let loc = loaded.runtime_location(e.span);
                 if json {
                     results.push(format!(
-                        "{{\"name\":\"{}\",\"ok\":false,\"error\":\"{}\",\"line\":{},\"col\":{}}}",
+                        "{{\"name\":\"{}\",\"ok\":false,\"error\":\"{}\",\"location\":\"{}\"}}",
                         diag::json_escape(&t.name),
                         diag::json_escape(&e.message),
-                        line,
-                        col
+                        diag::json_escape(&loc)
                     ));
                 } else {
                     println!("FAIL  {}", t.name);
-                    println!("      {} ({}:{}:{})", e.message, path, line, col);
+                    println!("      {} ({})", e.message, loc);
                 }
             }
         }
@@ -211,15 +364,21 @@ fn cmd_run(rest: &[String]) -> ExitCode {
     let Some(path) = parse_file_arg(rest, "run") else {
         return ExitCode::from(2);
     };
+    let file_pos = rest.iter().position(|a| a == path).unwrap_or(0);
+    let program_args: Vec<String> = rest[file_pos + 1..].to_vec();
     let Some(loaded) = load(path, false) else {
         return ExitCode::FAILURE;
     };
     let mut interp = interp::Interp::new(&loaded.program);
+    interp.args = program_args;
     match interp.run_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            let (line, col) = line_col(&loaded.source, e.span.start);
-            eprintln!("runtime error: {} ({}:{}:{})", e.message, path, line, col);
+            eprintln!(
+                "runtime error: {} ({})",
+                e.message,
+                loaded.runtime_location(e.span)
+            );
             ExitCode::FAILURE
         }
     }
@@ -244,11 +403,16 @@ fn cmd_build(rest: &[String]) -> ExitCode {
     let Some(loaded) = load(path, false) else {
         return ExitCode::FAILURE;
     };
-    if !loaded.program.functions.iter().any(|f| f.name == "main" && !f.is_extern) {
+    if !loaded
+        .program
+        .functions
+        .iter()
+        .any(|f| f.name == "main" && !f.is_extern)
+    {
         eprintln!("error: 'machino build' requires a 'fn main()' entry point");
         return ExitCode::FAILURE;
     }
-    let bytes = wasm::compile(&loaded.program, &loaded.source);
+    let bytes = wasm::compile(&loaded.program, &loaded.bundle);
     match std::fs::write(&out_path, &bytes) {
         Ok(()) => {
             println!("wrote {} ({} bytes)", out_path, bytes.len());

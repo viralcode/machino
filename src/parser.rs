@@ -84,7 +84,9 @@ impl<'a> Parser<'a> {
 
     pub fn parse_program(&mut self) -> PResult<Program> {
         let mut functions = Vec::new();
+        let mut structs = Vec::new();
         let mut tests = Vec::new();
+        let mut imports = Vec::new();
         loop {
             self.skip_newlines();
             match self.peek() {
@@ -94,12 +96,33 @@ impl<'a> Parser<'a> {
                     self.advance();
                     functions.push(self.parse_function(true)?);
                 }
+                Tok::Struct => structs.push(self.parse_struct()?),
                 Tok::Test => tests.push(self.parse_test()?),
+                Tok::Import => {
+                    let tok = self.advance();
+                    match self.advance() {
+                        Token {
+                            tok: Tok::Str(path),
+                            span,
+                        } => {
+                            imports.push((path, tok.span.merge(span)));
+                            self.expect_stmt_end()?;
+                        }
+                        t => {
+                            return Err(Diagnostic::new(
+                                "E014",
+                                format!("expected import path string, found {}", describe(&t.tok)),
+                                t.span,
+                            )
+                            .with_help("imports are written: import \"lib/util.mno\""));
+                        }
+                    }
+                }
                 other => {
                     return Err(Diagnostic::new(
                         "E012",
                         format!(
-                            "expected 'fn', 'extern fn' or 'test' at top level, found {}",
+                            "expected 'fn', 'extern fn', 'struct', 'test' or 'import' at top level, found {}",
                             describe(other)
                         ),
                         self.peek_span(),
@@ -108,7 +131,52 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Ok(Program { functions, tests })
+        Ok(Program {
+            functions,
+            structs,
+            tests,
+            imports,
+        })
+    }
+
+    fn parse_struct(&mut self) -> PResult<StructDef> {
+        let struct_tok = self.expect(Tok::Struct, "'struct'")?;
+        let name = self.parse_ident("struct name")?;
+        self.skip_newlines();
+        self.expect(Tok::LBrace, "'{' to open struct body")?;
+        let mut fields = Vec::new();
+        loop {
+            self.skip_newlines();
+            if matches!(self.peek(), Tok::RBrace) {
+                self.advance();
+                break;
+            }
+            let fspan = self.peek_span();
+            let fname = self.parse_ident("field name")?;
+            self.expect(Tok::Colon, "':' after field name")?;
+            let ty = self.parse_type()?;
+            fields.push(Param {
+                name: fname,
+                ty,
+                span: fspan,
+            });
+            self.expect_stmt_end()?;
+        }
+        let end = self.tokens[self.pos.saturating_sub(1)].span;
+        if fields.is_empty() {
+            return Err(Diagnostic::new(
+                "E013",
+                format!("struct '{}' has no fields", name),
+                struct_tok.span.merge(end),
+            )
+            .with_help("declare at least one field: struct Point { x: int }"));
+        }
+        Ok(StructDef {
+            name,
+            fields,
+            is_std: false,
+            span: struct_tok.span.merge(end),
+        })
     }
 
     fn parse_function(&mut self, is_extern: bool) -> PResult<Function> {
@@ -174,6 +242,7 @@ impl<'a> Parser<'a> {
                 ensures,
                 body: Vec::new(),
                 is_extern: true,
+                is_std: false,
                 span: fn_tok.span.merge(end),
             });
         }
@@ -188,6 +257,7 @@ impl<'a> Parser<'a> {
             ensures,
             body,
             is_extern: false,
+            is_std: false,
             span: fn_tok.span.merge(end),
         })
     }
@@ -310,6 +380,42 @@ impl<'a> Parser<'a> {
                     span: start.merge(end),
                 })
             }
+            Tok::For => {
+                self.advance();
+                let var = self.parse_ident("loop variable name")?;
+                self.expect(Tok::In, "'in' after loop variable")?;
+                let range_start = self.parse_expr()?;
+                self.expect(Tok::DotDot, "'..' in range")
+                    .map_err(|d| d.with_help("for loops iterate over a range: for i in 0..n { ... }"))?;
+                let range_end = self.parse_expr()?;
+                let body = self.parse_block()?;
+                let end = self.tokens[self.pos.saturating_sub(1)].span;
+                Ok(Stmt {
+                    kind: StmtKind::For {
+                        var,
+                        start: range_start,
+                        end: range_end,
+                        body,
+                    },
+                    span: start.merge(end),
+                })
+            }
+            Tok::Break => {
+                self.advance();
+                self.expect_stmt_end()?;
+                Ok(Stmt {
+                    kind: StmtKind::Break,
+                    span: start,
+                })
+            }
+            Tok::Continue => {
+                self.advance();
+                self.expect_stmt_end()?;
+                Ok(Stmt {
+                    kind: StmtKind::Continue,
+                    span: start,
+                })
+            }
             Tok::Return => {
                 self.advance();
                 let value = if matches!(self.peek(), Tok::Newline | Tok::RBrace | Tok::Eof) {
@@ -337,55 +443,45 @@ impl<'a> Parser<'a> {
                     span,
                 })
             }
-            Tok::Ident(name) => {
-                // lookahead: assignment, index assignment, or expression
-                let next = &self.tokens[self.pos + 1].tok;
-                match next {
-                    Tok::Assign => {
-                        self.advance();
-                        self.advance();
-                        let value = self.parse_expr()?;
-                        let span = start.merge(value.span);
-                        self.expect_stmt_end()?;
-                        Ok(Stmt {
-                            kind: StmtKind::Assign { name, value },
-                            span,
-                        })
-                    }
-                    Tok::LBracket => {
-                        // could be a[i] = v  (index assign) or a[i] used in expression
-                        let save = self.pos;
-                        self.advance(); // ident
-                        self.advance(); // [
-                        let index = self.parse_expr()?;
-                        if self.eat(&Tok::RBracket) && self.eat(&Tok::Assign) {
-                            let value = self.parse_expr()?;
-                            let span = start.merge(value.span);
-                            self.expect_stmt_end()?;
-                            return Ok(Stmt {
-                                kind: StmtKind::IndexAssign { name, index, value },
-                                span,
-                            });
+            Tok::Ident(_) => {
+                // parse an expression, then decide: assignment or expression stmt
+                let expr = self.parse_expr()?;
+                if matches!(self.peek(), Tok::Assign) {
+                    self.advance();
+                    let value = self.parse_expr()?;
+                    let span = start.merge(value.span);
+                    self.expect_stmt_end()?;
+                    let kind = match expr.kind {
+                        ExprKind::Var(name) => StmtKind::Assign { name, value },
+                        ExprKind::Index(base, index) => StmtKind::IndexAssign {
+                            base: *base,
+                            index: *index,
+                            value,
+                        },
+                        ExprKind::Field(base, field) => StmtKind::FieldAssign {
+                            base: *base,
+                            field,
+                            value,
+                        },
+                        _ => {
+                            return Err(Diagnostic::new(
+                                "E016",
+                                "invalid assignment target",
+                                expr.span,
+                            )
+                            .with_help(
+                                "you can assign to a variable, an array element xs[i], or a struct field p.x",
+                            ));
                         }
-                        self.pos = save;
-                        let expr = self.parse_expr()?;
-                        let span = expr.span;
-                        self.expect_stmt_end()?;
-                        Ok(Stmt {
-                            kind: StmtKind::Expr(expr),
-                            span,
-                        })
-                    }
-                    _ => {
-                        let expr = self.parse_expr()?;
-                        let span = expr.span;
-                        self.expect_stmt_end()?;
-                        Ok(Stmt {
-                            kind: StmtKind::Expr(expr),
-                            span,
-                        })
-                    }
+                    };
+                    return Ok(Stmt { kind, span });
                 }
+                let span = expr.span;
+                self.expect_stmt_end()?;
+                Ok(Stmt {
+                    kind: StmtKind::Expr(expr),
+                    span,
+                })
             }
             other => Err(Diagnostic::new(
                 "E016",
@@ -411,19 +507,15 @@ impl<'a> Parser<'a> {
     fn parse_type(&mut self) -> PResult<Type> {
         match self.advance() {
             Token {
-                tok: Tok::Ident(s),
-                span,
+                tok: Tok::Ident(s), ..
             } => match s.as_str() {
                 "int" => Ok(Type::Int),
                 "float" => Ok(Type::Float),
                 "bool" => Ok(Type::Bool),
                 "str" => Ok(Type::Str),
-                other => Err(Diagnostic::new(
-                    "E018",
-                    format!("unknown type '{}'", other),
-                    span,
-                )
-                .with_help("valid types: int, float, bool, str, [T]")),
+                // any other identifier is a struct name; existence is
+                // validated by the type checker
+                _ => Ok(Type::Struct(s)),
             },
             Token {
                 tok: Tok::LBracket, ..
@@ -432,12 +524,31 @@ impl<'a> Parser<'a> {
                 self.expect(Tok::RBracket, "']' to close array type")?;
                 Ok(Type::Array(Box::new(inner)))
             }
+            Token { tok: Tok::Fn, .. } => {
+                self.expect(Tok::LParen, "'(' in function type")?;
+                let mut params = Vec::new();
+                if !matches!(self.peek(), Tok::RParen) {
+                    loop {
+                        params.push(self.parse_type()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(Tok::RParen, "')' in function type")?;
+                let ret = if self.eat(&Tok::Arrow) {
+                    self.parse_type()?
+                } else {
+                    Type::Unit
+                };
+                Ok(Type::Fn(params, Box::new(ret)))
+            }
             t => Err(Diagnostic::new(
                 "E018",
                 format!("expected a type, found {}", describe(&t.tok)),
                 t.span,
             )
-            .with_help("valid types: int, float, bool, str, [T]")),
+            .with_help("valid types: int, float, bool, str, [T], fn(T...) -> R, or a struct name")),
         }
     }
 
@@ -562,17 +673,39 @@ impl<'a> Parser<'a> {
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let mut expr = self.parse_atom()?;
         loop {
-            if matches!(self.peek(), Tok::LBracket) {
-                self.advance();
-                let index = self.parse_expr()?;
-                let rb = self.expect(Tok::RBracket, "']' to close index")?;
-                let span = expr.span.merge(rb.span);
-                expr = Expr {
-                    kind: ExprKind::Index(Box::new(expr), Box::new(index)),
-                    span,
-                };
-            } else {
-                break;
+            match self.peek() {
+                Tok::LBracket => {
+                    self.advance();
+                    let index = self.parse_expr()?;
+                    let rb = self.expect(Tok::RBracket, "']' to close index")?;
+                    let span = expr.span.merge(rb.span);
+                    expr = Expr {
+                        kind: ExprKind::Index(Box::new(expr), Box::new(index)),
+                        span,
+                    };
+                }
+                Tok::Dot => {
+                    self.advance();
+                    let fspan = self.peek_span();
+                    let field = self.parse_ident("field name after '.'")?;
+                    if matches!(self.peek(), Tok::LParen) {
+                        return Err(Diagnostic::new(
+                            "E019",
+                            "machino has no methods",
+                            fspan,
+                        )
+                        .with_help(format!(
+                            "call a plain function with the value as an argument: {}(...)",
+                            field
+                        )));
+                    }
+                    let span = expr.span.merge(fspan);
+                    expr = Expr {
+                        kind: ExprKind::Field(Box::new(expr), field),
+                        span,
+                    };
+                }
+                _ => break,
             }
         }
         Ok(expr)
@@ -671,6 +804,10 @@ fn describe(tok: &Tok) -> String {
         Tok::If => "'if'".to_string(),
         Tok::Else => "'else'".to_string(),
         Tok::While => "'while'".to_string(),
+        Tok::For => "'for'".to_string(),
+        Tok::In => "'in'".to_string(),
+        Tok::Break => "'break'".to_string(),
+        Tok::Continue => "'continue'".to_string(),
         Tok::Return => "'return'".to_string(),
         Tok::True => "'true'".to_string(),
         Tok::False => "'false'".to_string(),
@@ -678,6 +815,8 @@ fn describe(tok: &Tok) -> String {
         Tok::Ensures => "'ensures'".to_string(),
         Tok::Test => "'test'".to_string(),
         Tok::Assert => "'assert'".to_string(),
+        Tok::Struct => "'struct'".to_string(),
+        Tok::Import => "'import'".to_string(),
         Tok::LParen => "'('".to_string(),
         Tok::RParen => "')'".to_string(),
         Tok::LBrace => "'{'".to_string(),
@@ -686,6 +825,8 @@ fn describe(tok: &Tok) -> String {
         Tok::RBracket => "']'".to_string(),
         Tok::Comma => "','".to_string(),
         Tok::Colon => "':'".to_string(),
+        Tok::Dot => "'.'".to_string(),
+        Tok::DotDot => "'..'".to_string(),
         Tok::Arrow => "'->'".to_string(),
         Tok::Assign => "'='".to_string(),
         Tok::Plus => "'+'".to_string(),

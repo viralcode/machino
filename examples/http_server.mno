@@ -1,0 +1,83 @@
+# A real HTTP server written in machino.
+#
+#   machino run examples/http_server.mno 8080
+#   curl http://localhost:8080/
+#
+# Sockets are capabilities: the program declares the externs it needs and the
+# host (machino's native runtime) provides them.
+
+extern fn tcp_listen(port: int) -> int
+extern fn tcp_accept(listener: int) -> int
+extern fn tcp_read(conn: int) -> str
+extern fn tcp_write(conn: int, data: str) -> int
+extern fn tcp_close(handle: int)
+extern fn args() -> [str]
+
+fn request_path(request: str) -> str {
+    # "GET /path HTTP/1.1" -> "/path"
+    let head = split(request, "\r\n")[0]
+    let parts = split(head, " ")
+    if len(parts) < 2 {
+        return "/"
+    }
+    return parts[1]
+}
+
+fn html_page(counter: int) -> str {
+    # a statement continues across lines only inside parentheses
+    return ("<!DOCTYPE html><html><body style=\"font-family: sans-serif\">"
+        + "<h1>machino http server</h1>"
+        + "<p>request number " + str_of_int(counter) + "</p>"
+        + "<p>try <a href=\"/hello/you\">/hello/you</a> or <a href=\"/quit\">/quit</a></p>"
+        + "</body></html>")
+}
+
+fn respond(conn: int, status: str, content_type: str, body: str) {
+    let response = ("HTTP/1.1 " + status + "\r\n"
+        + "Content-Type: " + content_type + "\r\n"
+        + "Content-Length: " + str_of_int(len(body)) + "\r\n"
+        + "Connection: close\r\n"
+        + "\r\n"
+        + body)
+    tcp_write(conn, response)
+}
+
+fn main() {
+    let argv = args()
+    let port = 8080
+    if len(argv) > 0 && is_int_str(argv[0]) {
+        port = parse_int(argv[0])
+    }
+    let listener = tcp_listen(port)
+    print("listening on http://localhost:" + str_of_int(port))
+
+    let counter = 0
+    let running = true
+    while running {
+        let conn = tcp_accept(listener)
+        let request = tcp_read(conn)
+        let path = request_path(request)
+        counter = counter + 1
+
+        if path == "/quit" {
+            respond(conn, "200 OK", "text/plain", "bye\n")
+            running = false
+        } else if starts_with(path, "/hello/") {
+            let name = substr(path, 7, len(path))
+            respond(conn, "200 OK", "text/plain", "hello, " + name + "!\n")
+        } else if path == "/" {
+            respond(conn, "200 OK", "text/html", html_page(counter))
+        } else {
+            respond(conn, "404 Not Found", "text/plain", "not found: " + path + "\n")
+        }
+        tcp_close(conn)
+    }
+    tcp_close(listener)
+    print("server stopped after " + str_of_int(counter) + " requests")
+}
+
+test "request parsing" {
+    assert request_path("GET /abc HTTP/1.1\r\nHost: x\r\n\r\n") == "/abc"
+    assert request_path("POST / HTTP/1.1\r\n\r\n") == "/"
+    assert request_path("garbage") == "/"
+}

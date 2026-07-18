@@ -1,0 +1,37 @@
+# Text processing with the std prelude: split, trim, to_lower, StrMap.
+
+fn count_words(text: str) -> StrMap {
+    let counts = strmap_new()
+    let words = split(to_lower(text), " ")
+    for i in 0..len(words) {
+        let w = trim(words[i])
+        if len(w) == 0 {
+            continue
+        }
+        let n = parse_int(strmap_get_or(counts, w, "0"))
+        strmap_set(counts, w, str_of_int(n + 1))
+    }
+    return counts
+}
+
+fn main() {
+    let text = "the quick brown fox jumps over the lazy dog the fox"
+    let counts = count_words(text)
+    let keys = counts.keys
+    for i in 0..len(keys) {
+        print(keys[i] + ": " + strmap_get(counts, keys[i]))
+    }
+}
+
+test "word counting" {
+    let counts = count_words("a b a c a b")
+    assert strmap_get(counts, "a") == "3"
+    assert strmap_get(counts, "b") == "2"
+    assert strmap_get(counts, "c") == "1"
+    assert strmap_len(counts) == 3
+}
+
+test "case and spacing" {
+    let counts = count_words("Dog dog  DOG")
+    assert strmap_get(counts, "dog") == "3"
+}

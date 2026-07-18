@@ -109,30 +109,44 @@ The whole pipeline is ~4,500 lines of dependency-free Rust — small enough to r
 | Path | What it is |
 |---|---|
 | `src/lexer.rs` → `src/parser.rs` → `src/checker.rs` | frontend: newline-terminated grammar, full static typing, stable `E0xx` diagnostics |
-| `src/interp.rs` | reference interpreter — the language's ground-truth semantics (`run`, `test`) |
+| `src/interp.rs` | reference interpreter + native runtime: files, stdin, env, TCP sockets (`run`, `test`) |
 | `src/wasm.rs` | WebAssembly **binary emitter**: hand-rolled encoding, no LLVM, no external toolchain |
+| `src/std.mno` | the standard prelude, written in machino itself |
 | `src/synth.rs` | verified-corpus generator |
 | `runners/` | reference hosts: Node CLI and a drag-and-drop browser page |
-| `tests/cli.rs` | end-to-end suite, including a wasm-vs-interpreter equivalence check on every example |
+| `tests/cli.rs` | end-to-end suite: wasm-vs-interpreter equivalence on every feature, plus a live HTTP-server test |
 
 Compiled modules use a simple, documented ABI: every value is one wasm value (`i64`/`f64`), strings and arrays live in linear memory as `[len][payload]`, and the module imports exactly five host functions (`print_*`, `fail`) plus whatever `extern fn`s the program declares. That `extern fn` seam is the FFI *and* the capability system — a machino program cannot name any host power the host didn't explicitly provide.
 
+## You can write real software in it — including servers
+
+`examples/http_server.mno` is a complete HTTP server written in machino: request parsing with the std string library, path routing, 404s, and graceful shutdown. Sockets are capabilities — the program declares the `extern fn`s it needs and the runtime provides them:
+
+```sh
+machino run examples/http_server.mno 8080
+curl http://localhost:8080/hello/world   # -> hello, world!
+```
+
+The `machino run` interpreter doubles as a **native runtime** with files, stdin, environment, CLI args, TCP sockets, and clock — so agents can ship CLI tools and network services directly, the way they'd use `node script.js` or `python app.py`.
+
 ## Language at a glance
 
-- **Types:** `int` (i64), `float` (f64), `bool`, `str`, `[T]` — no implicit conversions, ever
-- **Control flow:** `if` / `else`, `while`, `return`
-- **Contracts:** `requires` (checked at entry), `ensures` (checks `result` at exit)
-- **Builtins:** `print`, `len`, `push`, `to_float`, `to_int`
-- **Safety:** bounds-checked indexing, trapping division by zero, block scoping, no nulls, no globals
-- **Interop:** `extern fn` → WASM imports, provided by the host
+- **Types:** `int` (i64, checked arithmetic), `float` (f64), `bool`, `str`, `[T]`, structs, `fn(T...) -> R` function values — no implicit conversions, ever
+- **Data modeling:** nominal `struct`s with positional constructors and field assignment, string-keyed maps (`StrMap`) in the prelude
+- **Control flow:** `if` / `else`, `while`, `for i in a..b`, `break`, `continue`, `return`
+- **Contracts:** `requires` (checked at entry), `ensures` (checks `result` at exit) — enforced in the interpreter *and* in compiled WASM, with identical messages
+- **Std prelude, written in machino itself:** `split`/`join`/`trim`/`find`/`substr`, `parse_int`/`str_of_int`/`str_of_float`, `StrMap`, sorting — dead-code-eliminated from compiled binaries
+- **Modules:** `import "lib/util.mno"` with transitive resolution and per-file diagnostics
+- **Safety:** bounds-checked indexing, trapping overflow and division by zero, block scoping, no nulls, no globals, no undefined behavior
+- **Interop:** `extern fn` → WASM imports, provided by the host (files, sockets, env, clock in the native runtime)
 
 Full details in [SPEC.md](SPEC.md).
 
 ## Status and roadmap
 
-This is **v0.1** — a real, working end-to-end system, intentionally small enough to hold in a model's context window. Known limits, documented in the spec: no structs or `for` loops yet, no GC (bump allocator; fine for short-lived programs), and int overflow traps in the interpreter but wraps in WASM.
+This is **v0.2** — a real, working end-to-end system, intentionally small enough to hold in a model's context window. Honest limits, documented in the spec: named functions are first-class but there are no capturing closures, no garbage collector (bump allocator — fine for scripts and request handlers), and no generics yet.
 
-Planned for v0.2+: structs, pattern matching, unified overflow semantics, WASM-GC, a module system, and static contract verification (SMT) for a decidable subset.
+Planned for v0.3+: enums and pattern matching, generics, a WASM-GC backend, static contract verification (SMT) for a decidable subset, and a package registry.
 
 ## License
 

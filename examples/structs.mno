@@ -1,0 +1,60 @@
+# Structs: nominal record types with reference semantics.
+# Constructors are positional: Point(1.0, 2.0).
+
+struct Point {
+    x: float
+    y: float
+}
+
+struct Circle {
+    center: Point
+    radius: float
+}
+
+fn dist(a: Point, b: Point) -> float {
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    return sqrt_approx(dx * dx + dy * dy)
+}
+
+# Newton's method; machino has no float stdlib yet, so we write one.
+fn sqrt_approx(v: float) -> float
+    requires v >= 0.0
+    ensures result >= 0.0
+{
+    if v == 0.0 {
+        return 0.0
+    }
+    let guess = v
+    for i in 0..40 {
+        guess = (guess + v / guess) / 2.0
+    }
+    return guess
+}
+
+fn contains_point(c: Circle, p: Point) -> bool {
+    return dist(c.center, p) <= c.radius
+}
+
+fn main() {
+    let c = Circle(Point(0.0, 0.0), 5.0)
+    print(contains_point(c, Point(3.0, 4.0)))   # on the edge: true
+    print(contains_point(c, Point(4.0, 4.0)))   # outside: false
+
+    # structs are references: mutation is visible through aliases
+    let p = c.center
+    p.x = 10.0
+    print(c.center.x)
+}
+
+test "geometry" {
+    let c = Circle(Point(0.0, 0.0), 5.0)
+    assert contains_point(c, Point(0.0, 0.0))
+    assert contains_point(c, Point(3.0, 4.0))
+    assert !contains_point(c, Point(5.1, 0.0))
+}
+
+test "sqrt" {
+    let r = sqrt_approx(2.0)
+    assert r > 1.41421 && r < 1.41422
+}

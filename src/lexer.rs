@@ -18,6 +18,10 @@ pub enum Tok {
     If,
     Else,
     While,
+    For,
+    In,
+    Break,
+    Continue,
     Return,
     True,
     False,
@@ -25,6 +29,8 @@ pub enum Tok {
     Ensures,
     Test,
     Assert,
+    Struct,
+    Import,
     // punctuation
     LParen,
     RParen,
@@ -34,6 +40,8 @@ pub enum Tok {
     RBracket,
     Comma,
     Colon,
+    Dot,     // .
+    DotDot,  // ..
     Arrow,   // ->
     Assign,  // =
     // operators
@@ -133,6 +141,15 @@ pub fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
             ':' => {
                 i += 1;
                 push!(Tok::Colon, start, i);
+            }
+            '.' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'.' {
+                    i += 2;
+                    push!(Tok::DotDot, start, i);
+                } else {
+                    i += 1;
+                    push!(Tok::Dot, start, i);
+                }
             }
             '+' => {
                 i += 1;
@@ -342,6 +359,10 @@ pub fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
                     "if" => Tok::If,
                     "else" => Tok::Else,
                     "while" => Tok::While,
+                    "for" => Tok::For,
+                    "in" => Tok::In,
+                    "break" => Tok::Break,
+                    "continue" => Tok::Continue,
                     "return" => Tok::Return,
                     "true" => Tok::True,
                     "false" => Tok::False,
@@ -349,6 +370,8 @@ pub fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
                     "ensures" => Tok::Ensures,
                     "test" => Tok::Test,
                     "assert" => Tok::Assert,
+                    "struct" => Tok::Struct,
+                    "import" => Tok::Import,
                     _ => Tok::Ident(word.to_string()),
                 };
                 push!(tok, i, end);

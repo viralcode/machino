@@ -77,11 +77,20 @@ const drop = document.getElementById("drop");
 const fileInput = document.getElementById("file");
 
 let memory;
+let alloc;
 function readStr(addr) {
   const a = Number(addr);
   const view = new DataView(memory.buffer);
   const len = Number(view.getBigInt64(a, true));
   return new TextDecoder().decode(new Uint8Array(memory.buffer, a + 8, len));
+}
+function makeStr(text) {
+  const bytes = new TextEncoder().encode(text);
+  const addr = Number(alloc(BigInt(8 + bytes.length)));
+  const view = new DataView(memory.buffer);
+  view.setBigInt64(addr, BigInt(bytes.length), true);
+  new Uint8Array(memory.buffer, addr + 8, bytes.length).set(bytes);
+  return BigInt(addr);
 }
 function line(text, cls) {
   const span = document.createElement("span");
@@ -101,11 +110,16 @@ async function run(bytes, name) {
       print_bool: (v) => line(v === 0n ? "false" : "true"),
       print_str: (addr) => line(readStr(addr)),
       clock_ms: () => BigInt(Date.now()),
+      getenv: () => makeStr(""),
+      read_line: () => makeStr(window.prompt("machino read_line()") ?? ""),
+      exit: () => { throw new WebAssembly.RuntimeError("exit"); },
+      // file and socket externs are not available in the browser sandbox
     },
   };
   try {
     const { instance } = await WebAssembly.instantiate(bytes, imports);
     memory = instance.exports.memory;
+    alloc = instance.exports.alloc;
     instance.exports.main();
     line("— finished —", "meta");
   } catch (e) {
