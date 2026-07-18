@@ -1,0 +1,56 @@
+# Generic syntax example (experimental)
+# Note: Full generic implementation in progress
+# This demonstrates the target syntax
+
+# Generic swap would look like: fn<T> swap(arr: [T], i: int, j: int) -> [T]
+# For now, we use concrete types
+
+fn swap_ints(arr: [int], i: int, j: int) -> [int] {
+    let temp = arr[i]
+    arr[i] = arr[j]
+    arr[j] = temp
+    return arr
+}
+
+fn bubble_sort(arr: [int]) -> [int] {
+    let n = len(arr)
+    for i in 0..n {
+        for j in 0..(n - i - 1) {
+            if arr[j] > arr[j + 1] {
+                arr = swap_ints(arr, j, j + 1)
+            }
+        }
+    }
+    return arr
+}
+
+# Future: Generic version will allow this to work with [float], [str], etc.
+# fn<T> sort(arr: [T]) -> [T] where T: Ord
+
+fn main() {
+    print("=== Sorting Example ===")
+    print("(Generics syntax supported, full implementation in progress)")
+    print("")
+    
+    let nums = [64, 34, 25, 12, 22, 11, 90]
+    print("Before sorting:")
+    for i in 0..len(nums) {
+        print(nums[i])
+    }
+    
+    let sorted = bubble_sort(nums)
+    print("After sorting:")
+    for i in 0..len(sorted) {
+        print(sorted[i])
+    }
+}
+
+test "sort works" {
+    let arr = [3, 1, 4, 1, 5, 9, 2, 6]
+    let sorted = bubble_sort(arr)
+    assert sorted[0] == 1
+    assert sorted[1] == 1
+    assert sorted[2] == 2
+    assert sorted[len(sorted) - 1] == 9
+}
+

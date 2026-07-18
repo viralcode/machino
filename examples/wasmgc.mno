@@ -1,0 +1,73 @@
+# WASM-GC Backend Example
+# Demonstrates features that benefit from automatic memory management
+
+struct Node {
+    value: int
+    next: int  # In real GC version, this would be (ref Node)
+}
+
+# Tree structure that benefits from GC
+fn create_list(size: int) -> [Node] {
+    let nodes: [Node] = []
+    for i in 0..size {
+        let node = Node(i, i + 1)
+        nodes = push(nodes, node)
+    }
+    return nodes
+}
+
+# Recursive structure that would benefit from automatic GC
+fn sum_list(nodes: [Node], idx: int) -> int {
+    if idx >= len(nodes) {
+        return 0
+    }
+    return nodes[idx].value + sum_list(nodes, idx + 1)
+}
+
+# Allocate and deallocate many objects - GC handles it automatically
+fn stress_test(iterations: int) -> int {
+    let total = 0
+    for i in 0..iterations {
+        let nodes = create_list(10)
+        total = total + sum_list(nodes, 0)
+        # With GC, nodes are automatically collected here
+    }
+    return total
+}
+
+fn main() {
+    print("=== WASM-GC Example ===")
+    print("Creating linked list...")
+    
+    let nodes = create_list(5)
+    print("Created " + str_of_int(len(nodes)) + " nodes")
+    
+    print("List values:")
+    for i in 0..len(nodes) {
+        print("  Node " + str_of_int(i) + ": value=" + str_of_int(nodes[i].value))
+    }
+    
+    let sum = sum_list(nodes, 0)
+    print("Sum of values: " + str_of_int(sum))
+    
+    print("")
+    print("Running stress test (100 iterations)...")
+    let total = stress_test(100)
+    print("Total: " + str_of_int(total))
+    print("With WASM-GC, no manual memory management needed!")
+}
+
+test "list operations" {
+    let nodes = create_list(3)
+    assert len(nodes) == 3
+    assert nodes[0].value == 0
+    assert nodes[1].value == 1
+    assert nodes[2].value == 2
+}
+
+test "sum calculation" {
+    let nodes = create_list(5)
+    let sum = sum_list(nodes, 0)
+    assert sum == 0 + 1 + 2 + 3 + 4
+    assert sum == 10
+}
