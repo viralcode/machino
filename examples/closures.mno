@@ -1,0 +1,71 @@
+# Capturing closures: lambdas that close over enclosing variables by value.
+# Captured variables are read-only; to share mutable state, capture a
+# struct or array and mutate its contents.
+
+struct Counter {
+    count: int
+}
+
+fn make_adder(n: int) -> fn(int) -> int {
+    return fn(x: int) -> int { return x + n }
+}
+
+fn compose(f: fn(int) -> int, g: fn(int) -> int) -> fn(int) -> int {
+    return fn(x: int) -> int { return g(f(x)) }
+}
+
+fn map_ints(xs: [int], f: fn(int) -> int) -> [int] {
+    let out: [int] = []
+    for i in 0..len(xs) {
+        out = push(out, f(xs[i]))
+    }
+    return out
+}
+
+fn make_counter() -> fn() -> int {
+    let state = Counter(0)
+    return fn() -> int {
+        state.count = state.count + 1
+        return state.count
+    }
+}
+
+fn main() {
+    let add3 = make_adder(3)
+    let add7 = make_adder(7)
+    print(add3(10))
+    print(add7(10))
+
+    let add10 = compose(add3, add7)
+    print(add10(5))
+
+    let doubled = map_ints([1, 2, 3, 4], fn(x: int) -> int { return x * 2 })
+    for i in 0..len(doubled) {
+        print(doubled[i])
+    }
+
+    let tick = make_counter()
+    print(tick())
+    print(tick())
+    print(tick())
+}
+
+test "closures capture by value" {
+    let f = make_adder(100)
+    assert f(1) == 101
+    assert f(f(1)) == 201
+}
+
+test "composition" {
+    let inc = make_adder(1)
+    let inc2 = compose(inc, inc)
+    assert inc2(0) == 2
+}
+
+test "counters keep independent state" {
+    let a = make_counter()
+    let b = make_counter()
+    assert a() == 1
+    assert a() == 2
+    assert b() == 1
+}

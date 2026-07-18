@@ -28,6 +28,7 @@ the exact fix. Trust `help`.
 ```
 # comment (to end of line)
 import "lib/util.mno"        # imports at the top; paths relative to this file
+import "pkg:mathx/mathx.mno" # package import (machino_modules/, see below)
 
 struct Point {               # structs: nominal record types
     x: float
@@ -49,13 +50,17 @@ fn safe_div(a: int, b: int) -> int
     return a / b
 }
 
-# first-class functions (no closures; pass state as arguments)
+# first-class functions and capturing lambdas
 fn map_ints(xs: [int], f: fn(int) -> int) -> [int] {
     let out: [int] = []
     for i in 0..len(xs) {
         out = push(out, f(xs[i]))
     }
     return out
+}
+
+fn make_adder(n: int) -> fn(int) -> int {
+    return fn(x: int) -> int { return x + n }   # captures n by value
 }
 
 # host imports (FFI/capabilities); the host must provide them
@@ -76,6 +81,8 @@ fn main() {
     let msg = ("long strings wrap"
         + " only inside parentheses")   # newlines end statements otherwise
     print(msg)
+    let doubled = map_ints(xs, fn(x: int) -> int { return x * 2 })
+    print(doubled[0])
 }
 
 test "math" {
@@ -93,7 +100,13 @@ test "math" {
 - `push(xs, v)` does NOT mutate; always rebind: `xs = push(xs, v)`.
 - Structs/arrays are references; `==` works only on scalars and `str`.
 - No methods: `p.dist()` is an error; write `dist(p)`.
-- No closures: a `fn`-typed value must be a named top-level function.
+- Lambdas: `fn(x: int) -> int { return x + n }` is an expression; it
+  captures enclosing variables **by value** and captured variables are
+  **read-only** (E049). To share mutable state, capture a struct or array
+  and mutate its *contents*. Lambdas can't recurse (no name) and have no
+  contracts. Named functions also work as `fn`-typed values.
+- Calls apply to *names* only — `f(1)(2)` doesn't parse. Bind the
+  intermediate: `let g = f(1)` then `g(2)`.
 - Each statement on its own line; wrap long expressions in `(...)`.
 - Every path in a value-returning function must `return`.
 - In `ensures`, `result` is the return value; parameters are the *original*
@@ -142,6 +155,20 @@ Servers: `tcp_listen` → loop `tcp_accept` → `tcp_read` → `tcp_write` →
 `tcp_close`. See `examples/http_server.mno` for a complete HTTP server.
 The Node WASM host provides everything except `tcp_*`.
 
+## Packages
+
+```
+machino pkg init myapp                 # creates machino.pkg in this directory
+machino pkg add mathx ../mathx         # local path dependency (copied)
+machino pkg add strkit https://github.com/user/strkit 0.2.0   # git, at a tag
+machino pkg sync                       # (re)install everything + machino.lock
+```
+
+Then import with the `pkg:` prefix: `import "pkg:mathx/mathx.mno"`.
+Dependencies land in `machino_modules/` (commit machino.pkg and
+machino.lock; ignore machino_modules). Transitive deps are flattened —
+one source per package name.
+
 ## Error codes you will see most
 
 | Code | Meaning | Usual fix |
@@ -154,6 +181,7 @@ The Node WASM host provides everything except `tcp_*`.
 | E011 | expected end of statement | split lines, or wrap in `(...)` |
 | E021 | name already defined | prelude names are reserved; rename |
 | E048 | no such struct field | check the field list in the error's help |
+| E049 | assigning to a captured variable | capture a struct/array and mutate its contents |
 
 ## Deployment
 
@@ -163,3 +191,8 @@ The Node WASM host provides everything except `tcp_*`.
 into `runners/run.html` in a browser, or embed it in any WebAssembly runtime.
 Contracts, asserts, bounds checks, and overflow checks stay enforced in the
 compiled binary, with the same messages as the interpreter.
+
+The compiled module includes a mark-sweep garbage collector: loops that
+allocate freely (string building, `push` in a loop, closures) run in bounded
+memory. Memory is capped at 1 GiB; a program whose *live* data exceeds that
+traps with `out of memory`.

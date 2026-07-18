@@ -9,6 +9,7 @@ pub struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
     source: &'a str,
+    lambda_counter: usize,
 }
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -19,6 +20,7 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             source,
+            lambda_counter: 0,
         }
     }
 
@@ -758,6 +760,48 @@ impl<'a> Parser<'a> {
                         span,
                     })
                 }
+            }
+            Tok::Fn => {
+                // lambda expression: fn(x: int) -> int { ... }
+                self.expect(Tok::LParen, "'(' after 'fn' in a lambda")?;
+                let mut params = Vec::new();
+                if !matches!(self.peek(), Tok::RParen) {
+                    loop {
+                        let pstart = self.peek_span();
+                        let pname = self.parse_ident("parameter name")?;
+                        self.expect(Tok::Colon, "':' after parameter name")?;
+                        let ty = self.parse_type()?;
+                        params.push(Param {
+                            name: pname,
+                            ty,
+                            span: pstart,
+                        });
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(Tok::RParen, "')' after lambda parameters")?;
+                let ret = if self.eat(&Tok::Arrow) {
+                    self.parse_type()?
+                } else {
+                    Type::Unit
+                };
+                // id assigned before the body parses: outer lambdas get
+                // smaller ids than nested ones (compilation order relies on it)
+                let id = self.lambda_counter;
+                self.lambda_counter += 1;
+                let body = self.parse_block()?;
+                let end = self.tokens[self.pos.saturating_sub(1)].span;
+                Ok(Expr {
+                    kind: ExprKind::Lambda(Box::new(Lambda {
+                        id,
+                        params,
+                        ret,
+                        body,
+                    })),
+                    span: span.merge(end),
+                })
             }
             Tok::LParen => {
                 let inner = self.parse_expr()?;

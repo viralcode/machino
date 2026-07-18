@@ -5,29 +5,45 @@
 //!   int    -> i64
 //!   bool   -> i64 (0 or 1)
 //!   float  -> f64
-//!   str    -> i64 pointer into linear memory: [len: i64][bytes]
-//!   [T]    -> i64 pointer into linear memory: [len: i64][elements, 8 bytes each]
-//!   struct -> i64 pointer into linear memory: [fields, 8 bytes each]
-//!   fn     -> i64 index into the module's function table (call_indirect)
+//!   str / [T] / struct / fn -> i64 pointer to a heap object
+//!
+//! Every heap object has a uniform 16-byte header for the garbage collector:
+//!   word 0 (meta):   bits 0..2 tag, bit 3 mark, bits 4.. count
+//!   word 1 (bitmap): for TAG_STRUCT, bit i set if payload word i is a pointer
+//!   payload at +16
+//! Tags: 0 = bytes (str, count = byte length), 1 = array of scalars,
+//! 2 = array of pointers (count = elements), 3 = struct/closure (count =
+//! payload words), 6 = free block (count = total block size in bytes).
+//!
+//! Function values are closure objects: [header][table_slot][captures...].
+//! Named functions used as values get a static singleton closure plus a
+//! wrapper in the function table that drops the environment argument.
+//! Indirect calls pass the closure pointer as a hidden trailing parameter.
+//!
+//! Memory management is a precise mark-sweep garbage collector:
+//! - Pointer-typed variables are mirrored into shadow-stack frames in linear
+//!   memory; pointer-typed temporaries that must survive a potentially
+//!   GC-ing evaluation are rooted in per-statement frame slots. Objects
+//!   never move, so operand-stack copies stay valid.
+//! - GC runs only at safepoints (function entry and loop back-edges), when
+//!   allocation since the last collection exceeds an adaptive threshold.
+//! - The allocator serves from a free list built by the sweep phase, then
+//!   bumps, then grows memory (capped at 1 GiB).
 //!
 //! Integer arithmetic is checked: overflow, division by zero, and modulo by
 //! zero call the host `fail` import with a message and trap — identical
 //! behavior to the reference interpreter.
-//!
-//! Memory is managed by a bump allocator (mutable global 0 holds the heap
-//! pointer). Arrays are immutable-length; push copies. There is no free/GC —
-//! fine for short-lived programs, documented in SPEC.md.
 //!
 //! Host interface (module "env"):
 //!   fail(msg: i64)        called before trapping on contract/bounds failures
 //!   print_i64 / print_f64 / print_bool / print_str
 //!   ...plus every `extern fn` the program declares.
 //! The module exports "memory", "alloc" (so hosts can pass strings/arrays
-//! in), and every non-std user function.
+//! in; hosts must write the 16-byte header), and every non-std user function.
 
 use crate::ast::*;
 use crate::diag::line_col;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ---- encoding primitives ----
 
@@ -63,6 +79,30 @@ const VT_I64: u8 = 0x7E;
 const VT_F64: u8 = 0x7C;
 const BLOCK_VOID: u8 = 0x40;
 
+// object tags
+const TAG_BYTES: i64 = 0;
+const TAG_ARR: i64 = 1; // array of scalars
+const TAG_ARRP: i64 = 2; // array of pointers
+const TAG_STRUCT: i64 = 3; // struct or closure
+const TAG_FREE: i64 = 6; // free block (count = total size in bytes)
+const MARK: i64 = 8;
+const HDR: i64 = 16;
+
+// mutable globals
+const G_HP: u32 = 0; // i32 heap bump pointer
+const G_SSP: u32 = 1; // i32 shadow stack pointer
+const G_FREELIST: u32 = 2; // i64 free-list head (0 = empty)
+const G_ALLOC: u32 = 3; // i64 bytes allocated since last GC
+const G_THRESH: u32 = 4; // i64 GC trigger threshold
+const G_MSBASE: u32 = 5; // i64 mark-stack base (set during GC)
+const G_MSTOP: u32 = 6; // i64 mark-stack element count
+// immutable globals (values patched in at assembly time)
+const G_HEAP_BASE: u32 = 7; // i32
+const G_SHADOW_BASE: u32 = 8; // i32
+
+const SHADOW_BYTES: u32 = 4 * 1024 * 1024;
+const MAX_PAGES: u64 = 16384; // 1 GiB
+
 fn valtype(ty: &Type) -> u8 {
     match ty {
         Type::Float => VT_F64,
@@ -70,11 +110,18 @@ fn valtype(ty: &Type) -> u8 {
     }
 }
 
+fn is_ptr(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Str | Type::Array(_) | Type::Struct(_) | Type::Fn(_, _)
+    )
+}
+
 // ---- function body builder ----
 
 struct FnBuilder {
     n_params: u32,
-    locals: Vec<u8>, // valtypes of locals beyond params
+    locals: Vec<u8>,
     code: Vec<u8>,
 }
 
@@ -139,7 +186,7 @@ impl FnBuilder {
     fn call_indirect(&mut self, type_idx: u32) {
         self.op(0x11);
         uleb(&mut self.code, type_idx as u64);
-        self.op(0x00); // table 0
+        self.op(0x00);
     }
     fn drop_(&mut self) {
         self.op(0x1A);
@@ -150,6 +197,10 @@ impl FnBuilder {
     }
     fn local_set(&mut self, idx: u32) {
         self.op(0x21);
+        uleb(&mut self.code, idx as u64);
+    }
+    fn local_tee(&mut self, idx: u32) {
+        self.op(0x22);
         uleb(&mut self.code, idx as u64);
     }
     fn global_get(&mut self, idx: u32) {
@@ -200,6 +251,23 @@ impl FnBuilder {
         self.op(0x41);
         sleb(&mut self.code, v as i64);
     }
+    /// Emits an i32.const with a fixed 5-byte payload that can be patched
+    /// later. Returns the payload position within `code`.
+    fn i32_const_patchable(&mut self) -> usize {
+        self.op(0x41);
+        let pos = self.code.len();
+        self.code
+            .extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]);
+        pos
+    }
+    fn patch_i32(&mut self, pos: usize, v: i32) {
+        let v = v as u32;
+        self.code[pos] = (v & 0x7F) as u8 | 0x80;
+        self.code[pos + 1] = ((v >> 7) & 0x7F) as u8 | 0x80;
+        self.code[pos + 2] = ((v >> 14) & 0x7F) as u8 | 0x80;
+        self.code[pos + 3] = ((v >> 21) & 0x7F) as u8 | 0x80;
+        self.code[pos + 4] = ((v >> 28) & 0x0F) as u8;
+    }
     fn i64_const(&mut self, v: i64) {
         self.op(0x42);
         sleb(&mut self.code, v);
@@ -213,6 +281,12 @@ impl FnBuilder {
     }
     fn i32_eq(&mut self) {
         self.op(0x46);
+    }
+    fn i32_lt_u(&mut self) {
+        self.op(0x49);
+    }
+    fn i32_gt_u(&mut self) {
+        self.op(0x4B);
     }
     fn i32_add(&mut self) {
         self.op(0x6A);
@@ -241,11 +315,17 @@ impl FnBuilder {
     fn i64_gt_s(&mut self) {
         self.op(0x55);
     }
+    fn i64_gt_u(&mut self) {
+        self.op(0x56);
+    }
     fn i64_le_s(&mut self) {
         self.op(0x57);
     }
     fn i64_ge_s(&mut self) {
         self.op(0x59);
+    }
+    fn i64_ge_u(&mut self) {
+        self.op(0x5A);
     }
     fn f64_eq(&mut self) {
         self.op(0x61);
@@ -282,6 +362,9 @@ impl FnBuilder {
     }
     fn i64_and(&mut self) {
         self.op(0x83);
+    }
+    fn i64_or(&mut self) {
+        self.op(0x84);
     }
     fn i64_xor(&mut self) {
         self.op(0x85);
@@ -325,11 +408,14 @@ impl FnBuilder {
         self.op(0x00);
         self.op(0x00);
     }
+    fn memory_fill(&mut self) {
+        self.op(0xFC);
+        uleb(&mut self.code, 0x0B);
+        self.op(0x00);
+    }
 
-    /// Final encoding for the code section entry.
     fn finish(self) -> Vec<u8> {
         let mut body = Vec::new();
-        // compress consecutive identical local valtypes
         let mut groups: Vec<(u32, u8)> = Vec::new();
         for vt in &self.locals {
             match groups.last_mut() {
@@ -343,7 +429,7 @@ impl FnBuilder {
             body.push(vt);
         }
         body.extend_from_slice(&self.code);
-        body.push(0x0B); // end
+        body.push(0x0B);
         let mut out = Vec::new();
         uleb(&mut out, body.len() as u64);
         out.extend_from_slice(&body);
@@ -359,24 +445,28 @@ const IMP_PRINT_F64: u32 = 2;
 const IMP_PRINT_BOOL: u32 = 3;
 const IMP_PRINT_STR: u32 = 4;
 const N_RUNTIME_IMPORTS: u32 = 5;
-const N_HELPERS: u32 = 17;
+const N_HELPERS: u32 = 21;
 
 pub struct WasmCompiler<'a> {
     program: &'a Program,
     source: &'a str,
     signatures: HashMap<&'a str, (Vec<Type>, Type)>,
     struct_fields: HashMap<&'a str, &'a [Param]>,
-    // type section
-    types: Vec<Vec<u8>>, // encoded functype
+    struct_bitmap: HashMap<&'a str, u64>,
+    types: Vec<Vec<u8>>,
     type_index: HashMap<Vec<u8>, u32>,
-    // static data blob; lives at address 8 in linear memory
     data: Vec<u8>,
     string_addrs: HashMap<String, u32>,
-    // function indexing
+    singleton_addrs: HashMap<String, u32>,
     func_index: HashMap<&'a str, u32>,
-    table_slot: HashMap<&'a str, u32>,
+    // closures
+    lambdas: BTreeMap<usize, &'a Lambda>,
+    lambda_index: HashMap<usize, u32>,
+    lambda_slot: HashMap<usize, u32>,
+    lambda_captures: HashMap<usize, Vec<(String, Type)>>,
+    wrapper_slot: HashMap<&'a str, u32>,
     n_imports: u32,
-    // helper function indices
+    // helpers
     h_alloc: u32,
     h_concat: u32,
     h_str_eq: u32,
@@ -394,27 +484,69 @@ pub struct WasmCompiler<'a> {
     h_char_at: u32,
     h_substr: u32,
     h_chr: u32,
+    h_obj_size: u32,
+    h_mark_push: u32,
+    h_gc_collect: u32,
+    h_gc_maybe: u32,
 }
 
-type Scope<'s> = Vec<HashMap<String, (u32, Type)>>;
+type Scope = Vec<HashMap<String, (u32, Type)>>;
 
 struct FnCtx {
     b: FnBuilder,
-    /// number of blocks entered since the function's exit block
     nesting: u32,
-    /// stack of (break_target, continue_target) nesting levels
     loops: Vec<(u32, u32)>,
     result_local: Option<u32>,
     ret: Type,
+    /// i32 local holding the shadow-stack frame base.
+    fb: u32,
+    /// scratch i64 local for pointer plumbing.
+    scratch: u32,
+    named_next: u32,
+    temp_next: u32,
+    frame_high: u32,
+}
+
+impl FnCtx {
+    fn alloc_named(&mut self) -> u32 {
+        let s = self.named_next;
+        self.named_next += 1;
+        self.temp_next = self.temp_next.max(self.named_next);
+        self.frame_high = self.frame_high.max(self.named_next);
+        s
+    }
+    fn alloc_temp(&mut self) -> u32 {
+        let s = self.temp_next;
+        self.temp_next += 1;
+        self.frame_high = self.frame_high.max(self.temp_next);
+        s
+    }
+}
+
+enum Saved {
+    Scalar(u32),
+    Ptr(u32),
 }
 
 pub fn compile(program: &Program, source: &str) -> Vec<u8> {
     WasmCompiler::new(program, source).compile()
 }
 
-/// Collects the names of all functions reachable from the roots (all
-/// non-std, non-extern functions). Unreachable std-prelude functions are
-/// not compiled into the module.
+/// Conservative: an expression "can GC" if evaluating it may reach a
+/// safepoint — i.e. it contains any call. Lambda bodies don't run at
+/// creation, so they are not descended into.
+fn can_gc(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Call(_, _) => true,
+        ExprKind::Array(elems) => elems.iter().any(can_gc),
+        ExprKind::Index(a, b) => can_gc(a) || can_gc(b),
+        ExprKind::Field(a, _) => can_gc(a),
+        ExprKind::Bin(_, a, b) => can_gc(a) || can_gc(b),
+        ExprKind::Un(_, a) => can_gc(a),
+        _ => false,
+    }
+}
+
 fn reachable_functions(program: &Program) -> HashSet<String> {
     let by_name: HashMap<&str, &Function> = program
         .functions
@@ -512,6 +644,80 @@ fn collect_fn_names<'e>(expr: &'e Expr, out: &mut Vec<&'e str>) {
                 collect_fn_names(a, out);
             }
         }
+        ExprKind::Lambda(l) => collect_fn_names_stmts(&l.body, out),
+        _ => {}
+    }
+}
+
+fn collect_lambdas_stmts<'e>(stmts: &'e [Stmt], out: &mut BTreeMap<usize, &'e Lambda>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Let { value, .. } | StmtKind::Assign { value, .. } => {
+                collect_lambdas(value, out)
+            }
+            StmtKind::IndexAssign { base, index, value } => {
+                collect_lambdas(base, out);
+                collect_lambdas(index, out);
+                collect_lambdas(value, out);
+            }
+            StmtKind::FieldAssign { base, value, .. } => {
+                collect_lambdas(base, out);
+                collect_lambdas(value, out);
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                collect_lambdas(cond, out);
+                collect_lambdas_stmts(then_body, out);
+                collect_lambdas_stmts(else_body, out);
+            }
+            StmtKind::While { cond, body } => {
+                collect_lambdas(cond, out);
+                collect_lambdas_stmts(body, out);
+            }
+            StmtKind::For {
+                start, end, body, ..
+            } => {
+                collect_lambdas(start, out);
+                collect_lambdas(end, out);
+                collect_lambdas_stmts(body, out);
+            }
+            StmtKind::Return(Some(e)) | StmtKind::Assert(e) | StmtKind::Expr(e) => {
+                collect_lambdas(e, out)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_lambdas<'e>(expr: &'e Expr, out: &mut BTreeMap<usize, &'e Lambda>) {
+    match &expr.kind {
+        ExprKind::Array(elems) => {
+            for e in elems {
+                collect_lambdas(e, out);
+            }
+        }
+        ExprKind::Index(a, b) => {
+            collect_lambdas(a, out);
+            collect_lambdas(b, out);
+        }
+        ExprKind::Field(a, _) => collect_lambdas(a, out),
+        ExprKind::Bin(_, a, b) => {
+            collect_lambdas(a, out);
+            collect_lambdas(b, out);
+        }
+        ExprKind::Un(_, a) => collect_lambdas(a, out),
+        ExprKind::Call(_, args) => {
+            for a in args {
+                collect_lambdas(a, out);
+            }
+        }
+        ExprKind::Lambda(l) => {
+            out.insert(l.id, l);
+            collect_lambdas_stmts(&l.body, out);
+        }
         _ => {}
     }
 }
@@ -523,12 +729,18 @@ impl<'a> WasmCompiler<'a> {
             source,
             signatures: HashMap::new(),
             struct_fields: HashMap::new(),
+            struct_bitmap: HashMap::new(),
             types: Vec::new(),
             type_index: HashMap::new(),
             data: Vec::new(),
             string_addrs: HashMap::new(),
+            singleton_addrs: HashMap::new(),
             func_index: HashMap::new(),
-            table_slot: HashMap::new(),
+            lambdas: BTreeMap::new(),
+            lambda_index: HashMap::new(),
+            lambda_slot: HashMap::new(),
+            lambda_captures: HashMap::new(),
+            wrapper_slot: HashMap::new(),
             n_imports: 0,
             h_alloc: 0,
             h_concat: 0,
@@ -547,6 +759,10 @@ impl<'a> WasmCompiler<'a> {
             h_char_at: 0,
             h_substr: 0,
             h_chr: 0,
+            h_obj_size: 0,
+            h_mark_push: 0,
+            h_gc_collect: 0,
+            h_gc_maybe: 0,
         }
     }
 
@@ -574,7 +790,17 @@ impl<'a> WasmCompiler<'a> {
         self.get_type(&p, &r)
     }
 
-    /// Interns a string constant, returning its address in linear memory.
+    /// Signature for indirect calls: params plus the hidden i64 env pointer.
+    fn sig_type_env(&mut self, params: &[Type], ret: &Type) -> u32 {
+        let mut p: Vec<u8> = params.iter().map(valtype).collect();
+        p.push(VT_I64);
+        let r: Vec<u8> = match ret {
+            Type::Unit => vec![],
+            t => vec![valtype(t)],
+        };
+        self.get_type(&p, &r)
+    }
+
     fn intern(&mut self, text: &str) -> u32 {
         if let Some(&addr) = self.string_addrs.get(text) {
             return addr;
@@ -583,10 +809,28 @@ impl<'a> WasmCompiler<'a> {
             self.data.push(0);
         }
         let addr = 8 + self.data.len() as u32;
-        self.data
-            .extend_from_slice(&(text.len() as i64).to_le_bytes());
+        let meta = (text.len() as i64) << 4 | TAG_BYTES;
+        self.data.extend_from_slice(&meta.to_le_bytes());
+        self.data.extend_from_slice(&0i64.to_le_bytes());
         self.data.extend_from_slice(text.as_bytes());
         self.string_addrs.insert(text.to_string(), addr);
+        addr
+    }
+
+    /// A static closure object for a named function: [meta][0][table_slot].
+    fn intern_singleton(&mut self, name: &str, slot: u32) -> u32 {
+        if let Some(&addr) = self.singleton_addrs.get(name) {
+            return addr;
+        }
+        while self.data.len() % 8 != 0 {
+            self.data.push(0);
+        }
+        let addr = 8 + self.data.len() as u32;
+        let meta = 1i64 << 4 | TAG_STRUCT;
+        self.data.extend_from_slice(&meta.to_le_bytes());
+        self.data.extend_from_slice(&0i64.to_le_bytes());
+        self.data.extend_from_slice(&(slot as i64).to_le_bytes());
+        self.singleton_addrs.insert(name.to_string(), addr);
         addr
     }
 
@@ -594,16 +838,26 @@ impl<'a> WasmCompiler<'a> {
         for f in &self.program.functions {
             self.signatures.insert(
                 f.name.as_str(),
-                (f.params.iter().map(|p| p.ty.clone()).collect(), f.ret.clone()),
+                (
+                    f.params.iter().map(|p| p.ty.clone()).collect(),
+                    f.ret.clone(),
+                ),
             );
         }
         for s in &self.program.structs {
             self.struct_fields.insert(s.name.as_str(), &s.fields);
+            let mut bm = 0u64;
+            for (i, fld) in s.fields.iter().enumerate() {
+                if is_ptr(&fld.ty) {
+                    bm |= 1 << i;
+                }
+            }
+            self.struct_bitmap.insert(s.name.as_str(), bm);
         }
 
         let reachable = reachable_functions(self.program);
 
-        // -- imports: 5 runtime imports + user externs --
+        // -- imports --
         let t_i64_void = self.get_type(&[VT_I64], &[]);
         let t_f64_void = self.get_type(&[VT_F64], &[]);
         let mut imports: Vec<(String, u32)> = vec![
@@ -613,8 +867,12 @@ impl<'a> WasmCompiler<'a> {
             ("print_bool".to_string(), t_i64_void),
             ("print_str".to_string(), t_i64_void),
         ];
-        let externs: Vec<&Function> =
-            self.program.functions.iter().filter(|f| f.is_extern).collect();
+        let externs: Vec<&Function> = self
+            .program
+            .functions
+            .iter()
+            .filter(|f| f.is_extern)
+            .collect();
         for f in &externs {
             let params: Vec<Type> = f.params.iter().map(|p| p.ty.clone()).collect();
             let tidx = self.sig_type(&params, &f.ret);
@@ -626,7 +884,31 @@ impl<'a> WasmCompiler<'a> {
                 .insert(f.name.as_str(), N_RUNTIME_IMPORTS + i as u32);
         }
 
-        // -- assign indices: helpers, then reachable defined functions --
+        // -- lambdas and named-function values in reachable code --
+        let mut fn_value_names: Vec<&str> = Vec::new();
+        for f in &self.program.functions {
+            if f.is_extern || !reachable.contains(&f.name) {
+                continue;
+            }
+            collect_lambdas_stmts(&f.body, &mut self.lambdas);
+            for c in f.requires.iter().chain(f.ensures.iter()) {
+                collect_lambdas(&c.expr, &mut self.lambdas);
+            }
+            let mut names = Vec::new();
+            collect_fn_names_stmts(&f.body, &mut names);
+            for c in f.requires.iter().chain(f.ensures.iter()) {
+                collect_fn_names(&c.expr, &mut names);
+            }
+            for n in names {
+                if self.signatures.contains_key(n) {
+                    fn_value_names.push(n);
+                }
+            }
+        }
+        fn_value_names.sort();
+        fn_value_names.dedup();
+
+        // -- function indices: helpers, user fns, wrappers, lambdas --
         let base = self.n_imports;
         self.h_alloc = base;
         self.h_concat = base + 1;
@@ -645,6 +927,11 @@ impl<'a> WasmCompiler<'a> {
         self.h_char_at = base + 14;
         self.h_substr = base + 15;
         self.h_chr = base + 16;
+        self.h_obj_size = base + 17;
+        self.h_mark_push = base + 18;
+        self.h_gc_collect = base + 19;
+        self.h_gc_maybe = base + 20;
+
         let user_fns: Vec<&Function> = self
             .program
             .functions
@@ -655,19 +942,31 @@ impl<'a> WasmCompiler<'a> {
             self.func_index
                 .insert(f.name.as_str(), base + N_HELPERS + i as u32);
         }
+        let wrapper_base = base + N_HELPERS + user_fns.len() as u32;
+        let lambda_base = wrapper_base + fn_value_names.len() as u32;
+        for (i, l) in self.lambdas.values().enumerate() {
+            self.lambda_index.insert(l.id, lambda_base + i as u32);
+        }
 
-        // -- function table (for first-class function values) --
-        // externs first, then defined functions, in stable order
+        // -- table slots: wrappers first, then lambdas --
+        let mut wrapper_func_index: HashMap<&str, u32> = HashMap::new();
         {
             let mut slot = 0u32;
-            for f in &externs {
-                self.table_slot.insert(f.name.as_str(), slot);
+            for (i, name) in fn_value_names.iter().enumerate() {
+                self.wrapper_slot.insert(name, slot);
+                wrapper_func_index.insert(name, wrapper_base + i as u32);
                 slot += 1;
             }
-            for f in &user_fns {
-                self.table_slot.insert(f.name.as_str(), slot);
+            let ids: Vec<usize> = self.lambdas.keys().copied().collect();
+            for id in ids {
+                self.lambda_slot.insert(id, slot);
                 slot += 1;
             }
+        }
+        // singletons for named function values
+        for name in &fn_value_names {
+            let slot = self.wrapper_slot[name];
+            self.intern_singleton(name, slot);
         }
 
         // -- helper types --
@@ -678,26 +977,31 @@ impl<'a> WasmCompiler<'a> {
         let t_set_i64 = self.get_type(&[VT_I64, VT_I64, VT_I64], &[]);
         let t_set_f64 = self.get_type(&[VT_I64, VT_I64, VT_F64], &[]);
         let t_substr = self.get_type(&[VT_I64, VT_I64, VT_I64], &[VT_I64]);
+        let t_void_i64 = self.get_type(&[VT_I64], &[]);
+        let t_void_void = self.get_type(&[], &[]);
 
-        // -- compile bodies --
         let mut func_types: Vec<u32> = vec![
-            t_alloc,   // alloc
-            t_bin_i64, // concat
-            t_bin_i64, // str_eq
-            t_bin_i64, // push_i64
-            t_push_f64,
-            t_bin_i64, // get_i64
-            t_get_f64,
-            t_set_i64,
-            t_set_f64,
-            t_bin_i64, // iadd
-            t_bin_i64, // isub
-            t_bin_i64, // imul
-            t_bin_i64, // idiv
-            t_bin_i64, // irem
-            t_bin_i64, // char_at
-            t_substr,  // substr
-            t_alloc,   // chr
+            t_alloc,    // alloc
+            t_bin_i64,  // concat
+            t_bin_i64,  // str_eq
+            t_bin_i64,  // push_i64
+            t_push_f64, // push_f64
+            t_bin_i64,  // get_i64
+            t_get_f64,  // get_f64
+            t_set_i64,  // set_i64
+            t_set_f64,  // set_f64
+            t_bin_i64,  // iadd
+            t_bin_i64,  // isub
+            t_bin_i64,  // imul
+            t_bin_i64,  // idiv
+            t_bin_i64,  // irem
+            t_bin_i64,  // char_at
+            t_substr,   // substr
+            t_alloc,    // chr
+            t_alloc,    // obj_size
+            t_void_i64, // mark_push
+            t_void_void, // gc_collect
+            t_void_void, // gc_maybe
         ];
         let mut bodies: Vec<Vec<u8>> = vec![
             self.emit_alloc(),
@@ -717,25 +1021,53 @@ impl<'a> WasmCompiler<'a> {
             self.emit_char_at(),
             self.emit_substr(),
             self.emit_chr(),
+            self.emit_obj_size(),
+            self.emit_mark_push(),
+            self.emit_gc_collect(),
+            self.emit_gc_maybe(),
         ];
+
+        // user functions
         for f in &user_fns {
             let params: Vec<Type> = f.params.iter().map(|p| p.ty.clone()).collect();
             func_types.push(self.sig_type(&params, &f.ret));
             bodies.push(self.emit_function(f));
         }
+        // wrappers
+        for name in &fn_value_names {
+            let (params, ret) = self.signatures[name].clone();
+            func_types.push(self.sig_type_env(&params, &ret));
+            let target = self.func_index[name];
+            let mut b = FnBuilder::new(params.len() as u32 + 1);
+            for i in 0..params.len() as u32 {
+                b.local_get(i);
+            }
+            b.call(target);
+            bodies.push(b.finish());
+        }
+        // lambdas, parents before children (ids ascend outward-in)
+        let lambda_list: Vec<&Lambda> = self.lambdas.values().copied().collect();
+        for l in &lambda_list {
+            let params: Vec<Type> = l.params.iter().map(|p| p.ty.clone()).collect();
+            func_types.push(self.sig_type_env(&params, &l.ret));
+        }
+        for l in &lambda_list {
+            bodies.push(self.emit_lambda(l));
+        }
 
-        // -- layout --
+        // -- memory layout --
         let data_end = {
             let mut end = 8 + self.data.len() as u32;
             end = (end + 7) & !7;
             end
         };
-        let min_pages = (data_end as u64 / 65536) + 17; // ~1MB headroom, grows on demand
+        let shadow_base = data_end;
+        let heap_base = shadow_base + SHADOW_BYTES;
+        let min_pages = (heap_base as u64 / 65536) + 17;
 
-        // -- assemble module --
+        // -- assemble --
         let mut module: Vec<u8> = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
 
-        // type section (1)
         {
             let mut payload = Vec::new();
             uleb(&mut payload, self.types.len() as u64);
@@ -744,19 +1076,17 @@ impl<'a> WasmCompiler<'a> {
             }
             section(&mut module, 1, &payload);
         }
-        // import section (2)
         {
             let mut payload = Vec::new();
             uleb(&mut payload, imports.len() as u64);
             for (name, tidx) in &imports {
                 write_name(&mut payload, "env");
                 write_name(&mut payload, name);
-                payload.push(0x00); // func import
+                payload.push(0x00);
                 uleb(&mut payload, *tidx as u64);
             }
             section(&mut module, 2, &payload);
         }
-        // function section (3)
         {
             let mut payload = Vec::new();
             uleb(&mut payload, func_types.len() as u64);
@@ -765,71 +1095,92 @@ impl<'a> WasmCompiler<'a> {
             }
             section(&mut module, 3, &payload);
         }
-        // table section (4): funcref table for call_indirect
-        let n_slots = self.table_slot.len() as u64;
+        let n_slots = (self.wrapper_slot.len() + self.lambda_slot.len()) as u64;
         {
             let mut payload = Vec::new();
             uleb(&mut payload, 1);
-            payload.push(0x70); // funcref
-            payload.push(0x00); // min only
+            payload.push(0x70);
+            payload.push(0x00);
             uleb(&mut payload, n_slots);
             section(&mut module, 4, &payload);
         }
-        // memory section (5)
         {
             let mut payload = Vec::new();
             uleb(&mut payload, 1);
-            payload.push(0x00); // min only
+            payload.push(0x01); // min and max
             uleb(&mut payload, min_pages);
+            uleb(&mut payload, MAX_PAGES.max(min_pages + 1));
             section(&mut module, 5, &payload);
         }
-        // global section (6): heap pointer
+        // globals
         {
             let mut payload = Vec::new();
-            uleb(&mut payload, 1);
-            payload.push(VT_I32);
-            payload.push(0x01); // mutable
-            payload.push(0x41); // i32.const
-            sleb(&mut payload, data_end as i64);
-            payload.push(0x0B);
+            uleb(&mut payload, 9);
+            let g_i32 = |payload: &mut Vec<u8>, mutable: bool, v: i64| {
+                payload.push(VT_I32);
+                payload.push(if mutable { 0x01 } else { 0x00 });
+                payload.push(0x41);
+                sleb(payload, v);
+                payload.push(0x0B);
+            };
+            let g_i64 = |payload: &mut Vec<u8>, v: i64| {
+                payload.push(VT_I64);
+                payload.push(0x01);
+                payload.push(0x42);
+                sleb(payload, v);
+                payload.push(0x0B);
+            };
+            g_i32(&mut payload, true, heap_base as i64); // hp
+            g_i32(&mut payload, true, shadow_base as i64); // ssp
+            g_i64(&mut payload, 0); // free list
+            g_i64(&mut payload, 0); // alloc since gc
+            g_i64(&mut payload, 1 << 20); // threshold
+            g_i64(&mut payload, 0); // mark stack base
+            g_i64(&mut payload, 0); // mark stack top
+            g_i32(&mut payload, false, heap_base as i64);
+            g_i32(&mut payload, false, shadow_base as i64);
             section(&mut module, 6, &payload);
         }
-        // export section (7): memory + alloc + non-std user functions
+        // exports
         {
             let exported: Vec<&&Function> = user_fns.iter().filter(|f| !f.is_std).collect();
             let mut payload = Vec::new();
             uleb(&mut payload, 2 + exported.len() as u64);
             write_name(&mut payload, "memory");
-            payload.push(0x02); // memory export
+            payload.push(0x02);
             uleb(&mut payload, 0);
             write_name(&mut payload, "alloc");
             payload.push(0x00);
             uleb(&mut payload, self.h_alloc as u64);
             for f in exported {
                 write_name(&mut payload, &f.name);
-                payload.push(0x00); // func export
+                payload.push(0x00);
                 uleb(&mut payload, self.func_index[f.name.as_str()] as u64);
             }
             section(&mut module, 7, &payload);
         }
-        // element section (9): populate the function table
+        // elements
         if n_slots > 0 {
-            let mut slots: Vec<(&str, u32)> =
-                self.table_slot.iter().map(|(n, s)| (*n, *s)).collect();
-            slots.sort_by_key(|(_, s)| *s);
+            let mut in_slot_order: Vec<(u32, u32)> = Vec::new(); // (slot, func idx)
+            for (name, slot) in &self.wrapper_slot {
+                in_slot_order.push((*slot, wrapper_func_index[name]));
+            }
+            for (id, slot) in &self.lambda_slot {
+                in_slot_order.push((*slot, self.lambda_index[id]));
+            }
+            in_slot_order.sort();
             let mut payload = Vec::new();
             uleb(&mut payload, 1);
-            payload.push(0x00); // active, table 0, offset expr
-            payload.push(0x41); // i32.const 0
+            payload.push(0x00);
+            payload.push(0x41);
             sleb(&mut payload, 0);
             payload.push(0x0B);
             uleb(&mut payload, n_slots);
-            for (name, _) in slots {
-                uleb(&mut payload, self.func_index[name] as u64);
+            for (_, fidx) in in_slot_order {
+                uleb(&mut payload, fidx as u64);
             }
             section(&mut module, 9, &payload);
         }
-        // code section (10)
         {
             let mut payload = Vec::new();
             uleb(&mut payload, bodies.len() as u64);
@@ -838,12 +1189,11 @@ impl<'a> WasmCompiler<'a> {
             }
             section(&mut module, 10, &payload);
         }
-        // data section (11)
         if !self.data.is_empty() {
             let mut payload = Vec::new();
             uleb(&mut payload, 1);
-            payload.push(0x00); // active, memory 0
-            payload.push(0x41); // i32.const 8
+            payload.push(0x00);
+            payload.push(0x41);
             sleb(&mut payload, 8);
             payload.push(0x0B);
             uleb(&mut payload, self.data.len() as u64);
@@ -854,7 +1204,7 @@ impl<'a> WasmCompiler<'a> {
         module
     }
 
-    // ---- runtime helper functions (hand-assembled) ----
+    // ---- runtime helpers ----
 
     fn emit_fail(&mut self, b: &mut FnBuilder, message: &str) {
         let addr = self.intern(message);
@@ -863,28 +1213,147 @@ impl<'a> WasmCompiler<'a> {
         b.unreachable();
     }
 
-    /// fn alloc(size: i64) -> i64  (bump allocator, grows memory on demand)
+    /// fn alloc(total_bytes: i64) -> i64
+    /// First-fit from the free list, else bump, else grow. Zeroes the block.
+    /// Never triggers GC (collection happens only at safepoints).
     fn emit_alloc(&mut self) -> Vec<u8> {
         let mut b = FnBuilder::new(1);
+        let prev = b.new_local(VT_I64);
+        let cur = b.new_local(VT_I64);
+        let bsize = b.new_local(VT_I64);
         let ptr = b.new_local(VT_I64);
         let new_hp = b.new_local(VT_I64);
-        // size = (size + 7) & ~7
+        // total = (total + 7) & ~7
         b.local_get(0);
         b.i64_const(7);
         b.i64_add();
         b.i64_const(-8);
         b.i64_and();
         b.local_set(0);
-        // ptr = hp
-        b.global_get(0);
+        // alloc_since += total
+        b.global_get(G_ALLOC);
+        b.local_get(0);
+        b.i64_add();
+        b.global_set(G_ALLOC);
+        // free-list first fit
+        b.i64_const(0);
+        b.local_set(prev);
+        b.global_get(G_FREELIST);
+        b.local_set(cur);
+        b.block_void();
+        b.loop_void();
+        {
+            b.local_get(cur);
+            b.i64_eqz();
+            b.br_if(1);
+            // bsize = meta(cur) >> 4
+            b.local_get(cur);
+            b.i32_wrap_i64();
+            b.i64_load(0);
+            b.i64_const(4);
+            b.i64_shr_u();
+            b.local_set(bsize);
+            // usable if bsize == total or bsize >= total + 16
+            b.local_get(bsize);
+            b.local_get(0);
+            b.i64_eq();
+            b.local_get(bsize);
+            b.local_get(0);
+            b.i64_const(16);
+            b.i64_add();
+            b.i64_ge_s();
+            b.i32_or();
+            b.if_void();
+            {
+                // split?
+                b.local_get(bsize);
+                b.local_get(0);
+                b.i64_ne();
+                b.if_void();
+                {
+                    // remainder block at cur + total
+                    b.local_get(cur);
+                    b.local_get(0);
+                    b.i64_add();
+                    b.local_set(ptr); // reuse ptr as remainder addr
+                    b.local_get(ptr);
+                    b.i32_wrap_i64();
+                    b.local_get(bsize);
+                    b.local_get(0);
+                    b.i64_sub();
+                    b.i64_const(4);
+                    b.i64_shl();
+                    b.i64_const(TAG_FREE);
+                    b.i64_or();
+                    b.i64_store(0);
+                    b.local_get(ptr);
+                    b.i32_wrap_i64();
+                    b.local_get(cur);
+                    b.i32_wrap_i64();
+                    b.i64_load(8);
+                    b.i64_store(8);
+                    // link remainder where cur was
+                    b.local_get(prev);
+                    b.i64_eqz();
+                    b.if_void();
+                    b.local_get(ptr);
+                    b.global_set(G_FREELIST);
+                    b.else_();
+                    b.local_get(prev);
+                    b.i32_wrap_i64();
+                    b.local_get(ptr);
+                    b.i64_store(8);
+                    b.end();
+                }
+                b.else_();
+                {
+                    // take the whole block: unlink cur
+                    b.local_get(prev);
+                    b.i64_eqz();
+                    b.if_void();
+                    b.local_get(cur);
+                    b.i32_wrap_i64();
+                    b.i64_load(8);
+                    b.global_set(G_FREELIST);
+                    b.else_();
+                    b.local_get(prev);
+                    b.i32_wrap_i64();
+                    b.local_get(cur);
+                    b.i32_wrap_i64();
+                    b.i64_load(8);
+                    b.i64_store(8);
+                    b.end();
+                }
+                b.end();
+                // zero and return
+                b.local_get(cur);
+                b.i32_wrap_i64();
+                b.i32_const(0);
+                b.local_get(0);
+                b.i32_wrap_i64();
+                b.memory_fill();
+                b.local_get(cur);
+                b.ret();
+            }
+            b.end();
+            b.local_get(cur);
+            b.local_set(prev);
+            b.local_get(cur);
+            b.i32_wrap_i64();
+            b.i64_load(8);
+            b.local_set(cur);
+            b.br(0);
+        }
+        b.end();
+        b.end();
+        // bump path
+        b.global_get(G_HP);
         b.i64_extend_i32_u();
         b.local_set(ptr);
-        // new_hp = ptr + size
         b.local_get(ptr);
         b.local_get(0);
         b.i64_add();
         b.local_set(new_hp);
-        // if memory_bytes < new_hp: grow
         b.memory_size();
         b.i64_extend_i32_u();
         b.i64_const(16);
@@ -903,68 +1372,81 @@ impl<'a> WasmCompiler<'a> {
             b.i32_const(-1);
             b.i32_eq();
             b.if_void();
-            b.unreachable();
+            self.emit_fail(&mut b, "runtime error: out of memory");
             b.end();
         }
         b.end();
-        // hp = new_hp
         b.local_get(new_hp);
         b.i32_wrap_i64();
-        b.global_set(0);
+        b.global_set(G_HP);
+        b.local_get(ptr);
+        b.i32_wrap_i64();
+        b.i32_const(0);
+        b.local_get(0);
+        b.i32_wrap_i64();
+        b.memory_fill();
         b.local_get(ptr);
         b.finish()
     }
 
-    /// fn concat(a: i64, b: i64) -> i64
+    /// Reads an object's byte length (meta >> 4) from a pointer on the stack.
+    fn emit_len_read(&self, b: &mut FnBuilder) {
+        b.i32_wrap_i64();
+        b.i64_load(0);
+        b.i64_const(4);
+        b.i64_shr_u();
+    }
+
+    /// fn concat(a, b) -> new str
     fn emit_concat(&mut self) -> Vec<u8> {
         let mut b = FnBuilder::new(2);
         let la = b.new_local(VT_I64);
         let lb = b.new_local(VT_I64);
         let out = b.new_local(VT_I64);
         b.local_get(0);
-        b.i32_wrap_i64();
-        b.i64_load(0);
+        self.emit_len_read(&mut b);
         b.local_set(la);
         b.local_get(1);
-        b.i32_wrap_i64();
-        b.i64_load(0);
+        self.emit_len_read(&mut b);
         b.local_set(lb);
-        // out = alloc(8 + la + lb)
-        b.i64_const(8);
+        // out = alloc(16 + la + lb)
+        b.i64_const(HDR);
         b.local_get(la);
         b.i64_add();
         b.local_get(lb);
         b.i64_add();
         b.call(self.h_alloc);
         b.local_set(out);
-        // *out = la + lb
+        // meta = (la+lb) << 4 | TAG_BYTES
         b.local_get(out);
         b.i32_wrap_i64();
         b.local_get(la);
         b.local_get(lb);
         b.i64_add();
+        b.i64_const(4);
+        b.i64_shl();
         b.i64_store(0);
-        // copy a's bytes
+        // copy a
         b.local_get(out);
-        b.i64_const(8);
+        b.i64_const(HDR);
         b.i64_add();
         b.i32_wrap_i64();
         b.local_get(0);
-        b.i64_const(8);
+        b.i64_const(HDR);
         b.i64_add();
         b.i32_wrap_i64();
         b.local_get(la);
         b.i32_wrap_i64();
         b.memory_copy();
-        // copy b's bytes
+        // copy b
         b.local_get(out);
-        b.i64_const(8);
+        b.i64_const(HDR);
         b.i64_add();
         b.local_get(la);
         b.i64_add();
         b.i32_wrap_i64();
         b.local_get(1);
-        b.i64_const(8);
+        b.i64_const(HDR);
         b.i64_add();
         b.i32_wrap_i64();
         b.local_get(lb);
@@ -974,26 +1456,22 @@ impl<'a> WasmCompiler<'a> {
         b.finish()
     }
 
-    /// fn str_eq(a: i64, b: i64) -> i64
+    /// fn str_eq(a, b) -> i64
     fn emit_str_eq(&mut self) -> Vec<u8> {
         let mut b = FnBuilder::new(2);
         let la = b.new_local(VT_I64);
         let i = b.new_local(VT_I64);
         b.local_get(0);
-        b.i32_wrap_i64();
-        b.i64_load(0);
+        self.emit_len_read(&mut b);
         b.local_set(la);
-        // if len(a) != len(b) return 0
         b.local_get(la);
         b.local_get(1);
-        b.i32_wrap_i64();
-        b.i64_load(0);
+        self.emit_len_read(&mut b);
         b.i64_ne();
         b.if_void();
         b.i64_const(0);
         b.ret();
         b.end();
-        // byte-by-byte compare
         b.i64_const(0);
         b.local_set(i);
         b.block_void();
@@ -1007,12 +1485,12 @@ impl<'a> WasmCompiler<'a> {
             b.local_get(i);
             b.i64_add();
             b.i32_wrap_i64();
-            b.i64_load8_u(8);
+            b.i64_load8_u(HDR as u32);
             b.local_get(1);
             b.local_get(i);
             b.i64_add();
             b.i32_wrap_i64();
-            b.i64_load8_u(8);
+            b.i64_load8_u(HDR as u32);
             b.i64_ne();
             b.if_void();
             b.i64_const(0);
@@ -1030,37 +1508,38 @@ impl<'a> WasmCompiler<'a> {
         b.finish()
     }
 
-    /// fn push(arr: i64, v) -> i64   (copies into a new, longer array)
+    /// fn push(arr, v) -> new array (one element longer)
     fn emit_push(&mut self, float_elem: bool) -> Vec<u8> {
         let mut b = FnBuilder::new(2);
         let n = b.new_local(VT_I64);
         let out = b.new_local(VT_I64);
         b.local_get(0);
-        b.i32_wrap_i64();
-        b.i64_load(0);
+        self.emit_len_read(&mut b);
         b.local_set(n);
-        // out = alloc(16 + 8n)
-        b.i64_const(16);
+        // out = alloc(16 + 8(n+1))
+        b.i64_const(HDR + 8);
         b.local_get(n);
         b.i64_const(3);
         b.i64_shl();
         b.i64_add();
         b.call(self.h_alloc);
         b.local_set(out);
-        // *out = n + 1
+        // meta = old meta + (1 << 4)  (same tag, count + 1)
         b.local_get(out);
         b.i32_wrap_i64();
-        b.local_get(n);
-        b.i64_const(1);
+        b.local_get(0);
+        b.i32_wrap_i64();
+        b.i64_load(0);
+        b.i64_const(16);
         b.i64_add();
         b.i64_store(0);
         // copy old elements
         b.local_get(out);
-        b.i64_const(8);
+        b.i64_const(HDR);
         b.i64_add();
         b.i32_wrap_i64();
         b.local_get(0);
-        b.i64_const(8);
+        b.i64_const(HDR);
         b.i64_add();
         b.i32_wrap_i64();
         b.local_get(n);
@@ -1077,23 +1556,21 @@ impl<'a> WasmCompiler<'a> {
         b.i32_wrap_i64();
         b.local_get(1);
         if float_elem {
-            b.f64_store(8);
+            b.f64_store(HDR as u32);
         } else {
-            b.i64_store(8);
+            b.i64_store(HDR as u32);
         }
         b.local_get(out);
         b.finish()
     }
 
     fn emit_bounds_check(&mut self, b: &mut FnBuilder) {
-        // idx < 0 || idx >= len
         b.local_get(1);
         b.i64_const(0);
         b.i64_lt_s();
         b.local_get(1);
         b.local_get(0);
-        b.i32_wrap_i64();
-        b.i64_load(0);
+        self.emit_len_read(b);
         b.i64_ge_s();
         b.i32_or();
         b.if_void();
@@ -1101,7 +1578,6 @@ impl<'a> WasmCompiler<'a> {
         b.end();
     }
 
-    /// fn arr_get(ptr: i64, idx: i64) -> elem
     fn emit_arr_get(&mut self, float_elem: bool) -> Vec<u8> {
         let mut b = FnBuilder::new(2);
         self.emit_bounds_check(&mut b);
@@ -1112,14 +1588,13 @@ impl<'a> WasmCompiler<'a> {
         b.i64_add();
         b.i32_wrap_i64();
         if float_elem {
-            b.f64_load(8);
+            b.f64_load(HDR as u32);
         } else {
-            b.i64_load(8);
+            b.i64_load(HDR as u32);
         }
         b.finish()
     }
 
-    /// fn arr_set(ptr: i64, idx: i64, v)
     fn emit_arr_set(&mut self, float_elem: bool) -> Vec<u8> {
         let mut b = FnBuilder::new(3);
         self.emit_bounds_check(&mut b);
@@ -1131,14 +1606,13 @@ impl<'a> WasmCompiler<'a> {
         b.i32_wrap_i64();
         b.local_get(2);
         if float_elem {
-            b.f64_store(8);
+            b.f64_store(HDR as u32);
         } else {
-            b.i64_store(8);
+            b.i64_store(HDR as u32);
         }
         b.finish()
     }
 
-    /// fn iadd(a, b) -> i64, trapping on overflow.
     fn emit_iadd(&mut self) -> Vec<u8> {
         let mut b = FnBuilder::new(2);
         let c = b.new_local(VT_I64);
@@ -1146,7 +1620,6 @@ impl<'a> WasmCompiler<'a> {
         b.local_get(1);
         b.i64_add();
         b.local_set(c);
-        // overflow iff (a^c) & (b^c) < 0
         b.local_get(0);
         b.local_get(c);
         b.i64_xor();
@@ -1163,7 +1636,6 @@ impl<'a> WasmCompiler<'a> {
         b.finish()
     }
 
-    /// fn isub(a, b) -> i64, trapping on overflow.
     fn emit_isub(&mut self) -> Vec<u8> {
         let mut b = FnBuilder::new(2);
         let c = b.new_local(VT_I64);
@@ -1171,7 +1643,6 @@ impl<'a> WasmCompiler<'a> {
         b.local_get(1);
         b.i64_sub();
         b.local_set(c);
-        // overflow iff (a^b) & (a^c) < 0
         b.local_get(0);
         b.local_get(1);
         b.i64_xor();
@@ -1188,18 +1659,15 @@ impl<'a> WasmCompiler<'a> {
         b.finish()
     }
 
-    /// fn imul(a, b) -> i64, trapping on overflow.
     fn emit_imul(&mut self) -> Vec<u8> {
         let mut b = FnBuilder::new(2);
         let c = b.new_local(VT_I64);
-        // a == 0 -> 0
         b.local_get(0);
         b.i64_eqz();
         b.if_void();
         b.i64_const(0);
         b.ret();
         b.end();
-        // a == -1: result is -b; only i64::MIN overflows
         b.local_get(0);
         b.i64_const(-1);
         b.i64_eq();
@@ -1217,7 +1685,6 @@ impl<'a> WasmCompiler<'a> {
             b.ret();
         }
         b.end();
-        // general case: c = a*b; overflow iff c/a != b (a != 0, a != -1)
         b.local_get(0);
         b.local_get(1);
         b.i64_mul();
@@ -1234,7 +1701,6 @@ impl<'a> WasmCompiler<'a> {
         b.finish()
     }
 
-    /// fn idiv(a, b) -> i64, trapping on b == 0 and MIN / -1.
     fn emit_idiv(&mut self) -> Vec<u8> {
         let mut b = FnBuilder::new(2);
         b.local_get(1);
@@ -1258,7 +1724,6 @@ impl<'a> WasmCompiler<'a> {
         b.finish()
     }
 
-    /// fn irem(a, b) -> i64, trapping on b == 0 and MIN % -1.
     fn emit_irem(&mut self) -> Vec<u8> {
         let mut b = FnBuilder::new(2);
         b.local_get(1);
@@ -1282,17 +1747,14 @@ impl<'a> WasmCompiler<'a> {
         b.finish()
     }
 
-    /// fn char_at(str: i64, idx: i64) -> i64 (byte value)
     fn emit_char_at(&mut self) -> Vec<u8> {
         let mut b = FnBuilder::new(2);
-        // idx < 0 || idx >= len
         b.local_get(1);
         b.i64_const(0);
         b.i64_lt_s();
         b.local_get(1);
         b.local_get(0);
-        b.i32_wrap_i64();
-        b.i64_load(0);
+        self.emit_len_read(&mut b);
         b.i64_ge_s();
         b.i32_or();
         b.if_void();
@@ -1302,16 +1764,14 @@ impl<'a> WasmCompiler<'a> {
         b.local_get(1);
         b.i64_add();
         b.i32_wrap_i64();
-        b.i64_load8_u(8);
+        b.i64_load8_u(HDR as u32);
         b.finish()
     }
 
-    /// fn substr(str: i64, a: i64, b: i64) -> i64
     fn emit_substr(&mut self) -> Vec<u8> {
         let mut b = FnBuilder::new(3);
         let out = b.new_local(VT_I64);
         let n = b.new_local(VT_I64);
-        // a < 0 || a > b || b > len
         b.local_get(1);
         b.i64_const(0);
         b.i64_lt_s();
@@ -1321,19 +1781,17 @@ impl<'a> WasmCompiler<'a> {
         b.i32_or();
         b.local_get(2);
         b.local_get(0);
-        b.i32_wrap_i64();
-        b.i64_load(0);
+        self.emit_len_read(&mut b);
         b.i64_gt_s();
         b.i32_or();
         b.if_void();
         self.emit_fail(&mut b, "runtime error: substr out of range");
         b.end();
-        // n = b - a; out = alloc(8 + n)
         b.local_get(2);
         b.local_get(1);
         b.i64_sub();
         b.local_set(n);
-        b.i64_const(8);
+        b.i64_const(HDR);
         b.local_get(n);
         b.i64_add();
         b.call(self.h_alloc);
@@ -1341,14 +1799,15 @@ impl<'a> WasmCompiler<'a> {
         b.local_get(out);
         b.i32_wrap_i64();
         b.local_get(n);
+        b.i64_const(4);
+        b.i64_shl();
         b.i64_store(0);
-        // copy bytes
         b.local_get(out);
-        b.i64_const(8);
+        b.i64_const(HDR);
         b.i64_add();
         b.i32_wrap_i64();
         b.local_get(0);
-        b.i64_const(8);
+        b.i64_const(HDR);
         b.i64_add();
         b.local_get(1);
         b.i64_add();
@@ -1360,7 +1819,6 @@ impl<'a> WasmCompiler<'a> {
         b.finish()
     }
 
-    /// fn chr(byte: i64) -> i64 (a one-byte string)
     fn emit_chr(&mut self) -> Vec<u8> {
         let mut b = FnBuilder::new(1);
         let out = b.new_local(VT_I64);
@@ -1374,43 +1832,616 @@ impl<'a> WasmCompiler<'a> {
         b.if_void();
         self.emit_fail(&mut b, "runtime error: chr byte value out of range 0..=255");
         b.end();
-        b.i64_const(9);
+        b.i64_const(HDR + 1);
         b.call(self.h_alloc);
         b.local_set(out);
         b.local_get(out);
         b.i32_wrap_i64();
-        b.i64_const(1);
+        b.i64_const(1 << 4);
         b.i64_store(0);
         b.local_get(out);
         b.i32_wrap_i64();
         b.local_get(0);
-        b.i64_store8(8);
+        b.i64_store8(HDR as u32);
         b.local_get(out);
+        b.finish()
+    }
+
+    // ---- garbage collector ----
+
+    /// fn obj_size(meta: i64) -> i64 (total block bytes, 8-aligned)
+    fn emit_obj_size(&mut self) -> Vec<u8> {
+        let mut b = FnBuilder::new(1);
+        let tag = b.new_local(VT_I64);
+        let count = b.new_local(VT_I64);
+        b.local_get(0);
+        b.i64_const(7);
+        b.i64_and();
+        b.local_set(tag);
+        b.local_get(0);
+        b.i64_const(4);
+        b.i64_shr_u();
+        b.local_set(count);
+        // bytes object: 16 + align8(count)
+        b.local_get(tag);
+        b.i64_const(TAG_BYTES);
+        b.i64_eq();
+        b.if_void();
+        b.i64_const(HDR);
+        b.local_get(count);
+        b.i64_const(7);
+        b.i64_add();
+        b.i64_const(-8);
+        b.i64_and();
+        b.i64_add();
+        b.ret();
+        b.end();
+        // free block: count = total size
+        b.local_get(tag);
+        b.i64_const(TAG_FREE);
+        b.i64_eq();
+        b.if_void();
+        b.local_get(count);
+        b.ret();
+        b.end();
+        // arrays and structs: 16 + 8 * count
+        b.i64_const(HDR);
+        b.local_get(count);
+        b.i64_const(3);
+        b.i64_shl();
+        b.i64_add();
+        b.finish()
+    }
+
+    /// fn mark_push(p: i64): mark an object and push it on the mark stack.
+    fn emit_mark_push(&mut self) -> Vec<u8> {
+        let mut b = FnBuilder::new(1);
+        let meta = b.new_local(VT_I64);
+        let addr = b.new_local(VT_I64);
+        // null or static: ignore
+        b.local_get(0);
+        b.i64_eqz();
+        b.if_void();
+        b.ret();
+        b.end();
+        b.local_get(0);
+        b.global_get(G_HEAP_BASE);
+        b.i64_extend_i32_u();
+        b.i64_lt_u();
+        b.if_void();
+        b.ret();
+        b.end();
+        // already marked?
+        b.local_get(0);
+        b.i32_wrap_i64();
+        b.i64_load(0);
+        b.local_set(meta);
+        b.local_get(meta);
+        b.i64_const(MARK);
+        b.i64_and();
+        b.i64_eqz();
+        b.i32_eqz();
+        b.if_void();
+        b.ret();
+        b.end();
+        // set mark bit
+        b.local_get(0);
+        b.i32_wrap_i64();
+        b.local_get(meta);
+        b.i64_const(MARK);
+        b.i64_or();
+        b.i64_store(0);
+        // push: addr = ms_base + ms_top * 8
+        b.global_get(G_MSBASE);
+        b.global_get(G_MSTOP);
+        b.i64_const(3);
+        b.i64_shl();
+        b.i64_add();
+        b.local_set(addr);
+        // grow memory if the mark stack ran past the end
+        b.local_get(addr);
+        b.i64_const(8);
+        b.i64_add();
+        b.memory_size();
+        b.i64_extend_i32_u();
+        b.i64_const(16);
+        b.i64_shl();
+        b.i64_gt_u();
+        b.if_void();
+        {
+            b.i32_const(1);
+            b.memory_grow();
+            b.i32_const(-1);
+            b.i32_eq();
+            b.if_void();
+            self.emit_fail(&mut b, "runtime error: out of memory (gc mark stack)");
+            b.end();
+        }
+        b.end();
+        b.local_get(addr);
+        b.i32_wrap_i64();
+        b.local_get(0);
+        b.i64_store(0);
+        b.global_get(G_MSTOP);
+        b.i64_const(1);
+        b.i64_add();
+        b.global_set(G_MSTOP);
+        b.finish()
+    }
+
+    /// fn gc_collect(): mark from the shadow stack, then sweep the heap into
+    /// a free list, updating the adaptive threshold.
+    fn emit_gc_collect(&mut self) -> Vec<u8> {
+        let mut b = FnBuilder::new(0);
+        let p = b.new_local(VT_I64);
+        let limit = b.new_local(VT_I64);
+        let obj = b.new_local(VT_I64);
+        let meta = b.new_local(VT_I64);
+        let tag = b.new_local(VT_I64);
+        let count = b.new_local(VT_I64);
+        let i = b.new_local(VT_I64);
+        let bm = b.new_local(VT_I64);
+        let size = b.new_local(VT_I64);
+        let live = b.new_local(VT_I64);
+        let prevfree = b.new_local(VT_I64);
+        let tmp = b.new_local(VT_I64);
+
+        // the mark stack lives in the slack between the bump pointer and the
+        // end of memory (growing if it runs out); no heap allocation happens
+        // during collection, so the slack is free to use
+        b.global_get(G_HP);
+        b.i64_extend_i32_u();
+        b.global_set(G_MSBASE);
+        b.i64_const(0);
+        b.global_set(G_MSTOP);
+
+        // --- roots: every slot of every shadow frame ---
+        b.global_get(G_SHADOW_BASE);
+        b.i64_extend_i32_u();
+        b.local_set(p);
+        b.global_get(G_SSP);
+        b.i64_extend_i32_u();
+        b.local_set(limit);
+        b.block_void();
+        b.loop_void();
+        {
+            b.local_get(p);
+            b.local_get(limit);
+            b.i64_ge_u();
+            b.br_if(1);
+            b.local_get(p);
+            b.i32_wrap_i64();
+            b.i64_load(0);
+            b.call(self.h_mark_push);
+            b.local_get(p);
+            b.i64_const(8);
+            b.i64_add();
+            b.local_set(p);
+            b.br(0);
+        }
+        b.end();
+        b.end();
+
+        // --- drain the mark stack, tracing pointer fields ---
+        b.block_void();
+        b.loop_void();
+        {
+            b.global_get(G_MSTOP);
+            b.i64_eqz();
+            b.br_if(1);
+            b.global_get(G_MSTOP);
+            b.i64_const(1);
+            b.i64_sub();
+            b.global_set(G_MSTOP);
+            b.global_get(G_MSBASE);
+            b.global_get(G_MSTOP);
+            b.i64_const(3);
+            b.i64_shl();
+            b.i64_add();
+            b.i32_wrap_i64();
+            b.i64_load(0);
+            b.local_set(obj);
+            b.local_get(obj);
+            b.i32_wrap_i64();
+            b.i64_load(0);
+            b.local_set(meta);
+            b.local_get(meta);
+            b.i64_const(7);
+            b.i64_and();
+            b.local_set(tag);
+            b.local_get(meta);
+            b.i64_const(4);
+            b.i64_shr_u();
+            b.local_set(count);
+            // array of pointers: trace every element
+            b.local_get(tag);
+            b.i64_const(TAG_ARRP);
+            b.i64_eq();
+            b.if_void();
+            {
+                b.i64_const(0);
+                b.local_set(i);
+                b.block_void();
+                b.loop_void();
+                {
+                    b.local_get(i);
+                    b.local_get(count);
+                    b.i64_ge_s();
+                    b.br_if(1);
+                    b.local_get(obj);
+                    b.local_get(i);
+                    b.i64_const(3);
+                    b.i64_shl();
+                    b.i64_add();
+                    b.i32_wrap_i64();
+                    b.i64_load(HDR as u32);
+                    b.call(self.h_mark_push);
+                    b.local_get(i);
+                    b.i64_const(1);
+                    b.i64_add();
+                    b.local_set(i);
+                    b.br(0);
+                }
+                b.end();
+                b.end();
+            }
+            b.end();
+            // struct/closure: trace fields flagged in the bitmap
+            b.local_get(tag);
+            b.i64_const(TAG_STRUCT);
+            b.i64_eq();
+            b.if_void();
+            {
+                b.local_get(obj);
+                b.i32_wrap_i64();
+                b.i64_load(8);
+                b.local_set(bm);
+                b.i64_const(0);
+                b.local_set(i);
+                b.block_void();
+                b.loop_void();
+                {
+                    b.local_get(i);
+                    b.local_get(count);
+                    b.i64_ge_s();
+                    b.br_if(1);
+                    b.local_get(bm);
+                    b.local_get(i);
+                    b.i64_shr_u();
+                    b.i64_const(1);
+                    b.i64_and();
+                    b.i64_eqz();
+                    b.i32_eqz();
+                    b.if_void();
+                    {
+                        b.local_get(obj);
+                        b.local_get(i);
+                        b.i64_const(3);
+                        b.i64_shl();
+                        b.i64_add();
+                        b.i32_wrap_i64();
+                        b.i64_load(HDR as u32);
+                        b.call(self.h_mark_push);
+                    }
+                    b.end();
+                    b.local_get(i);
+                    b.i64_const(1);
+                    b.i64_add();
+                    b.local_set(i);
+                    b.br(0);
+                }
+                b.end();
+                b.end();
+            }
+            b.end();
+            b.br(0);
+        }
+        b.end();
+        b.end();
+
+        // --- sweep: walk the heap, freeing unmarked blocks (coalescing) ---
+        b.global_get(G_HEAP_BASE);
+        b.i64_extend_i32_u();
+        b.local_set(p);
+        b.global_get(G_HP);
+        b.i64_extend_i32_u();
+        b.local_set(limit);
+        b.i64_const(0);
+        b.global_set(G_FREELIST);
+        b.i64_const(0);
+        b.local_set(live);
+        b.i64_const(0);
+        b.local_set(prevfree);
+        b.block_void();
+        b.loop_void();
+        {
+            b.local_get(p);
+            b.local_get(limit);
+            b.i64_ge_u();
+            b.br_if(1);
+            b.local_get(p);
+            b.i32_wrap_i64();
+            b.i64_load(0);
+            b.local_set(meta);
+            b.local_get(meta);
+            b.call(self.h_obj_size);
+            b.local_set(size);
+            b.local_get(meta);
+            b.i64_const(MARK);
+            b.i64_and();
+            b.i64_eqz();
+            b.i32_eqz();
+            b.if_void();
+            {
+                // live: clear the mark
+                b.local_get(p);
+                b.i32_wrap_i64();
+                b.local_get(meta);
+                b.i64_const(!MARK);
+                b.i64_and();
+                b.i64_store(0);
+                b.local_get(live);
+                b.local_get(size);
+                b.i64_add();
+                b.local_set(live);
+                b.i64_const(0);
+                b.local_set(prevfree);
+            }
+            b.else_();
+            {
+                // dead: free block, coalescing with the previous free block
+                b.local_get(prevfree);
+                b.i64_eqz();
+                b.if_void();
+                {
+                    b.local_get(p);
+                    b.i32_wrap_i64();
+                    b.local_get(size);
+                    b.i64_const(4);
+                    b.i64_shl();
+                    b.i64_const(TAG_FREE);
+                    b.i64_or();
+                    b.i64_store(0);
+                    b.local_get(p);
+                    b.i32_wrap_i64();
+                    b.global_get(G_FREELIST);
+                    b.i64_store(8);
+                    b.local_get(p);
+                    b.global_set(G_FREELIST);
+                    b.local_get(p);
+                    b.local_set(prevfree);
+                }
+                b.else_();
+                {
+                    // grow prevfree by size
+                    b.local_get(prevfree);
+                    b.i32_wrap_i64();
+                    b.i64_load(0);
+                    b.i64_const(4);
+                    b.i64_shr_u();
+                    b.local_get(size);
+                    b.i64_add();
+                    b.local_set(tmp);
+                    b.local_get(prevfree);
+                    b.i32_wrap_i64();
+                    b.local_get(tmp);
+                    b.i64_const(4);
+                    b.i64_shl();
+                    b.i64_const(TAG_FREE);
+                    b.i64_or();
+                    b.i64_store(0);
+                }
+                b.end();
+            }
+            b.end();
+            b.local_get(p);
+            b.local_get(size);
+            b.i64_add();
+            b.local_set(p);
+            b.br(0);
+        }
+        b.end();
+        b.end();
+        // threshold = max(live, 1 MiB); reset the allocation counter
+        b.local_get(live);
+        b.i64_const(1 << 20);
+        b.i64_lt_s();
+        b.if_void();
+        b.i64_const(1 << 20);
+        b.local_set(live);
+        b.end();
+        b.local_get(live);
+        b.global_set(G_THRESH);
+        b.i64_const(0);
+        b.global_set(G_ALLOC);
+        b.finish()
+    }
+
+    /// fn gc_maybe(): the safepoint check.
+    fn emit_gc_maybe(&mut self) -> Vec<u8> {
+        let mut b = FnBuilder::new(0);
+        b.global_get(G_ALLOC);
+        b.global_get(G_THRESH);
+        b.i64_gt_s();
+        b.if_void();
+        b.call(self.h_gc_collect);
+        b.end();
         b.finish()
     }
 
     // ---- user function codegen ----
 
+    fn frame_addr(&self, ctx: &mut FnCtx, slot: u32) {
+        ctx.b.local_get(ctx.fb);
+        ctx.b.i32_const((slot * 8) as i32);
+        ctx.b.i32_add();
+    }
+
+    /// Stores the i64 on top of the stack into a frame slot (via scratch),
+    /// consuming it.
+    fn frame_store(&self, ctx: &mut FnCtx, slot: u32) {
+        ctx.b.local_set(ctx.scratch);
+        self.frame_addr(ctx, slot);
+        ctx.b.local_get(ctx.scratch);
+        ctx.b.i64_store(0);
+    }
+
+    fn frame_load(&self, ctx: &mut FnCtx, slot: u32) {
+        self.frame_addr(ctx, slot);
+        ctx.b.i64_load(0);
+    }
+
+    /// Mirrors a pointer-typed local into its frame slot (roots it).
+    fn mirror_local(&self, ctx: &mut FnCtx, local: u32, slot: u32) {
+        self.frame_addr(ctx, slot);
+        ctx.b.local_get(local);
+        ctx.b.i64_store(0);
+    }
+
     fn emit_function(&mut self, f: &Function) -> Vec<u8> {
+        let params: Vec<(String, Type)> = f
+            .params
+            .iter()
+            .map(|p| (p.name.clone(), p.ty.clone()))
+            .collect();
+        self.emit_body(
+            &params,
+            f.ret.clone(),
+            &f.requires,
+            &f.ensures,
+            &f.body,
+            &f.name,
+            None,
+        )
+    }
+
+    fn emit_lambda(&mut self, l: &Lambda) -> Vec<u8> {
+        let params: Vec<(String, Type)> = l
+            .params
+            .iter()
+            .map(|p| (p.name.clone(), p.ty.clone()))
+            .collect();
+        let captures = self
+            .lambda_captures
+            .get(&l.id)
+            .cloned()
+            .unwrap_or_default();
+        self.emit_body(
+            &params,
+            l.ret.clone(),
+            &[],
+            &[],
+            &l.body,
+            "<lambda>",
+            Some(captures),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_body(
+        &mut self,
+        params: &[(String, Type)],
+        ret: Type,
+        requires: &[Contract],
+        ensures: &[Contract],
+        body: &[Stmt],
+        fn_name: &str,
+        captures: Option<Vec<(String, Type)>>,
+    ) -> Vec<u8> {
+        let is_lambda = captures.is_some();
+        let n_params = params.len() as u32 + if is_lambda { 1 } else { 0 };
+        let mut b = FnBuilder::new(n_params);
+        let fb = b.new_local(VT_I32);
+        let scratch = b.new_local(VT_I64);
         let mut ctx = FnCtx {
-            b: FnBuilder::new(f.params.len() as u32),
+            b,
             nesting: 0,
             loops: Vec::new(),
             result_local: None,
-            ret: f.ret.clone(),
+            ret: ret.clone(),
+            fb,
+            scratch,
+            named_next: 0,
+            temp_next: 0,
+            frame_high: 0,
         };
         let mut scope: Scope = vec![HashMap::new()];
-        for (i, p) in f.params.iter().enumerate() {
-            scope[0].insert(p.name.clone(), (i as u32, p.ty.clone()));
+        for (i, (name, ty)) in params.iter().enumerate() {
+            scope[0].insert(name.clone(), (i as u32, ty.clone()));
         }
 
-        // requires clauses run first, against the incoming arguments
-        for c in &f.requires {
+        // --- frame prologue ---
+        ctx.b.global_get(G_SSP);
+        ctx.b.local_set(ctx.fb);
+        ctx.b.local_get(ctx.fb);
+        let patch_size = ctx.b.i32_const_patchable();
+        ctx.b.i32_add();
+        ctx.b.global_set(G_SSP);
+        ctx.b.global_get(G_SSP);
+        ctx.b.global_get(G_HEAP_BASE);
+        ctx.b.i32_gt_u();
+        ctx.b.if_void();
+        self.emit_fail(&mut ctx.b, "runtime error: stack overflow");
+        ctx.b.end();
+        ctx.b.local_get(ctx.fb);
+        ctx.b.i32_const(0);
+        let patch_fill = ctx.b.i32_const_patchable();
+        ctx.b.memory_fill();
+
+        // pointer params (including the env pointer of a lambda) get slots
+        for (i, (name, ty)) in params.iter().enumerate() {
+            if is_ptr(ty) {
+                let slot = ctx.alloc_named();
+                self.mirror_local(&mut ctx, i as u32, slot);
+                scope[0].insert(format!("{}\u{0}slot", name), (slot, Type::Int));
+            }
+        }
+        if is_lambda {
+            let env = params.len() as u32;
+            let slot = ctx.alloc_named();
+            self.mirror_local(&mut ctx, env, slot);
+            // load captures from the closure object into locals; they stay
+            // alive through the rooted env pointer
+            for (i, (name, ty)) in captures.as_ref().unwrap().iter().enumerate() {
+                let l = ctx.b.new_local(valtype(ty));
+                ctx.b.local_get(env);
+                ctx.b.i32_wrap_i64();
+                let off = HDR as u32 + 8 + 8 * i as u32;
+                if *ty == Type::Float {
+                    ctx.b.f64_load(off);
+                } else {
+                    ctx.b.i64_load(off);
+                }
+                ctx.b.local_set(l);
+                scope[0].insert(name.clone(), (l, ty.clone()));
+            }
+        }
+
+        // shadow copies of params for ensures (original argument values)
+        let mut shadows: Vec<(String, u32, Type)> = Vec::new();
+        if !ensures.is_empty() {
+            for (i, (name, ty)) in params.iter().enumerate() {
+                let sh = ctx.b.new_local(valtype(ty));
+                ctx.b.local_get(i as u32);
+                ctx.b.local_set(sh);
+                if is_ptr(ty) {
+                    let slot = ctx.alloc_named();
+                    self.mirror_local(&mut ctx, sh, slot);
+                }
+                shadows.push((name.clone(), sh, ty.clone()));
+            }
+        }
+
+        // entry safepoint
+        ctx.b.call(self.h_gc_maybe);
+
+        for c in requires {
             let msg = format!(
                 "runtime error: contract violation: requires '{}' failed when calling '{}'",
-                c.text, f.name
+                c.text, fn_name
             );
             let addr = self.intern(&msg);
+            ctx.temp_next = ctx.named_next;
             self.expr(&mut ctx, &scope, &c.expr, None);
             ctx.b.i32_wrap_i64();
             ctx.b.i32_eqz();
@@ -1421,42 +2452,37 @@ impl<'a> WasmCompiler<'a> {
             ctx.b.end();
         }
 
-        // shadow-copy params so ensures sees the original argument values
-        let mut shadows: Vec<(String, u32, Type)> = Vec::new();
-        if !f.ensures.is_empty() {
-            for (i, p) in f.params.iter().enumerate() {
-                let sh = ctx.b.new_local(valtype(&p.ty));
-                ctx.b.local_get(i as u32);
-                ctx.b.local_set(sh);
-                shadows.push((p.name.clone(), sh, p.ty.clone()));
-            }
+        if ret != Type::Unit {
+            ctx.result_local = Some(ctx.b.new_local(valtype(&ret)));
         }
 
-        if f.ret != Type::Unit {
-            ctx.result_local = Some(ctx.b.new_local(valtype(&f.ret)));
-        }
-
-        // function body inside an exit block; 'return' branches to its end
         ctx.b.block_void();
         ctx.nesting = 0;
-        self.stmts(&mut ctx, &mut scope, &f.body);
+        self.stmts(&mut ctx, &mut scope, body);
         ctx.b.end();
 
-        // ensures clauses check 'result' against the original arguments
-        if !f.ensures.is_empty() {
+        if !ensures.is_empty() {
             let mut ens_scope: Scope = vec![HashMap::new()];
             for (name, idx, ty) in &shadows {
                 ens_scope[0].insert(name.clone(), (*idx, ty.clone()));
             }
             if let Some(r) = ctx.result_local {
-                ens_scope[0].insert("result".to_string(), (r, f.ret.clone()));
+                ens_scope[0].insert("result".to_string(), (r, ret.clone()));
             }
-            for c in &f.ensures {
+            // the result must survive GC during ensures evaluation
+            if is_ptr(&ret) {
+                if let Some(r) = ctx.result_local {
+                    let slot = ctx.alloc_named();
+                    self.mirror_local(&mut ctx, r, slot);
+                }
+            }
+            for c in ensures {
                 let msg = format!(
                     "runtime error: contract violation: ensures '{}' failed in '{}'",
-                    c.text, f.name
+                    c.text, fn_name
                 );
                 let addr = self.intern(&msg);
+                ctx.temp_next = ctx.named_next;
                 self.expr(&mut ctx, &ens_scope, &c.expr, None);
                 ctx.b.i32_wrap_i64();
                 ctx.b.i32_eqz();
@@ -1468,9 +2494,15 @@ impl<'a> WasmCompiler<'a> {
             }
         }
 
+        // frame epilogue
+        ctx.b.local_get(ctx.fb);
+        ctx.b.global_set(G_SSP);
         if let Some(r) = ctx.result_local {
             ctx.b.local_get(r);
         }
+        let frame_bytes = (ctx.frame_high * 8) as i32;
+        ctx.b.patch_i32(patch_size, frame_bytes);
+        ctx.b.patch_i32(patch_fill, frame_bytes);
         ctx.b.finish()
     }
 
@@ -1483,6 +2515,8 @@ impl<'a> WasmCompiler<'a> {
     }
 
     fn stmt(&mut self, ctx: &mut FnCtx, scope: &mut Scope, stmt: &Stmt) {
+        // temp roots are per-statement
+        ctx.temp_next = ctx.named_next;
         match &stmt.kind {
             StmtKind::Let { name, ty, value } => {
                 let vty = match ty {
@@ -1492,21 +2526,41 @@ impl<'a> WasmCompiler<'a> {
                 self.expr(ctx, scope, value, Some(&vty));
                 let idx = ctx.b.new_local(valtype(&vty));
                 ctx.b.local_set(idx);
+                if is_ptr(&vty) {
+                    let slot = ctx.alloc_named();
+                    self.mirror_local(ctx, idx, slot);
+                    scope
+                        .last_mut()
+                        .unwrap()
+                        .insert(format!("{}\u{0}slot", name), (slot, Type::Int));
+                }
                 scope.last_mut().unwrap().insert(name.clone(), (idx, vty));
             }
             StmtKind::Assign { name, value } => {
                 let (idx, ty) = lookup(scope, name).expect("checked");
                 self.expr(ctx, scope, value, Some(&ty));
                 ctx.b.local_set(idx);
+                if is_ptr(&ty) {
+                    let (slot, _) = lookup(scope, &format!("{}\u{0}slot", name))
+                        .expect("every pointer variable has a frame slot");
+                    self.mirror_local(ctx, idx, slot);
+                }
             }
             StmtKind::IndexAssign { base, index, value } => {
                 let elem = match self.type_of(base, scope) {
                     Type::Array(e) => *e,
                     _ => unreachable!(),
                 };
-                self.expr(ctx, scope, base, None);
-                self.expr(ctx, scope, index, Some(&Type::Int));
-                self.expr(ctx, scope, value, Some(&elem));
+                let bt = self.type_of(base, scope);
+                self.eval_operands(
+                    ctx,
+                    scope,
+                    &[
+                        (base, Some(bt)),
+                        (index, Some(Type::Int)),
+                        (value, Some(elem.clone())),
+                    ],
+                );
                 let helper = if elem == Type::Float {
                     self.h_set_f64
                 } else {
@@ -1520,9 +2574,19 @@ impl<'a> WasmCompiler<'a> {
                     _ => unreachable!(),
                 };
                 let (offset, fty) = self.field_slot(&sname, field);
-                self.expr(ctx, scope, base, None);
+                // evaluate to temps so the base survives value's evaluation,
+                // then interleave: addr, value, store
+                let saved = self.eval_to_temps(
+                    ctx,
+                    scope,
+                    &[
+                        (base, Some(Type::Struct(sname.clone()))),
+                        (value, Some(fty.clone())),
+                    ],
+                );
+                self.reload(ctx, &saved[0]);
                 ctx.b.i32_wrap_i64();
-                self.expr(ctx, scope, value, Some(&fty));
+                self.reload(ctx, &saved[1]);
                 if fty == Type::Float {
                     ctx.b.f64_store(offset);
                 } else {
@@ -1553,6 +2617,7 @@ impl<'a> WasmCompiler<'a> {
                 ctx.b.loop_void();
                 ctx.nesting += 1;
                 let t_continue = ctx.nesting;
+                ctx.temp_next = ctx.named_next;
                 self.expr(ctx, scope, cond, Some(&Type::Bool));
                 ctx.b.i32_wrap_i64();
                 ctx.b.i32_eqz();
@@ -1560,6 +2625,8 @@ impl<'a> WasmCompiler<'a> {
                 ctx.loops.push((t_break, t_continue));
                 self.stmts(ctx, scope, body);
                 ctx.loops.pop();
+                // loop back-edge safepoint
+                ctx.b.call(self.h_gc_maybe);
                 ctx.b.br(ctx.nesting - t_continue);
                 ctx.nesting -= 2;
                 ctx.b.end();
@@ -1571,11 +2638,11 @@ impl<'a> WasmCompiler<'a> {
                 end,
                 body,
             } => {
-                // end is evaluated once, before the loop
                 let e_local = ctx.b.new_local(VT_I64);
                 self.expr(ctx, scope, end, Some(&Type::Int));
                 ctx.b.local_set(e_local);
                 let i_local = ctx.b.new_local(VT_I64);
+                ctx.temp_next = ctx.named_next;
                 self.expr(ctx, scope, start, Some(&Type::Int));
                 ctx.b.local_set(i_local);
                 scope.push(HashMap::new());
@@ -1584,34 +2651,34 @@ impl<'a> WasmCompiler<'a> {
                     .unwrap()
                     .insert(var.clone(), (i_local, Type::Int));
 
-                ctx.b.block_void(); // A: break target
+                ctx.b.block_void();
                 ctx.nesting += 1;
                 let t_break = ctx.nesting;
-                ctx.b.loop_void(); // L
+                ctx.b.loop_void();
                 ctx.nesting += 1;
                 let t_loop = ctx.nesting;
-                // if i >= e, exit
                 ctx.b.local_get(i_local);
                 ctx.b.local_get(e_local);
                 ctx.b.i64_ge_s();
                 ctx.b.br_if(ctx.nesting - t_break);
-                ctx.b.block_void(); // C: continue target (increment still runs)
+                ctx.b.block_void();
                 ctx.nesting += 1;
                 let t_continue = ctx.nesting;
                 ctx.loops.push((t_break, t_continue));
                 self.stmts(ctx, scope, body);
                 ctx.loops.pop();
                 ctx.nesting -= 1;
-                ctx.b.end(); // C
-                // i = i + 1 (checked, same as the interpreter)
+                ctx.b.end();
                 ctx.b.local_get(i_local);
                 ctx.b.i64_const(1);
                 ctx.b.call(self.h_iadd);
                 ctx.b.local_set(i_local);
+                // loop back-edge safepoint
+                ctx.b.call(self.h_gc_maybe);
                 ctx.b.br(ctx.nesting - t_loop);
                 ctx.nesting -= 2;
-                ctx.b.end(); // L
-                ctx.b.end(); // A
+                ctx.b.end();
+                ctx.b.end();
                 scope.pop();
             }
             StmtKind::Break => {
@@ -1669,7 +2736,81 @@ impl<'a> WasmCompiler<'a> {
             .iter()
             .position(|f| f.name == field)
             .expect("checked");
-        (8 * idx as u32, fields[idx].ty.clone())
+        (HDR as u32 + 8 * idx as u32, fields[idx].ty.clone())
+    }
+
+    /// Evaluates operands to temps (frame slots for pointers, locals for
+    /// scalars) when needed for GC safety, then reloads them in order onto
+    /// the stack. When no operand needs rooting, evaluates directly.
+    fn eval_operands(&mut self, ctx: &mut FnCtx, scope: &Scope, ops: &[(&Expr, Option<Type>)]) {
+        let saved = self.eval_to_temps(ctx, scope, ops);
+        for s in &saved {
+            self.reload(ctx, s);
+        }
+    }
+
+    /// Like eval_operands but leaves values in temps, returning handles.
+    fn eval_to_temps(
+        &mut self,
+        ctx: &mut FnCtx,
+        scope: &Scope,
+        ops: &[(&Expr, Option<Type>)],
+    ) -> Vec<Saved> {
+        let mut out = Vec::with_capacity(ops.len());
+        for (e, expected) in ops {
+            let ty = expected
+                .clone()
+                .unwrap_or_else(|| self.type_of(e, scope));
+            self.expr(ctx, scope, e, expected.as_ref());
+            if is_ptr(&ty) {
+                let slot = ctx.alloc_temp();
+                self.frame_store(ctx, slot);
+                out.push(Saved::Ptr(slot));
+            } else {
+                let l = ctx.b.new_local(valtype(&ty));
+                ctx.b.local_set(l);
+                out.push(Saved::Scalar(l));
+            }
+        }
+        out
+    }
+
+    fn reload(&self, ctx: &mut FnCtx, s: &Saved) {
+        match s {
+            Saved::Scalar(l) => ctx.b.local_get(*l),
+            Saved::Ptr(slot) => self.frame_load(ctx, *slot),
+        }
+    }
+
+    /// True if any of `ops` after the first pointer-producing one can GC —
+    /// used to decide between direct stack evaluation and temping.
+    fn needs_temps(&self, scope: &Scope, ops: &[(&Expr, Option<Type>)]) -> bool {
+        for (i, (e, expected)) in ops.iter().enumerate() {
+            let ty = expected
+                .clone()
+                .unwrap_or_else(|| self.type_of(e, scope));
+            if is_ptr(&ty) && ops[i + 1..].iter().any(|(later, _)| can_gc(later)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Evaluates a list of operands onto the stack, temping only when a
+    /// pointer would otherwise sit on the operand stack across a safepoint.
+    fn eval_operands_smart(
+        &mut self,
+        ctx: &mut FnCtx,
+        scope: &Scope,
+        ops: &[(&Expr, Option<Type>)],
+    ) {
+        if self.needs_temps(scope, ops) {
+            self.eval_operands(ctx, scope, ops);
+        } else {
+            for (e, expected) in ops {
+                self.expr(ctx, scope, e, expected.as_ref());
+            }
+        }
     }
 
     fn expr(&mut self, ctx: &mut FnCtx, scope: &Scope, expr: &Expr, expected: Option<&Type>) {
@@ -1685,9 +2826,9 @@ impl<'a> WasmCompiler<'a> {
                 if let Some((idx, _)) = lookup(scope, name) {
                     ctx.b.local_get(idx);
                 } else {
-                    // a bare function name is a function-table slot
-                    let slot = self.table_slot[name.as_str()];
-                    ctx.b.i64_const(slot as i64);
+                    // a bare function name: its static singleton closure
+                    let addr = self.singleton_addrs[name.as_str()];
+                    ctx.b.i64_const(addr as i64);
                 }
             }
             ExprKind::Array(elems) => {
@@ -1699,19 +2840,23 @@ impl<'a> WasmCompiler<'a> {
                         .unwrap_or(Type::Int),
                 };
                 let n = elems.len() as i64;
-                ctx.b.i64_const(8 + 8 * n);
+                let tag = if is_ptr(&elem_ty) { TAG_ARRP } else { TAG_ARR };
+                ctx.b.i64_const(HDR + 8 * n);
                 ctx.b.call(self.h_alloc);
+                // root the fresh array: element evaluation may trigger GC
                 let tmp = ctx.b.new_local(VT_I64);
-                ctx.b.local_set(tmp);
+                ctx.b.local_tee(tmp);
+                let root = ctx.alloc_temp();
+                self.frame_store(ctx, root);
                 ctx.b.local_get(tmp);
                 ctx.b.i32_wrap_i64();
-                ctx.b.i64_const(n);
+                ctx.b.i64_const(n << 4 | tag);
                 ctx.b.i64_store(0);
                 for (i, e) in elems.iter().enumerate() {
                     ctx.b.local_get(tmp);
                     ctx.b.i32_wrap_i64();
                     self.expr(ctx, scope, e, Some(&elem_ty));
-                    let off = 8 + 8 * i as u32;
+                    let off = HDR as u32 + 8 * i as u32;
                     if elem_ty == Type::Float {
                         ctx.b.f64_store(off);
                     } else {
@@ -1722,12 +2867,15 @@ impl<'a> WasmCompiler<'a> {
             }
             ExprKind::Index(base, index) => {
                 let base_ty = self.type_of(base, scope);
-                let elem = match base_ty {
-                    Type::Array(e) => *e,
+                let elem = match &base_ty {
+                    Type::Array(e) => (**e).clone(),
                     _ => unreachable!(),
                 };
-                self.expr(ctx, scope, base, None);
-                self.expr(ctx, scope, index, Some(&Type::Int));
+                self.eval_operands_smart(
+                    ctx,
+                    scope,
+                    &[(base, Some(base_ty)), (index, Some(Type::Int))],
+                );
                 let helper = if elem == Type::Float {
                     self.h_get_f64
                 } else {
@@ -1769,12 +2917,60 @@ impl<'a> WasmCompiler<'a> {
             },
             ExprKind::Bin(op, lhs, rhs) => self.binop(ctx, scope, *op, lhs, rhs),
             ExprKind::Call(name, args) => self.call(ctx, scope, name, args, expected),
+            ExprKind::Lambda(l) => {
+                // resolve captures against the current scope, record their
+                // types for the lifted function, and build the closure object
+                let mut captures: Vec<(String, Type)> = Vec::new();
+                for n in l.free_names() {
+                    if let Some((_, ty)) = lookup(scope, &n) {
+                        captures.push((n, ty));
+                    }
+                }
+                self.lambda_captures.insert(l.id, captures.clone());
+                let ncaps = captures.len() as i64;
+                let mut bitmap: i64 = 0;
+                for (i, (_, ty)) in captures.iter().enumerate() {
+                    if is_ptr(ty) {
+                        bitmap |= 1 << (i + 1);
+                    }
+                }
+                ctx.b.i64_const(HDR + 8 * (1 + ncaps));
+                ctx.b.call(self.h_alloc);
+                let tmp = ctx.b.new_local(VT_I64);
+                ctx.b.local_tee(tmp);
+                let root = ctx.alloc_temp();
+                self.frame_store(ctx, root);
+                ctx.b.local_get(tmp);
+                ctx.b.i32_wrap_i64();
+                ctx.b.i64_const((1 + ncaps) << 4 | TAG_STRUCT);
+                ctx.b.i64_store(0);
+                ctx.b.local_get(tmp);
+                ctx.b.i32_wrap_i64();
+                ctx.b.i64_const(bitmap);
+                ctx.b.i64_store(8);
+                ctx.b.local_get(tmp);
+                ctx.b.i32_wrap_i64();
+                ctx.b.i64_const(self.lambda_slot[&l.id] as i64);
+                ctx.b.i64_store(HDR as u32);
+                for (i, (name, ty)) in captures.iter().enumerate() {
+                    ctx.b.local_get(tmp);
+                    ctx.b.i32_wrap_i64();
+                    let (idx, _) = lookup(scope, name).expect("capture in scope");
+                    ctx.b.local_get(idx);
+                    let off = HDR as u32 + 8 + 8 * i as u32;
+                    if *ty == Type::Float {
+                        ctx.b.f64_store(off);
+                    } else {
+                        ctx.b.i64_store(off);
+                    }
+                }
+                ctx.b.local_get(tmp);
+            }
         }
     }
 
     fn binop(&mut self, ctx: &mut FnCtx, scope: &Scope, op: BinOp, lhs: &Expr, rhs: &Expr) {
         use BinOp::*;
-        // short-circuit logic ops compile to if-expressions
         if matches!(op, And | Or) {
             self.expr(ctx, scope, lhs, Some(&Type::Bool));
             ctx.b.i32_wrap_i64();
@@ -1795,8 +2991,11 @@ impl<'a> WasmCompiler<'a> {
         }
 
         let lt = self.type_of(lhs, scope);
-        self.expr(ctx, scope, lhs, None);
-        self.expr(ctx, scope, rhs, Some(&lt));
+        self.eval_operands_smart(
+            ctx,
+            scope,
+            &[(lhs, Some(lt.clone())), (rhs, Some(lt.clone()))],
+        );
 
         match (&lt, op) {
             (Type::Str, Add) => ctx.b.call(self.h_concat),
@@ -1806,40 +3005,37 @@ impl<'a> WasmCompiler<'a> {
                 ctx.b.i64_eqz();
                 ctx.b.i64_extend_i32_u();
             }
-            (Type::Float, _) => {
-                match op {
-                    Add => ctx.b.f64_add(),
-                    Sub => ctx.b.f64_sub(),
-                    Mul => ctx.b.f64_mul(),
-                    Div => ctx.b.f64_div(),
-                    Eq => {
-                        ctx.b.f64_eq();
-                        ctx.b.i64_extend_i32_u();
-                    }
-                    Ne => {
-                        ctx.b.f64_ne();
-                        ctx.b.i64_extend_i32_u();
-                    }
-                    Lt => {
-                        ctx.b.f64_lt();
-                        ctx.b.i64_extend_i32_u();
-                    }
-                    Le => {
-                        ctx.b.f64_le();
-                        ctx.b.i64_extend_i32_u();
-                    }
-                    Gt => {
-                        ctx.b.f64_gt();
-                        ctx.b.i64_extend_i32_u();
-                    }
-                    Ge => {
-                        ctx.b.f64_ge();
-                        ctx.b.i64_extend_i32_u();
-                    }
-                    Mod | And | Or => unreachable!("checked"),
+            (Type::Float, _) => match op {
+                Add => ctx.b.f64_add(),
+                Sub => ctx.b.f64_sub(),
+                Mul => ctx.b.f64_mul(),
+                Div => ctx.b.f64_div(),
+                Eq => {
+                    ctx.b.f64_eq();
+                    ctx.b.i64_extend_i32_u();
                 }
-            }
-            // int (checked arithmetic) and bool (comparisons only)
+                Ne => {
+                    ctx.b.f64_ne();
+                    ctx.b.i64_extend_i32_u();
+                }
+                Lt => {
+                    ctx.b.f64_lt();
+                    ctx.b.i64_extend_i32_u();
+                }
+                Le => {
+                    ctx.b.f64_le();
+                    ctx.b.i64_extend_i32_u();
+                }
+                Gt => {
+                    ctx.b.f64_gt();
+                    ctx.b.i64_extend_i32_u();
+                }
+                Ge => {
+                    ctx.b.f64_ge();
+                    ctx.b.i64_extend_i32_u();
+                }
+                Mod | And | Or => unreachable!("checked"),
+            },
             _ => match op {
                 Add => ctx.b.call(self.h_iadd),
                 Sub => ctx.b.call(self.h_isub),
@@ -1885,12 +3081,19 @@ impl<'a> WasmCompiler<'a> {
     ) {
         // a local variable holding a function value: indirect call
         if let Some((idx, Type::Fn(params, ret))) = lookup(scope, name) {
-            for (a, p) in args.iter().zip(params.iter()) {
-                self.expr(ctx, scope, a, Some(p));
-            }
+            let ops: Vec<(&Expr, Option<Type>)> = args
+                .iter()
+                .zip(params.iter())
+                .map(|(a, p)| (a, Some(p.clone())))
+                .collect();
+            self.eval_operands_smart(ctx, scope, &ops);
+            // hidden env argument, then the table index from the closure
+            ctx.b.local_get(idx);
             ctx.b.local_get(idx);
             ctx.b.i32_wrap_i64();
-            let type_idx = self.sig_type(&params, &ret);
+            ctx.b.i64_load(HDR as u32);
+            ctx.b.i32_wrap_i64();
+            let type_idx = self.sig_type_env(&params, &ret);
             ctx.b.call_indirect(type_idx);
             return;
         }
@@ -1909,8 +3112,7 @@ impl<'a> WasmCompiler<'a> {
             }
             "len" => {
                 self.expr(ctx, scope, &args[0], None);
-                ctx.b.i32_wrap_i64();
-                ctx.b.i64_load(0);
+                self.emit_len_read(&mut ctx.b);
             }
             "push" => {
                 let arr_ty = match expected {
@@ -1921,8 +3123,11 @@ impl<'a> WasmCompiler<'a> {
                     Type::Array(e) => (**e).clone(),
                     _ => Type::Int,
                 };
-                self.expr(ctx, scope, &args[0], Some(&arr_ty));
-                self.expr(ctx, scope, &args[1], Some(&elem));
+                self.eval_operands_smart(
+                    ctx,
+                    scope,
+                    &[(&args[0], Some(arr_ty)), (&args[1], Some(elem.clone()))],
+                );
                 let helper = if elem == Type::Float {
                     self.h_push_f64
                 } else {
@@ -1935,16 +3140,14 @@ impl<'a> WasmCompiler<'a> {
                 ctx.b.f64_convert_i64_s();
             }
             "to_int" => {
-                // guard the trunc range so out-of-range values fail with a
-                // message instead of a bare wasm trap
                 self.expr(ctx, scope, &args[0], Some(&Type::Float));
                 let v = ctx.b.new_local(VT_F64);
                 ctx.b.local_set(v);
                 ctx.b.local_get(v);
-                ctx.b.f64_const(-9223372036854775808.0); // -(2^63), exact
+                ctx.b.f64_const(-9223372036854775808.0);
                 ctx.b.f64_ge();
                 ctx.b.local_get(v);
-                ctx.b.f64_const(9223372036854775808.0); // 2^63, exact
+                ctx.b.f64_const(9223372036854775808.0);
                 ctx.b.f64_lt();
                 ctx.b.i32_and();
                 ctx.b.i32_eqz();
@@ -1958,14 +3161,23 @@ impl<'a> WasmCompiler<'a> {
                 ctx.b.i64_trunc_f64_s();
             }
             "char_at" => {
-                self.expr(ctx, scope, &args[0], Some(&Type::Str));
-                self.expr(ctx, scope, &args[1], Some(&Type::Int));
+                self.eval_operands_smart(
+                    ctx,
+                    scope,
+                    &[(&args[0], Some(Type::Str)), (&args[1], Some(Type::Int))],
+                );
                 ctx.b.call(self.h_char_at);
             }
             "substr" => {
-                self.expr(ctx, scope, &args[0], Some(&Type::Str));
-                self.expr(ctx, scope, &args[1], Some(&Type::Int));
-                self.expr(ctx, scope, &args[2], Some(&Type::Int));
+                self.eval_operands_smart(
+                    ctx,
+                    scope,
+                    &[
+                        (&args[0], Some(Type::Str)),
+                        (&args[1], Some(Type::Int)),
+                        (&args[2], Some(Type::Int)),
+                    ],
+                );
                 ctx.b.call(self.h_substr);
             }
             "chr" => {
@@ -1973,18 +3185,29 @@ impl<'a> WasmCompiler<'a> {
                 ctx.b.call(self.h_chr);
             }
             _ => {
-                // struct constructor: allocate and fill fields
+                // struct constructor
                 if let Some(fields) = self.struct_fields.get(name).map(|f| f.to_vec()) {
+                    let bitmap = self.struct_bitmap[name] as i64;
                     let n = fields.len() as i64;
-                    ctx.b.i64_const(8 * n);
+                    ctx.b.i64_const(HDR + 8 * n);
                     ctx.b.call(self.h_alloc);
                     let tmp = ctx.b.new_local(VT_I64);
-                    ctx.b.local_set(tmp);
+                    ctx.b.local_tee(tmp);
+                    let root = ctx.alloc_temp();
+                    self.frame_store(ctx, root);
+                    ctx.b.local_get(tmp);
+                    ctx.b.i32_wrap_i64();
+                    ctx.b.i64_const(n << 4 | TAG_STRUCT);
+                    ctx.b.i64_store(0);
+                    ctx.b.local_get(tmp);
+                    ctx.b.i32_wrap_i64();
+                    ctx.b.i64_const(bitmap);
+                    ctx.b.i64_store(8);
                     for (i, (fld, arg)) in fields.iter().zip(args).enumerate() {
                         ctx.b.local_get(tmp);
                         ctx.b.i32_wrap_i64();
                         self.expr(ctx, scope, arg, Some(&fld.ty));
-                        let off = 8 * i as u32;
+                        let off = HDR as u32 + 8 * i as u32;
                         if fld.ty == Type::Float {
                             ctx.b.f64_store(off);
                         } else {
@@ -1995,16 +3218,18 @@ impl<'a> WasmCompiler<'a> {
                     return;
                 }
                 let (params, _) = self.signatures[name].clone();
-                for (a, p) in args.iter().zip(params.iter()) {
-                    self.expr(ctx, scope, a, Some(p));
-                }
+                let ops: Vec<(&Expr, Option<Type>)> = args
+                    .iter()
+                    .zip(params.iter())
+                    .map(|(a, p)| (a, Some(p.clone())))
+                    .collect();
+                self.eval_operands_smart(ctx, scope, &ops);
                 let idx = self.func_index[name];
                 ctx.b.call(idx);
             }
         }
     }
 
-    /// Type of an already-checked expression (cannot fail).
     fn type_of(&self, expr: &Expr, scope: &Scope) -> Type {
         match &expr.kind {
             ExprKind::Int(_) => Type::Int,
@@ -2042,6 +3267,10 @@ impl<'a> WasmCompiler<'a> {
                     _ => self.type_of(lhs, scope),
                 }
             }
+            ExprKind::Lambda(l) => Type::Fn(
+                l.params.iter().map(|p| p.ty.clone()).collect(),
+                Box::new(l.ret.clone()),
+            ),
             ExprKind::Call(name, args) => {
                 if let Some((_, Type::Fn(_, ret))) = lookup(scope, name) {
                     return *ret;

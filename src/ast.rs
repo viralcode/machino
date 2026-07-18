@@ -88,6 +88,138 @@ pub enum ExprKind {
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Un(UnOp, Box<Expr>),
     Call(String, Vec<Expr>),
+    /// A lambda expression: fn(x: int) -> int { ... }
+    /// Captures enclosing variables by value at creation.
+    Lambda(Box<Lambda>),
+}
+
+#[derive(Debug, Clone)]
+pub struct Lambda {
+    /// Unique per program, assigned by the parser.
+    pub id: usize,
+    pub params: Vec<Param>,
+    pub ret: Type,
+    pub body: Vec<Stmt>,
+}
+
+impl Lambda {
+    /// Syntactic free variables of the lambda body: names referenced but not
+    /// bound by the lambda's params or local declarations. Sorted and
+    /// deduplicated so every backend sees the same capture order. Names that
+    /// resolve to global functions/structs are filtered out by the caller
+    /// (they are not variables).
+    pub fn free_names(&self) -> Vec<String> {
+        let mut bound: Vec<Vec<String>> =
+            vec![self.params.iter().map(|p| p.name.clone()).collect()];
+        let mut free: Vec<String> = Vec::new();
+        free_in_stmts(&self.body, &mut bound, &mut free);
+        free.sort();
+        free.dedup();
+        free
+    }
+}
+
+fn is_bound(bound: &[Vec<String>], name: &str) -> bool {
+    bound.iter().any(|frame| frame.iter().any(|n| n == name))
+}
+
+fn free_in_stmts(stmts: &[Stmt], bound: &mut Vec<Vec<String>>, free: &mut Vec<String>) {
+    bound.push(Vec::new());
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Let { name, value, .. } => {
+                free_in_expr(value, bound, free);
+                bound.last_mut().unwrap().push(name.clone());
+            }
+            StmtKind::Assign { name, value } => {
+                if !is_bound(bound, name) {
+                    free.push(name.clone());
+                }
+                free_in_expr(value, bound, free);
+            }
+            StmtKind::IndexAssign { base, index, value } => {
+                free_in_expr(base, bound, free);
+                free_in_expr(index, bound, free);
+                free_in_expr(value, bound, free);
+            }
+            StmtKind::FieldAssign { base, value, .. } => {
+                free_in_expr(base, bound, free);
+                free_in_expr(value, bound, free);
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                free_in_expr(cond, bound, free);
+                free_in_stmts(then_body, bound, free);
+                free_in_stmts(else_body, bound, free);
+            }
+            StmtKind::While { cond, body } => {
+                free_in_expr(cond, bound, free);
+                free_in_stmts(body, bound, free);
+            }
+            StmtKind::For {
+                var,
+                start,
+                end,
+                body,
+            } => {
+                free_in_expr(start, bound, free);
+                free_in_expr(end, bound, free);
+                bound.push(vec![var.clone()]);
+                free_in_stmts(body, bound, free);
+                bound.pop();
+            }
+            StmtKind::Return(Some(e)) | StmtKind::Assert(e) | StmtKind::Expr(e) => {
+                free_in_expr(e, bound, free)
+            }
+            _ => {}
+        }
+    }
+    bound.pop();
+}
+
+fn free_in_expr(expr: &Expr, bound: &mut Vec<Vec<String>>, free: &mut Vec<String>) {
+    match &expr.kind {
+        ExprKind::Var(name) => {
+            if !is_bound(bound, name) {
+                free.push(name.clone());
+            }
+        }
+        ExprKind::Array(elems) => {
+            for e in elems {
+                free_in_expr(e, bound, free);
+            }
+        }
+        ExprKind::Index(a, b) => {
+            free_in_expr(a, bound, free);
+            free_in_expr(b, bound, free);
+        }
+        ExprKind::Field(a, _) => free_in_expr(a, bound, free),
+        ExprKind::Bin(_, a, b) => {
+            free_in_expr(a, bound, free);
+            free_in_expr(b, bound, free);
+        }
+        ExprKind::Un(_, a) => free_in_expr(a, bound, free),
+        ExprKind::Call(name, args) => {
+            if !is_bound(bound, name) {
+                free.push(name.clone());
+            }
+            for a in args {
+                free_in_expr(a, bound, free);
+            }
+        }
+        ExprKind::Lambda(inner) => {
+            // the inner lambda's free names that aren't bound here bubble up
+            for n in inner.free_names() {
+                if !is_bound(bound, &n) {
+                    free.push(n);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone)]

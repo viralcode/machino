@@ -104,19 +104,22 @@ A new language starts with zero corpus, which is the real moat and the real risk
 
 ## How it works
 
-The whole pipeline is ~4,500 lines of dependency-free Rust — small enough to read in an afternoon:
+The whole pipeline is ~8,500 lines of dependency-free Rust — small enough to read in a day:
 
 | Path | What it is |
 |---|---|
 | `src/lexer.rs` → `src/parser.rs` → `src/checker.rs` | frontend: newline-terminated grammar, full static typing, stable `E0xx` diagnostics |
 | `src/interp.rs` | reference interpreter + native runtime: files, stdin, env, TCP sockets (`run`, `test`) |
-| `src/wasm.rs` | WebAssembly **binary emitter**: hand-rolled encoding, no LLVM, no external toolchain |
+| `src/wasm.rs` | WebAssembly **binary emitter**: hand-rolled encoding, closures, and a mark-sweep GC — no LLVM, no external toolchain |
+| `src/pkg.rs` | the package system: manifest, installer, lockfile |
 | `src/std.mno` | the standard prelude, written in machino itself |
 | `src/synth.rs` | verified-corpus generator |
 | `runners/` | reference hosts: Node CLI and a drag-and-drop browser page |
 | `tests/cli.rs` | end-to-end suite: wasm-vs-interpreter equivalence on every feature, plus a live HTTP-server test |
 
-Compiled modules use a simple, documented ABI: every value is one wasm value (`i64`/`f64`), strings and arrays live in linear memory as `[len][payload]`, and the module imports exactly five host functions (`print_*`, `fail`) plus whatever `extern fn`s the program declares. That `extern fn` seam is the FFI *and* the capability system — a machino program cannot name any host power the host didn't explicitly provide.
+Compiled modules use a simple, documented ABI: every value is one wasm value (`i64`/`f64`), heap objects live in linear memory behind a 16-byte GC header, and the module imports exactly five host functions (`print_*`, `fail`) plus whatever `extern fn`s the program declares. That `extern fn` seam is the FFI *and* the capability system — a machino program cannot name any host power the host didn't explicitly provide.
+
+Every compiled binary also carries its own **precise mark-sweep garbage collector** — about 300 instructions of hand-emitted WASM. Pointer-typed locals are mirrored into shadow-stack frames that the collector scans as roots; collection triggers at safepoints under an adaptive threshold; freed blocks coalesce into a free list. No engine support, no external runtime: allocation-heavy loops run in bounded memory in any stock WebAssembly host.
 
 ## You can write real software in it — including servers
 
@@ -133,10 +136,12 @@ The `machino run` interpreter doubles as a **native runtime** with files, stdin,
 
 - **Types:** `int` (i64, checked arithmetic), `float` (f64), `bool`, `str`, `[T]`, structs, `fn(T...) -> R` function values — no implicit conversions, ever
 - **Data modeling:** nominal `struct`s with positional constructors and field assignment, string-keyed maps (`StrMap`) in the prelude
+- **Closures:** lambdas capture enclosing variables by value — `fn(x: int) -> int { return x + n }` — compiled to lifted functions + closure objects, GC-managed
+- **Memory:** precise mark-sweep garbage collector compiled *into* every binary; allocation-heavy programs run in bounded memory on any WASM host
 - **Control flow:** `if` / `else`, `while`, `for i in a..b`, `break`, `continue`, `return`
 - **Contracts:** `requires` (checked at entry), `ensures` (checks `result` at exit) — enforced in the interpreter *and* in compiled WASM, with identical messages
 - **Std prelude, written in machino itself:** `split`/`join`/`trim`/`find`/`substr`, `parse_int`/`str_of_int`/`str_of_float`, `StrMap`, sorting — dead-code-eliminated from compiled binaries
-- **Modules:** `import "lib/util.mno"` with transitive resolution and per-file diagnostics
+- **Modules and packages:** `import "lib/util.mno"` with per-file diagnostics, plus a package system — `machino pkg add mathx ../mathx` (or a git URL), then `import "pkg:mathx/mathx.mno"`, with transitive flattening and a lockfile
 - **Safety:** bounds-checked indexing, trapping overflow and division by zero, block scoping, no nulls, no globals, no undefined behavior
 - **Interop:** `extern fn` → WASM imports, provided by the host (files, sockets, env, clock in the native runtime)
 
@@ -144,9 +149,9 @@ Full details in [SPEC.md](SPEC.md).
 
 ## Status and roadmap
 
-This is **v0.2** — a real, working end-to-end system, intentionally small enough to hold in a model's context window. Honest limits, documented in the spec: named functions are first-class but there are no capturing closures, no garbage collector (bump allocator — fine for scripts and request handlers), and no generics yet.
+This is **v0.3** — a real, working end-to-end system, intentionally small enough to hold in a model's context window: capturing closures, a garbage collector in every compiled binary, and a package system, all covered by wasm-vs-interpreter equivalence tests (including a GC stress test that churns gigabytes under a 1 GiB memory cap). Honest limits, documented in the spec: no generics yet, structs cap at 60 fields, and compiled-module memory tops out at 1 GiB.
 
-Planned for v0.3+: enums and pattern matching, generics, a WASM-GC backend, static contract verification (SMT) for a decidable subset, and a package registry.
+Planned for v0.4+: enums and pattern matching, generics, a WASM-GC-proposal backend, static contract verification (SMT) for a decidable subset, and a package registry.
 
 ## License
 

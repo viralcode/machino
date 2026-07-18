@@ -1,4 +1,4 @@
-# The machino Language Specification (v0.2)
+# The machino Language Specification (v0.3)
 
 machino is an AI-first programming language. It is designed for code that is
 *written and verified by machines*: the syntax is small and canonical, the
@@ -45,7 +45,7 @@ formally specified machine language that runs everywhere.
 | `str`       | immutable byte string (usually UTF-8)         | `i64` pointer       |
 | `[T]`       | array of `T` (fixed length; `push` copies)    | `i64` pointer       |
 | `StructName`| a declared struct (nominal, reference type)   | `i64` pointer       |
-| `fn(T...) -> R` | a first-class named function             | `i64` table index   |
+| `fn(T...) -> R` | a function value (named fn or closure)    | `i64` closure ptr   |
 
 There are **no implicit conversions**. `int` + `float` is a type error; use
 `to_float(i)` or `to_int(f)` (truncating; traps outside int range). Array
@@ -53,7 +53,7 @@ elements must all have one type. Arrays and structs are reference values:
 mutation through one binding is visible through aliases. `==`/`!=` are defined
 for scalars and `str` only.
 
-## Programs and modules
+## Programs, modules, and packages
 
 A program is a sequence of `import` declarations, function definitions,
 `struct` definitions, `extern` declarations, and `test` blocks. The entry
@@ -61,11 +61,31 @@ point is `fn main()` (no parameters, no return value).
 
 ```
 import "lib/util.mno"
+import "pkg:mathx/mathx.mno"
 ```
 
-Imports are resolved relative to the importing file, transitively, and
+Plain imports are resolved relative to the importing file, transitively, and
 deduplicated. All definitions share one flat namespace (a name collision is
 error `E021`). Tests in imported files run as part of `machino test`.
+
+`pkg:` imports resolve against `machino_modules/` in the **project root** —
+the nearest ancestor directory of the entry file containing a `machino.pkg`
+manifest. The manifest is a line-based format:
+
+```
+name myapp
+version 0.1.0
+dep mathx ../mathx                                # local path
+dep strkit https://github.com/user/strkit 0.2.0   # git URL, optional tag
+```
+
+- `machino pkg init <name>` creates the manifest.
+- `machino pkg add <name> <source> [ref]` adds a dependency and installs it.
+- `machino pkg sync` installs every dependency into `machino_modules/`
+  (path deps are copied, git deps are shallow-cloned at the given tag),
+  resolves transitive `machino.pkg` manifests, flattens them (one version
+  per name; conflicting sources are an error), and records what was
+  installed in `machino.lock`.
 
 ### Functions
 
@@ -84,8 +104,38 @@ fn name(param: type, ...) -> ret_type
   clauses on exit against the *original* arguments and `result`. A false
   contract traps with a message naming the clause — in both backends.
 - Named functions are first-class values: `let f = double`, then `f(21)`.
-  Function types are written `fn(int, str) -> bool`. There are **no capturing
-  closures**; pass state as arguments.
+  Function types are written `fn(int, str) -> bool`.
+
+### Lambdas (capturing closures)
+
+```
+let add5 = fn(x: int) -> int { return x + 5 }
+
+fn make_adder(n: int) -> fn(int) -> int {
+    return fn(x: int) -> int { return x + n }
+}
+```
+
+A lambda is an expression. Parameter and return types are always written out
+(omit `-> R` for a unit lambda). Lambdas **capture enclosing variables by
+value at creation**:
+
+- Captured variables are **read-only** inside the lambda — assigning to one
+  is error `E049`. Because arrays and structs are reference values, capturing
+  one lets the lambda mutate its *contents*, which is the idiomatic way to
+  share mutable state:
+
+```
+let counter = Counter(0)
+let tick = fn() -> int {
+    counter.count = counter.count + 1
+    return counter.count
+}
+```
+
+- Lambdas have no contracts and no name (they cannot recurse into
+  themselves; name a function for that).
+- `break`/`continue`/`return` inside a lambda refer to the lambda itself.
 
 ### Structs
 
@@ -209,34 +259,54 @@ from compiled WASM.
 
 ## Memory model (compiled WASM)
 
-Values are 8 bytes each. `str`/`[T]` point into linear memory with layout
-`[len: i64][payload]`; structs are `[field0][field1]...`. Allocation is a bump
-allocator that grows memory on demand; there is no garbage collector
-(allocations live until the program exits — fine for scripts and request
-handlers, not for unbounded-allocation loops). The module exports `memory`,
-`alloc`, and every non-prelude function; function values use a `funcref`
-table and `call_indirect`.
+Values are 8 bytes each. Every heap object carries a 16-byte header:
+`[meta: i64][bitmap: i64][payload]`, where `meta` packs a type tag (bits
+0–2: bytes / scalar array / pointer array / struct / free block), a GC mark
+bit (bit 3), and a count (bits 4+). For structs and closures the bitmap
+flags which payload words are pointers. Function values are closure objects
+`[header][table_slot][captures...]`; calls through them use a `funcref`
+table and `call_indirect` with a hidden environment parameter (named
+functions used as values get a static singleton closure and a wrapper).
+
+**Garbage collection.** Compiled modules include a precise mark-sweep
+collector. Pointer-typed variables are mirrored into shadow-stack frames in
+linear memory, which the collector scans as roots; collection runs only at
+safepoints (function entry and loop back-edges) when allocation since the
+last cycle exceeds an adaptive threshold (min 1 MiB). Objects never move;
+freed blocks are coalesced into a free list that the allocator searches
+before bumping. Memory is capped at 1 GiB — allocating past it (with
+nothing to collect) traps with `out of memory`. The interpreter uses
+reference counting; the only divergence is pathological reference cycles
+(e.g. an array pushed into a struct it contains), which the interpreter
+leaks and the compiled GC reclaims.
+
+The module exports `memory`, `alloc`, and every non-prelude function. Hosts
+that create objects (strings, arrays) must write the 16-byte header — see
+`runners/run.mjs` for the reference implementation.
 
 ## Diagnostics
 
 `machino check --json` prints one JSON object:
 `{"ok":bool,"errors":n,"diagnostics":[{severity,code,message,file,line,col,endLine,endCol,help?}]}`.
 Positions map to the correct file across imports. Error codes are stable:
-`E001–E005` lexical, `E010–E019` syntax, `E020–E048` types and semantics.
+`E001–E005` lexical, `E010–E019` syntax, `E020–E050` types and semantics.
 
-## Known limits (v0.2)
+## Known limits (v0.3)
 
-- No capturing closures (named functions as values only).
-- No garbage collector (bump allocator; `push`/`+` allocate fresh copies).
 - No generics; `StrMap` is `str → str` (encode other value types).
+- Structs are limited to 60 fields (`E050`); GC bitmaps are one word.
 - Contracts on `extern fn`s are enforced by the interpreter but not in
   compiled WASM.
 - The interpreter's call depth defaults to 4096 (`MACHINO_MAX_DEPTH` env var
-  overrides).
+  overrides); compiled WASM has a 4 MiB shadow stack for pointer frames.
+- Compiled-module memory is capped at 1 GiB.
+- Reference cycles are reclaimed by the compiled GC but leak in the
+  interpreter (they require deliberately circular data).
 
-## Roadmap (v0.3+)
+## Roadmap (v0.4+)
 
 - enums and pattern matching, generics
-- WASM-GC backend, tree-shaken prelude in the interpreter
+- WASM-GC proposal backend (engine-managed heap instead of the built-in
+  collector)
 - static contract verification (SMT) for a decidable subset
-- package registry
+- package registry with content hashes in machino.lock

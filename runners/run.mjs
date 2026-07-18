@@ -5,8 +5,11 @@
 //
 // This file is the reference implementation of the machino host interface.
 // Any WebAssembly host can run machino programs by providing these imports.
-// Strings cross the boundary through linear memory ([len: i64][bytes]); the
-// module exports `alloc` so the host can allocate blocks to return.
+// Every heap object has a 16-byte header: [meta: i64][bitmap: i64][payload].
+// meta = tag (bits 0-2) | mark (bit 3) | count << 4. Strings are tag 0
+// (count = byte length), arrays of pointers are tag 2 (count = elements).
+// The module exports `alloc`; hosts must write the header on objects they
+// create.
 
 import { readFileSync, writeFileSync, existsSync, readSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -24,8 +27,8 @@ let alloc; // exported allocator
 function readStr(addr) {
   const a = Number(addr);
   const view = new DataView(memory.buffer);
-  const len = Number(view.getBigInt64(a, true));
-  return new TextDecoder().decode(new Uint8Array(memory.buffer, a + 8, len));
+  const len = Number(view.getBigInt64(a, true) >> 4n);
+  return new TextDecoder().decode(new Uint8Array(memory.buffer, a + 16, len));
 }
 
 function makeStr(text) {
@@ -34,20 +37,22 @@ function makeStr(text) {
 }
 
 function makeBytes(bytes) {
-  const addr = Number(alloc(BigInt(8 + bytes.length)));
+  const addr = Number(alloc(BigInt(16 + bytes.length)));
   const view = new DataView(memory.buffer);
-  view.setBigInt64(addr, BigInt(bytes.length), true);
-  new Uint8Array(memory.buffer, addr + 8, bytes.length).set(bytes);
+  view.setBigInt64(addr, BigInt(bytes.length) << 4n, true); // tag 0 = bytes
+  view.setBigInt64(addr + 8, 0n, true);
+  new Uint8Array(memory.buffer, addr + 16, bytes.length).set(bytes);
   return BigInt(addr);
 }
 
 function makeStrArray(items) {
   const ptrs = items.map((s) => makeStr(s));
-  const addr = Number(alloc(BigInt(8 + 8 * ptrs.length)));
+  const addr = Number(alloc(BigInt(16 + 8 * ptrs.length)));
   const view = new DataView(memory.buffer);
-  view.setBigInt64(addr, BigInt(ptrs.length), true);
+  view.setBigInt64(addr, (BigInt(ptrs.length) << 4n) | 2n, true); // tag 2 = ptr array
+  view.setBigInt64(addr + 8, 0n, true);
   for (let i = 0; i < ptrs.length; i++) {
-    view.setBigInt64(addr + 8 + 8 * i, ptrs[i], true);
+    view.setBigInt64(addr + 16 + 8 * i, ptrs[i], true);
   }
   return BigInt(addr);
 }
@@ -104,8 +109,8 @@ const imports = {
       try {
         const a = Number(dataAddr);
         const view = new DataView(memory.buffer);
-        const len = Number(view.getBigInt64(a, true));
-        writeFileSync(readStr(pathAddr), new Uint8Array(memory.buffer, a + 8, len));
+        const len = Number(view.getBigInt64(a, true) >> 4n);
+        writeFileSync(readStr(pathAddr), new Uint8Array(memory.buffer, a + 16, len));
         return 1n;
       } catch {
         return 0n;

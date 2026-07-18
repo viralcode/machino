@@ -4,6 +4,7 @@ mod diag;
 mod interp;
 mod lexer;
 mod parser;
+mod pkg;
 mod synth;
 mod wasm;
 
@@ -23,9 +24,26 @@ USAGE:
   machino build <file.mno> [-o out.wasm] compile to a portable .wasm module
   machino synth [--count N] [--seed S] [--out DIR]  generate a verified corpus
 
+  machino pkg init <name>                create a machino.pkg manifest here
+  machino pkg add <name> <source> [ref]  add a dependency (path or git URL)
+  machino pkg sync                       install deps into machino_modules/
+
+Import from packages with:  import \"pkg:<name>/<file>.mno\"
+
 Run .wasm output anywhere: browsers, Node (see runners/run.mjs), wasmtime, etc.";
 
 fn main() -> ExitCode {
+    // the tree-walking interpreter recurses on the Rust stack; give it room
+    // for MACHINO_MAX_DEPTH machino frames
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("failed to spawn main thread")
+        .join()
+        .expect("main thread panicked")
+}
+
+fn real_main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, rest) = match args.split_first() {
         Some((c, r)) => (c.as_str(), r),
@@ -40,6 +58,7 @@ fn main() -> ExitCode {
         "run" => cmd_run(rest),
         "build" => cmd_build(rest),
         "synth" => cmd_synth(rest),
+        "pkg" => cmd_pkg(rest),
         "--help" | "-h" | "help" => {
             println!("{}", USAGE);
             ExitCode::SUCCESS
@@ -132,15 +151,20 @@ fn bundle_sources(entry: &str) -> Result<(String, Vec<Segment>), String> {
         let imports = discover_imports(&source, &display)?;
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         for imp in imports {
-            let ipath = dir.join(&imp);
-            if !ipath.exists() {
-                return Err(format!(
-                    "error: cannot resolve import \"{}\" (from {}): file not found at {}",
-                    imp,
-                    display,
-                    ipath.display()
-                ));
-            }
+            let ipath = if imp.starts_with("pkg:") {
+                pkg::resolve_pkg_import(&imp, &entry_path)?
+            } else {
+                let p = dir.join(&imp);
+                if !p.exists() {
+                    return Err(format!(
+                        "error: cannot resolve import \"{}\" (from {}): file not found at {}",
+                        imp,
+                        display,
+                        p.display()
+                    ));
+                }
+                p
+            };
             queue.push((ipath.clone(), ipath.display().to_string()));
         }
         ordered.push((display, source));
@@ -422,6 +446,43 @@ fn cmd_build(rest: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!("error: cannot write '{}': {}", out_path, e);
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_pkg(rest: &[String]) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let result = match rest.split_first() {
+        Some((sub, args)) => match (sub.as_str(), args) {
+            ("init", [name]) => pkg::init(&cwd, name),
+            ("add", [name, source]) => pkg::add(&cwd, name, source, None).and_then(|_| {
+                pkg::sync(&cwd).map(|_| ())
+            }),
+            ("add", [name, source, reference]) => {
+                pkg::add(&cwd, name, source, Some(reference)).and_then(|_| {
+                    pkg::sync(&cwd).map(|_| ())
+                })
+            }
+            ("sync", []) => pkg::sync(&cwd).map(|installed| {
+                if installed.is_empty() {
+                    println!("no dependencies to install");
+                }
+            }),
+            _ => Err(
+                "usage:\n  machino pkg init <name>\n  machino pkg add <name> <source> [ref]\n  machino pkg sync"
+                    .to_string(),
+            ),
+        },
+        None => Err(
+            "usage:\n  machino pkg init <name>\n  machino pkg add <name> <source> [ref]\n  machino pkg sync"
+                .to_string(),
+        ),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            ExitCode::from(2)
         }
     }
 }

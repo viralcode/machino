@@ -33,6 +33,7 @@ fn check_passes_on_examples() {
         "structs",
         "wordcount",
         "higher_order",
+        "closures",
         "http_server",
     ] {
         let out = machino(&["check", &format!("examples/{}.mno", ex)]);
@@ -49,6 +50,7 @@ fn tests_pass_on_examples() {
         "structs",
         "wordcount",
         "higher_order",
+        "closures",
         "http_server",
     ] {
         let out = machino(&["test", &format!("examples/{}.mno", ex)]);
@@ -165,7 +167,15 @@ fn wasm_output_matches_interpreter_in_node() {
     if Command::new("node").arg("--version").output().is_err() {
         return;
     }
-    for ex in ["fib", "sort", "contracts", "structs", "wordcount", "higher_order"] {
+    for ex in [
+        "fib",
+        "sort",
+        "contracts",
+        "structs",
+        "wordcount",
+        "higher_order",
+        "closures",
+    ] {
         let wasm = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{}.wasm", ex));
         let out = machino(&[
             "build",
@@ -370,6 +380,234 @@ fn http_server_serves_requests() {
     assert!(bye.contains("bye"));
     let status = child.wait().unwrap();
     assert!(status.success());
+}
+
+// ---- v0.3 features ----
+
+#[test]
+fn closures_capture_by_value_parity() {
+    let out = assert_parity(
+        "closures_parity",
+        r#"fn make_adder(n: int) -> fn(int) -> int {
+    return fn(x: int) -> int { return x + n }
+}
+
+fn apply_twice(f: fn(int) -> int, x: int) -> int {
+    return f(f(x))
+}
+
+fn main() {
+    let add5 = make_adder(5)
+    let add9 = make_adder(9)
+    print(add5(10))
+    print(add9(10))
+    print(apply_twice(add5, 1))
+
+    let base = "pre-"
+    let tag = fn(s: str) -> str { return base + s + "!" }
+    print(tag("go"))
+
+    # shared mutable state through a captured array
+    let counter = [0]
+    let bump = fn() { counter[0] = counter[0] + 1 }
+    bump()
+    bump()
+    bump()
+    print(counter[0])
+
+    # a lambda capturing another closure, passed inline
+    let mul = fn(a: int, b: int) -> int { return a * b }
+    print(apply_twice(fn(x: int) -> int { return mul(x, 3) }, 2))
+
+    # named functions still work as values next to closures
+    print(apply_twice(make_adder(1), 0))
+}
+"#,
+    );
+    assert_eq!(out.trim(), "15\n19\n11\npre-go!\n3\n18\n2");
+}
+
+#[test]
+fn captured_variables_are_read_only() {
+    let path = write_temp(
+        "capture_assign.mno",
+        "fn main() {\n    let n = 1\n    let f = fn() { n = 2 }\n    f()\n}\n",
+    );
+    let out = machino(&["check", path.to_str().unwrap(), "--json"]);
+    assert!(!out.status.success());
+    assert!(stdout(&out).contains("\"code\":\"E049\""));
+}
+
+#[test]
+fn gc_collects_garbage_under_memory_cap() {
+    // Several GB of total string allocation. The wasm module caps memory at
+    // 1 GiB, so this only finishes if the collector reclaims garbage.
+    let source = r#"fn repeat_str(s: str, n: int) -> str {
+    let out = ""
+    for i in 0..n {
+        out = out + s
+    }
+    return out
+}
+
+fn main() {
+    let keep = ""
+    let total = 0
+    for i in 0..600 {
+        let chunk = repeat_str("abcdefgh", 4096)
+        total = total + len(chunk)
+        if i % 200 == 0 {
+            keep = substr(chunk, 0, 8)
+        }
+    }
+    print(total)
+    print(keep)
+}
+"#;
+    let out = assert_parity("gc_stress", source);
+    assert_eq!(out.trim(), "19660800\nabcdefgh");
+}
+
+#[test]
+fn gc_preserves_object_graphs() {
+    // Long-lived structs with pointer fields must survive collections that
+    // reclaim the interleaved garbage.
+    let source = r#"struct Node {
+    name: str
+    vals: [int]
+}
+
+fn churn(n: int) -> str {
+    let s = ""
+    for i in 0..n {
+        s = s + "x"
+    }
+    return s
+}
+
+fn main() {
+    let keep: [str] = []
+    for i in 0..200 {
+        let node = Node("node-" + str_of_int(i), [i, i * 2])
+        let junk = churn(2000)
+        if i % 50 == 0 {
+            keep = push(keep, node.name + ":" + str_of_int(node.vals[1]))
+        }
+    }
+    for i in 0..len(keep) {
+        print(keep[i])
+    }
+}
+"#;
+    let out = assert_parity("gc_graphs", source);
+    assert_eq!(
+        out.trim(),
+        "node-0:0\nnode-50:100\nnode-100:200\nnode-150:300"
+    );
+}
+
+#[test]
+fn pkg_workflow_installs_and_imports() {
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("pkgproj");
+    let _ = std::fs::remove_dir_all(&base);
+    let lib = base.join("mathx");
+    let app = base.join("app");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(lib.join("machino.pkg"), "name mathx\nversion 1.0.0\n").unwrap();
+    std::fs::write(
+        lib.join("mathx.mno"),
+        "fn gcd(a: int, b: int) -> int {\n    if b == 0 { return a }\n    return gcd(b, a % b)\n}\n",
+    )
+    .unwrap();
+
+    let run_in = |dir: &PathBuf, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_machino"))
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to run machino binary")
+    };
+
+    let init = run_in(&app, &["pkg", "init", "app"]);
+    assert!(init.status.success(), "{:?}", init);
+    let add = run_in(&app, &["pkg", "add", "mathx", "../mathx"]);
+    assert!(add.status.success(), "{:?}", add);
+    assert!(app.join("machino_modules/mathx/mathx.mno").exists());
+    assert!(app.join("machino.lock").exists());
+    let lock = std::fs::read_to_string(app.join("machino.lock")).unwrap();
+    assert!(lock.contains("mathx ../mathx path"), "lock: {}", lock);
+
+    std::fs::write(
+        app.join("main.mno"),
+        "import \"pkg:mathx/mathx.mno\"\n\nfn main() {\n    print(gcd(48, 36))\n}\n",
+    )
+    .unwrap();
+    let run = run_in(&app, &["run", "main.mno"]);
+    assert!(run.status.success(), "{:?}", run);
+    assert_eq!(stdout(&run).trim(), "12");
+
+    // the same program compiles to wasm
+    let build = run_in(&app, &["build", "main.mno", "-o", "app.wasm"]);
+    assert!(build.status.success(), "{:?}", build);
+
+    // a second sync is idempotent
+    let sync = run_in(&app, &["pkg", "sync"]);
+    assert!(sync.status.success(), "{:?}", sync);
+}
+
+#[test]
+fn pkg_transitive_deps_are_flattened() {
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("pkgtrans");
+    let _ = std::fs::remove_dir_all(&base);
+    let leaf = base.join("leaf");
+    let mid = base.join("mid");
+    let app = base.join("app");
+    for d in [&leaf, &mid, &app] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(leaf.join("machino.pkg"), "name leaf\nversion 1.0.0\n").unwrap();
+    std::fs::write(
+        leaf.join("leaf.mno"),
+        "fn double(n: int) -> int {\n    return n * 2\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        mid.join("machino.pkg"),
+        "name mid\nversion 1.0.0\ndep leaf ../leaf\n",
+    )
+    .unwrap();
+    std::fs::write(
+        mid.join("mid.mno"),
+        "import \"pkg:leaf/leaf.mno\"\n\nfn quad(n: int) -> int {\n    return double(double(n))\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("machino.pkg"),
+        "name app\nversion 0.1.0\ndep mid ../mid\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("main.mno"),
+        "import \"pkg:mid/mid.mno\"\n\nfn main() {\n    print(quad(5))\n}\n",
+    )
+    .unwrap();
+
+    let run_in = |dir: &PathBuf, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_machino"))
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("failed to run machino binary")
+    };
+    let sync = run_in(&app, &["pkg", "sync"]);
+    assert!(sync.status.success(), "{:?}", sync);
+    // both mid and its dependency leaf land flat in machino_modules
+    assert!(app.join("machino_modules/mid/mid.mno").exists());
+    assert!(app.join("machino_modules/leaf/leaf.mno").exists());
+    let run = run_in(&app, &["run", "main.mno"]);
+    assert!(run.status.success(), "{:?}", run);
+    assert_eq!(stdout(&run).trim(), "20");
 }
 
 #[test]

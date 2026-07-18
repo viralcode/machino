@@ -24,9 +24,17 @@ pub enum Value {
     Str(Rc<Vec<u8>>),
     Array(Rc<RefCell<Vec<Value>>>),
     Struct(Rc<RefCell<HashMap<String, Value>>>),
-    /// A first-class (named, non-capturing) function value.
+    /// A first-class named function value.
     Fn(String),
+    /// A lambda with its by-value captured environment.
+    Closure(Rc<ClosureData>),
     Unit,
+}
+
+#[derive(Debug)]
+pub struct ClosureData {
+    pub lambda_id: usize,
+    pub captured: Vec<(String, Value)>,
 }
 
 impl Value {
@@ -45,6 +53,7 @@ impl Value {
             Value::Array(_) => "<array>".to_string(),
             Value::Struct(_) => "<struct>".to_string(),
             Value::Fn(name) => format!("<fn {}>", name),
+            Value::Closure(_) => "<fn>".to_string(),
             Value::Unit => "<unit>".to_string(),
         }
     }
@@ -86,6 +95,7 @@ fn max_call_depth() -> usize {
 pub struct Interp<'a> {
     functions: HashMap<&'a str, &'a Function>,
     struct_fields: HashMap<&'a str, &'a [Param]>,
+    lambdas: HashMap<usize, &'a Lambda>,
     depth: usize,
     max_depth: usize,
     pub output: Box<dyn FnMut(&str) + 'a>,
@@ -108,9 +118,20 @@ impl<'a> Interp<'a> {
         for s in &program.structs {
             struct_fields.insert(s.name.as_str(), s.fields.as_slice());
         }
+        let mut lambdas = HashMap::new();
+        for f in &program.functions {
+            collect_lambdas_stmts(&f.body, &mut lambdas);
+            for c in f.requires.iter().chain(f.ensures.iter()) {
+                collect_lambdas_expr(&c.expr, &mut lambdas);
+            }
+        }
+        for t in &program.tests {
+            collect_lambdas_stmts(&t.body, &mut lambdas);
+        }
         Interp {
             functions,
             struct_fields,
+            lambdas,
             depth: 0,
             max_depth: max_call_depth(),
             output: Box::new(|line| println!("{}", line)),
@@ -207,6 +228,34 @@ impl<'a> Interp<'a> {
         }
 
         Ok(result)
+    }
+
+    fn call_closure(&mut self, c: &ClosureData, args: Vec<Value>, call_span: Span) -> RResult<Value> {
+        if self.depth >= self.max_depth {
+            return Err(RuntimeError::new(
+                format!(
+                    "stack overflow: call depth exceeded {} (override with MACHINO_MAX_DEPTH)",
+                    self.max_depth
+                ),
+                call_span,
+            ));
+        }
+        let lambda = *self.lambdas.get(&c.lambda_id).expect("lambda registered");
+        let mut env: Vec<HashMap<String, Value>> = vec![HashMap::new()];
+        for (name, v) in &c.captured {
+            env[0].insert(name.clone(), v.clone());
+        }
+        // params shadow captures of the same name
+        for (p, v) in lambda.params.iter().zip(args) {
+            env[0].insert(p.name.clone(), v);
+        }
+        self.depth += 1;
+        let flow = self.exec_block(&lambda.body, &mut env);
+        self.depth -= 1;
+        match flow? {
+            Flow::Return(v) => Ok(v),
+            _ => Ok(Value::Unit),
+        }
     }
 
     // ---- native externs (the machino native runtime) ----
@@ -683,25 +732,51 @@ impl<'a> Interp<'a> {
                 let r = self.eval(rhs, env)?;
                 self.eval_binop(*op, l, r, expr.span)
             }
+            ExprKind::Lambda(l) => {
+                // capture the lambda's free variables by value, now
+                let mut captured = Vec::new();
+                for name in l.free_names() {
+                    let found = env
+                        .iter()
+                        .rev()
+                        .find_map(|scope| scope.get(&name))
+                        .cloned();
+                    if let Some(v) = found {
+                        captured.push((name, v));
+                    }
+                    // names that don't resolve to variables are global
+                    // functions; the body resolves them at call time
+                }
+                Ok(Value::Closure(Rc::new(ClosureData {
+                    lambda_id: l.id,
+                    captured,
+                })))
+            }
             ExprKind::Call(name, args) => {
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     vals.push(self.eval(a, env)?);
                 }
                 // a local variable holding a function value shadows everything
-                let local_fn = env
+                let local_val = env
                     .iter()
                     .rev()
                     .find_map(|scope| scope.get(name.as_str()))
                     .and_then(|v| match v {
-                        Value::Fn(fname) => Some(fname.clone()),
+                        Value::Fn(_) | Value::Closure(_) => Some(v.clone()),
                         _ => None,
                     });
-                if let Some(fname) = local_fn {
-                    let f = self.functions.get(fname.as_str()).copied().ok_or_else(|| {
-                        RuntimeError::new(format!("unknown function '{}'", fname), expr.span)
-                    })?;
-                    return self.call_function(f, vals, expr.span);
+                match local_val {
+                    Some(Value::Fn(fname)) => {
+                        let f = self.functions.get(fname.as_str()).copied().ok_or_else(|| {
+                            RuntimeError::new(format!("unknown function '{}'", fname), expr.span)
+                        })?;
+                        return self.call_function(f, vals, expr.span);
+                    }
+                    Some(Value::Closure(c)) => {
+                        return self.call_closure(&c, vals, expr.span);
+                    }
+                    _ => {}
                 }
                 match name.as_str() {
                     "print" => {
@@ -857,6 +932,79 @@ impl<'a> Interp<'a> {
             (Ge, Float(a), Float(b)) => Ok(Bool(a >= b)),
             _ => unreachable!("type checker rejects other operand combinations"),
         }
+    }
+}
+
+fn collect_lambdas_stmts<'a>(stmts: &'a [Stmt], out: &mut HashMap<usize, &'a Lambda>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Let { value, .. } | StmtKind::Assign { value, .. } => {
+                collect_lambdas_expr(value, out)
+            }
+            StmtKind::IndexAssign { base, index, value } => {
+                collect_lambdas_expr(base, out);
+                collect_lambdas_expr(index, out);
+                collect_lambdas_expr(value, out);
+            }
+            StmtKind::FieldAssign { base, value, .. } => {
+                collect_lambdas_expr(base, out);
+                collect_lambdas_expr(value, out);
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                collect_lambdas_expr(cond, out);
+                collect_lambdas_stmts(then_body, out);
+                collect_lambdas_stmts(else_body, out);
+            }
+            StmtKind::While { cond, body } => {
+                collect_lambdas_expr(cond, out);
+                collect_lambdas_stmts(body, out);
+            }
+            StmtKind::For {
+                start, end, body, ..
+            } => {
+                collect_lambdas_expr(start, out);
+                collect_lambdas_expr(end, out);
+                collect_lambdas_stmts(body, out);
+            }
+            StmtKind::Return(Some(e)) | StmtKind::Assert(e) | StmtKind::Expr(e) => {
+                collect_lambdas_expr(e, out)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_lambdas_expr<'a>(expr: &'a Expr, out: &mut HashMap<usize, &'a Lambda>) {
+    match &expr.kind {
+        ExprKind::Array(elems) => {
+            for e in elems {
+                collect_lambdas_expr(e, out);
+            }
+        }
+        ExprKind::Index(a, b) => {
+            collect_lambdas_expr(a, out);
+            collect_lambdas_expr(b, out);
+        }
+        ExprKind::Field(a, _) => collect_lambdas_expr(a, out),
+        ExprKind::Bin(_, a, b) => {
+            collect_lambdas_expr(a, out);
+            collect_lambdas_expr(b, out);
+        }
+        ExprKind::Un(_, a) => collect_lambdas_expr(a, out),
+        ExprKind::Call(_, args) => {
+            for a in args {
+                collect_lambdas_expr(a, out);
+            }
+        }
+        ExprKind::Lambda(l) => {
+            out.insert(l.id, l);
+            collect_lambdas_stmts(&l.body, out);
+        }
+        _ => {}
     }
 }
 

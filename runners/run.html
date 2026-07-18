@@ -81,15 +81,16 @@ let alloc;
 function readStr(addr) {
   const a = Number(addr);
   const view = new DataView(memory.buffer);
-  const len = Number(view.getBigInt64(a, true));
-  return new TextDecoder().decode(new Uint8Array(memory.buffer, a + 8, len));
+  const len = Number(view.getBigInt64(a, true) >> 4n);
+  return new TextDecoder().decode(new Uint8Array(memory.buffer, a + 16, len));
 }
 function makeStr(text) {
   const bytes = new TextEncoder().encode(text);
-  const addr = Number(alloc(BigInt(8 + bytes.length)));
+  const addr = Number(alloc(BigInt(16 + bytes.length)));
   const view = new DataView(memory.buffer);
-  view.setBigInt64(addr, BigInt(bytes.length), true);
-  new Uint8Array(memory.buffer, addr + 8, bytes.length).set(bytes);
+  view.setBigInt64(addr, BigInt(bytes.length) << 4n, true); // tag 0 = bytes
+  view.setBigInt64(addr + 8, 0n, true);
+  new Uint8Array(memory.buffer, addr + 16, bytes.length).set(bytes);
   return BigInt(addr);
 }
 function line(text, cls) {

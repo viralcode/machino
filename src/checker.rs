@@ -26,12 +26,16 @@ pub const BUILTINS: &[&str] = &[
 
 struct Scope {
     vars: Vec<HashMap<String, Type>>,
+    /// Frame indices where enclosing lambdas begin. Variables declared below
+    /// the innermost boundary are captured (read-only inside the lambda).
+    boundaries: Vec<usize>,
 }
 
 impl Scope {
     fn new() -> Self {
         Scope {
             vars: vec![HashMap::new()],
+            boundaries: Vec::new(),
         }
     }
     fn push(&mut self) {
@@ -49,6 +53,19 @@ impl Scope {
     }
     fn lookup(&self, name: &str) -> Option<&Type> {
         self.vars.iter().rev().find_map(|m| m.get(name))
+    }
+    /// True if `name` resolves to a variable declared outside the innermost
+    /// enclosing lambda (i.e. it would be captured by value).
+    fn is_captured(&self, name: &str) -> bool {
+        let Some(&boundary) = self.boundaries.last() else {
+            return false;
+        };
+        for (i, frame) in self.vars.iter().enumerate().rev() {
+            if frame.contains_key(name) {
+                return i < boundary;
+            }
+        }
+        false
     }
 }
 
@@ -80,6 +97,21 @@ impl<'a> Checker<'a> {
                     format!("struct '{}' is defined more than once", s.name),
                     s.span,
                 ));
+                continue;
+            }
+            if s.fields.len() > 60 {
+                self.diags.push(
+                    Diagnostic::new(
+                        "E050",
+                        format!(
+                            "struct '{}' has {} fields; the maximum is 60",
+                            s.name,
+                            s.fields.len()
+                        ),
+                        s.span,
+                    )
+                    .with_help("split large structs into nested structs"),
+                );
                 continue;
             }
             let mut seen: HashMap<&str, ()> = HashMap::new();
@@ -261,7 +293,7 @@ impl<'a> Checker<'a> {
         }
 
         for c in &f.requires {
-            let ty = self.infer(&c.expr, &scope, None);
+            let ty = self.infer(&c.expr, &mut scope, None);
             self.expect_bool(ty, c.expr.span, "requires clause");
         }
         {
@@ -286,7 +318,7 @@ impl<'a> Checker<'a> {
                 );
             }
             for c in &f.ensures {
-                let ty = self.infer(&c.expr, &ens_scope, None);
+                let ty = self.infer(&c.expr, &mut ens_scope, None);
                 self.expect_bool(ty, c.expr.span, "ensures clause");
             }
         }
@@ -360,6 +392,18 @@ impl<'a> Checker<'a> {
                 scope.declare(name, final_ty);
             }
             StmtKind::Assign { name, value } => {
+                if scope.is_captured(name) {
+                    self.diags.push(
+                        Diagnostic::new(
+                            "E049",
+                            format!("cannot assign to captured variable '{}'", name),
+                            stmt.span,
+                        )
+                        .with_help(
+                            "lambdas capture by value; to share mutable state, capture a struct or array and mutate its contents",
+                        ),
+                    );
+                }
                 let var_ty = scope.lookup(name).cloned();
                 match var_ty {
                     Some(t) => {
@@ -607,7 +651,7 @@ impl<'a> Checker<'a> {
 
     /// Infers an expression type. Returns None if an error was already
     /// reported for this subtree (to avoid cascading diagnostics).
-    fn infer(&mut self, expr: &Expr, scope: &Scope, expected: Option<&Type>) -> Option<Type> {
+    fn infer(&mut self, expr: &Expr, scope: &mut Scope, expected: Option<&Type>) -> Option<Type> {
         match &expr.kind {
             ExprKind::Int(_) => Some(Type::Int),
             ExprKind::Float(_) => Some(Type::Float),
@@ -831,10 +875,55 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::Call(name, args) => self.check_call(name, args, expr.span, scope, expected),
+            ExprKind::Lambda(lambda) => {
+                for p in &lambda.params {
+                    self.validate_type(&p.ty, p.span);
+                }
+                self.validate_type(&lambda.ret, expr.span);
+                // the body is a new function scope: it can read (capture)
+                // enclosing variables but not reassign them, and break /
+                // continue / return refer to the lambda itself
+                scope.push();
+                scope.boundaries.push(scope.vars.len() - 1);
+                let mut seen: HashMap<String, ()> = HashMap::new();
+                for p in &lambda.params {
+                    if seen.insert(p.name.clone(), ()).is_some() {
+                        self.diags.push(Diagnostic::new(
+                            "E023",
+                            format!("duplicate parameter name '{}'", p.name),
+                            p.span,
+                        ));
+                    }
+                    scope.declare(&p.name, p.ty.clone());
+                }
+                let saved_loop = self.loop_depth;
+                self.loop_depth = 0;
+                self.check_stmts(&lambda.body, scope, &lambda.ret.clone(), false);
+                self.loop_depth = saved_loop;
+                if lambda.ret != Type::Unit && !always_returns(&lambda.body) {
+                    self.diags.push(
+                        Diagnostic::new(
+                            "E025",
+                            format!(
+                                "lambda returns '{}' but not all paths return a value",
+                                lambda.ret
+                            ),
+                            expr.span,
+                        )
+                        .with_help("add a 'return <expr>' at the end of the lambda body"),
+                    );
+                }
+                scope.boundaries.pop();
+                scope.pop();
+                Some(Type::Fn(
+                    lambda.params.iter().map(|p| p.ty.clone()).collect(),
+                    Box::new(lambda.ret.clone()),
+                ))
+            }
         }
     }
 
-    fn check_args(&mut self, name: &str, params: &[Type], args: &[Expr], span: Span, scope: &Scope) {
+    fn check_args(&mut self, name: &str, params: &[Type], args: &[Expr], span: Span, scope: &mut Scope) {
         if args.len() != params.len() {
             self.diags.push(Diagnostic::new(
                 "E045",
@@ -875,7 +964,7 @@ impl<'a> Checker<'a> {
         name: &str,
         args: &[Expr],
         span: Span,
-        scope: &Scope,
+        scope: &mut Scope,
         expected: Option<&Type>,
     ) -> Option<Type> {
         // 1. a local variable holding a function value shadows everything
@@ -1022,7 +1111,7 @@ impl<'a> Checker<'a> {
         &mut self,
         args: &[Expr],
         span: Span,
-        scope: &Scope,
+        scope: &mut Scope,
         params: &[Type],
         ret: Type,
         name: &str,
