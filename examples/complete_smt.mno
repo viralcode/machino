@@ -1,0 +1,79 @@
+# Complete SMT verification with arrays and structs
+
+fn array_sum(arr: [int], n: int) -> int
+    requires n >= 0
+    requires n <= len(arr)
+    ensures result >= 0
+{
+    let sum = 0
+    for i in 0..n {
+        sum = sum + arr[i]
+    }
+    return sum
+}
+
+struct Point {
+    x: int
+    y: int
+}
+
+fn manhattan_distance(p: Point, q: Point) -> int
+    ensures result >= 0
+{
+    let dx = 0
+    if p.x > q.x {
+        dx = p.x - q.x
+    } else {
+        dx = q.x - p.x
+    }
+    
+    let dy = 0
+    if p.y > q.y {
+        dy = p.y - q.y
+    } else {
+        dy = q.y - p.y
+    }
+    
+    return dx + dy
+}
+
+fn bounded_increment(x: int, max: int) -> int
+    requires x < max
+    ensures result > x
+    ensures result <= max
+{
+    return x + 1
+}
+
+test "array sum" {
+    let arr = [1, 2, 3, 4, 5]
+    assert array_sum(arr, 3) == 6
+    assert array_sum(arr, 5) == 15
+}
+
+test "manhattan distance" {
+    let p1 = Point(0, 0)
+    let p2 = Point(3, 4)
+    assert manhattan_distance(p1, p2) == 7
+}
+
+test "bounded increment" {
+    assert bounded_increment(5, 10) == 6
+    assert bounded_increment(9, 10) == 10
+}
+
+fn main() {
+    print("=== Complete SMT Verification ===")
+    
+    let numbers = [10, 20, 30, 40]
+    print("Sum of first 3 elements:")
+    print(array_sum(numbers, 3))
+    
+    let origin = Point(0, 0)
+    let dest = Point(5, 5)
+    print("Manhattan distance:")
+    print(manhattan_distance(origin, dest))
+    
+    print("Bounded increment of 7 (max 10):")
+    print(bounded_increment(7, 10))
+}

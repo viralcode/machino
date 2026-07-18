@@ -1,0 +1,94 @@
+# Complete WASM-GC example with full expression compilation
+
+struct TreeNode {
+    value: int
+    left_idx: int  # -1 if null
+    right_idx: int  # -1 if null
+}
+
+fn create_tree(values: [int]) -> [TreeNode] {
+    let nodes: [TreeNode] = []
+    for i in 0..len(values) {
+        let node = TreeNode(values[i], -1, -1)
+        nodes = push(nodes, node)
+    }
+    return nodes
+}
+
+fn tree_insert(nodes: [TreeNode], idx: int, value: int) -> [TreeNode] {
+    if idx < 0 || idx >= len(nodes) {
+        return nodes
+    }
+    
+    let node = nodes[idx]
+    if value < node.value {
+        # Insert left
+        if node.left_idx == -1 {
+            let new_node = TreeNode(value, -1, -1)
+            nodes = push(nodes, new_node)
+            let new_idx = len(nodes) - 1
+            node.left_idx = new_idx
+            nodes[idx] = node
+        } else {
+            nodes = tree_insert(nodes, node.left_idx, value)
+        }
+    } else {
+        # Insert right
+        if node.right_idx == -1 {
+            let new_node = TreeNode(value, -1, -1)
+            nodes = push(nodes, new_node)
+            let new_idx = len(nodes) - 1
+            node.right_idx = new_idx
+            nodes[idx] = node
+        } else {
+            nodes = tree_insert(nodes, node.right_idx, value)
+        }
+    }
+    
+    return nodes
+}
+
+fn tree_sum(nodes: [TreeNode], idx: int) -> int {
+    if idx < 0 || idx >= len(nodes) {
+        return 0
+    }
+    
+    let node = nodes[idx]
+    let left_sum = tree_sum(nodes, node.left_idx)
+    let right_sum = tree_sum(nodes, node.right_idx)
+    
+    return node.value + left_sum + right_sum
+}
+
+test "tree operations" {
+    let nodes = create_tree([50])
+    assert len(nodes) == 1
+    assert nodes[0].value == 50
+    
+    nodes = tree_insert(nodes, 0, 30)
+    nodes = tree_insert(nodes, 0, 70)
+    assert len(nodes) == 3
+    
+    let sum = tree_sum(nodes, 0)
+    assert sum == 150
+}
+
+fn main() {
+    print("=== Complete WASM-GC Backend ===")
+    print("Building binary search tree...")
+    
+    let tree = create_tree([50])
+    print("Initial tree size: " + str_of_int(len(tree)))
+    
+    tree = tree_insert(tree, 0, 30)
+    tree = tree_insert(tree, 0, 70)
+    tree = tree_insert(tree, 0, 20)
+    tree = tree_insert(tree, 0, 40)
+    
+    print("Final tree size: " + str_of_int(len(tree)))
+    
+    let total = tree_sum(tree, 0)
+    print("Sum of all nodes: " + str_of_int(total))
+    
+    print("WASM-GC handles all allocations automatically!")
+}

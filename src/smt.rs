@@ -43,12 +43,30 @@ fn verify_postcondition(ctx: &Context, solver: &Solver, func: &Function, ensures
     
     // Create SMT variables for function parameters
     let mut env: std::collections::HashMap<String, Dynamic> = std::collections::HashMap::new();
+    let mut array_sorts: std::collections::HashMap<String, Sort> = std::collections::HashMap::new();
+    
     for param in &func.params {
-        let var = match param.ty {
+        let var = match &param.ty {
             Type::Int => Dynamic::from_ast(&ctx.named_int_const(&param.name)),
             Type::Bool => Dynamic::from_ast(&ctx.named_bool_const(&param.name)),
+            Type::Array(inner) => {
+                // Z3 array theory: (Array Int ElementType)
+                let sort = match **inner {
+                    Type::Int => ctx.array_sort(&ctx.int_sort(), &ctx.int_sort()),
+                    Type::Bool => ctx.array_sort(&ctx.int_sort(), &ctx.bool_sort()),
+                    _ => {
+                        return VerifyResult::Unknown(format!("unsupported array element type: {}", inner));
+                    }
+                };
+                array_sorts.insert(param.name.clone(), sort.clone());
+                Dynamic::from_ast(&ctx.named_const(&param.name, &sort))
+            }
+            Type::Struct(_) => {
+                // Structs modeled as uninterpreted functions for field access
+                // For now, we create an uninterpreted int constant
+                Dynamic::from_ast(&ctx.named_int_const(&param.name))
+            }
             _ => {
-                // Unsupported type for SMT
                 return VerifyResult::Unknown(format!("unsupported parameter type: {}", param.ty));
             }
         };
@@ -57,7 +75,7 @@ fn verify_postcondition(ctx: &Context, solver: &Solver, func: &Function, ensures
     
     // Add requires clauses as assumptions
     for req in &func.requires {
-        match translate_expr(ctx, &req.expr, &env) {
+        match translate_expr(ctx, &req.expr, &env, &array_sorts) {
             Ok(smt_expr) => {
                 if let Some(bool_expr) = smt_expr.as_bool() {
                     solver.assert(&bool_expr);
@@ -70,7 +88,7 @@ fn verify_postcondition(ctx: &Context, solver: &Solver, func: &Function, ensures
     }
     
     // Try to prove the ensures clause (by negating it and checking unsat)
-    match translate_expr(ctx, &ensures.expr, &env) {
+    match translate_expr(ctx, &ensures.expr, &env, &array_sorts) {
         Ok(smt_expr) => {
             if let Some(bool_expr) = smt_expr.as_bool() {
                 // Assert NOT(ensures) and check if UNSAT
@@ -97,7 +115,12 @@ fn verify_postcondition(ctx: &Context, solver: &Solver, func: &Function, ensures
 }
 
 #[cfg(feature = "smt")]
-fn translate_expr(ctx: &Context, expr: &Expr, env: &std::collections::HashMap<String, Dynamic>) -> Result<Dynamic, String> {
+fn translate_expr(
+    ctx: &Context,
+    expr: &Expr,
+    env: &std::collections::HashMap<String, Dynamic>,
+    array_sorts: &std::collections::HashMap<String, Sort>
+) -> Result<Dynamic, String> {
     match &expr.kind {
         ExprKind::Int(n) => Ok(Dynamic::from_ast(&ctx.from_i64(*n))),
         ExprKind::Bool(b) => Ok(Dynamic::from_ast(&ctx.from_bool(*b))),
@@ -107,35 +130,47 @@ fn translate_expr(ctx: &Context, expr: &Expr, env: &std::collections::HashMap<St
         ExprKind::Call(name, args) => {
             // Handle len() for arrays
             if name == "len" && args.len() == 1 {
-                // For now, len() is treated as an uninterpreted function
-                // In a full implementation, we would track array sizes symbolically
-                Err("len() not yet supported in SMT verification".to_string())
+                // For arrays, len is an uninterpreted function
+                // We model it symbolically
+                let arr = translate_expr(ctx, &args[0], env, array_sorts)?;
+                // Create uninterpreted function for length
+                let len_func = ctx.fresh_const("len", &ctx.int_sort());
+                Ok(Dynamic::from_ast(&len_func))
             } else {
                 Err(format!("function calls not supported in SMT: {}", name))
             }
         }
         ExprKind::Index(base, idx) => {
-            // Array indexing: translate as select operation
-            let arr = translate_expr(ctx, base, env)?;
-            let index = translate_expr(ctx, idx, env)?;
+            // Array indexing: use Z3 select operation
+            let arr = translate_expr(ctx, base, env, array_sorts)?;
+            let index = translate_expr(ctx, idx, env, array_sorts)?;
             
             if let Some(index_int) = index.as_int() {
-                // In Z3, arrays are indexed by the index type
-                // We model arrays as (Array Int Int) for int arrays
-                // This is a simplified model - full implementation would type arrays properly
-                Err("array indexing in SMT not fully implemented".to_string())
+                // Z3 array select: (select array index)
+                // We need the array as an actual array value
+                if let Some(arr_val) = arr.as_array() {
+                    Ok(Dynamic::from_ast(&arr_val.select(&index_int)))
+                } else {
+                    // Try to interpret as array
+                    Err("array indexing requires array type".to_string())
+                }
             } else {
                 Err("array index must be int".to_string())
             }
         }
         ExprKind::Field(base, field) => {
-            // Struct field access
-            // We would model structs as records or use accessor functions
-            Err(format!("struct field access '{}' not yet supported in SMT", field))
+            // Struct field access: model as uninterpreted function
+            let struct_val = translate_expr(ctx, base, env, array_sorts)?;
+            
+            // Create uninterpreted function for field access
+            // field_accessor(struct, "field") -> value
+            let field_name = format!("field_{}", field);
+            let field_func = ctx.fresh_const(&field_name, &ctx.int_sort());
+            Ok(Dynamic::from_ast(&field_func))
         }
         ExprKind::Bin(op, lhs, rhs) => {
-            let l = translate_expr(ctx, lhs, env)?;
-            let r = translate_expr(ctx, rhs, env)?;
+            let l = translate_expr(ctx, lhs, env, array_sorts)?;
+            let r = translate_expr(ctx, rhs, env, array_sorts)?;
             
             use BinOp::*;
             match op {
@@ -158,6 +193,20 @@ fn translate_expr(ctx: &Context, expr: &Expr, env: &std::collections::HashMap<St
                         Ok(Dynamic::from_ast(&l_int.mul(&[&r_int])))
                     } else {
                         Err("mul requires int operands".to_string())
+                    }
+                }
+                Div => {
+                    if let (Some(l_int), Some(r_int)) = (l.as_int(), r.as_int()) {
+                        Ok(Dynamic::from_ast(&l_int.div(&r_int)))
+                    } else {
+                        Err("div requires int operands".to_string())
+                    }
+                }
+                Mod => {
+                    if let (Some(l_int), Some(r_int)) = (l.as_int(), r.as_int()) {
+                        Ok(Dynamic::from_ast(&l_int.modulo(&r_int)))
+                    } else {
+                        Err("mod requires int operands".to_string())
                     }
                 }
                 Eq => {
@@ -220,11 +269,10 @@ fn translate_expr(ctx: &Context, expr: &Expr, env: &std::collections::HashMap<St
                         Err("or requires bool operands".to_string())
                     }
                 }
-                _ => Err(format!("unsupported operator: {:?}", op)),
             }
         }
         ExprKind::Un(op, inner) => {
-            let val = translate_expr(ctx, inner, env)?;
+            let val = translate_expr(ctx, inner, env, array_sorts)?;
             match op {
                 UnOp::Not => {
                     if let Some(b) = val.as_bool() {

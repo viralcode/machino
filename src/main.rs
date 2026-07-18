@@ -1,6 +1,7 @@
 mod ast;
 mod checker;
 mod diag;
+mod infer;
 mod interp;
 mod lexer;
 mod mono;

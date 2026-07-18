@@ -2,6 +2,7 @@
 
 use crate::ast::*;
 use crate::diag::{Diagnostic, Span};
+use crate::infer::InferCtx;
 use std::collections::HashMap;
 
 /// Information about a call to a generic function.
