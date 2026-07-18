@@ -104,6 +104,35 @@ fn translate_expr(ctx: &Context, expr: &Expr, env: &std::collections::HashMap<St
         ExprKind::Var(name) => {
             env.get(name).cloned().ok_or_else(|| format!("unknown variable: {}", name))
         }
+        ExprKind::Call(name, args) => {
+            // Handle len() for arrays
+            if name == "len" && args.len() == 1 {
+                // For now, len() is treated as an uninterpreted function
+                // In a full implementation, we would track array sizes symbolically
+                Err("len() not yet supported in SMT verification".to_string())
+            } else {
+                Err(format!("function calls not supported in SMT: {}", name))
+            }
+        }
+        ExprKind::Index(base, idx) => {
+            // Array indexing: translate as select operation
+            let arr = translate_expr(ctx, base, env)?;
+            let index = translate_expr(ctx, idx, env)?;
+            
+            if let Some(index_int) = index.as_int() {
+                // In Z3, arrays are indexed by the index type
+                // We model arrays as (Array Int Int) for int arrays
+                // This is a simplified model - full implementation would type arrays properly
+                Err("array indexing in SMT not fully implemented".to_string())
+            } else {
+                Err("array index must be int".to_string())
+            }
+        }
+        ExprKind::Field(base, field) => {
+            // Struct field access
+            // We would model structs as records or use accessor functions
+            Err(format!("struct field access '{}' not yet supported in SMT", field))
+        }
         ExprKind::Bin(op, lhs, rhs) => {
             let l = translate_expr(ctx, lhs, env)?;
             let r = translate_expr(ctx, rhs, env)?;

@@ -150,17 +150,17 @@ Full details in [SPEC.md](SPEC.md).
 
 ## Status and roadmap
 
-This is **v0.5** — a comprehensive system with capturing closures, garbage collection, package management, **enums with pattern matching**, and experimental support for **generics**, **SMT verification**, **WASM-GC backend**, and an **HTTP-based package registry**. All covered by wasm-vs-interpreter equivalence tests.
+This is **v0.6** — a comprehensive system with capturing closures, garbage collection, package management, **enums with pattern matching**, **generics infrastructure**, **SMT verification**, **WASM-GC backend foundation**, and an **HTTP-based package registry client**. All covered by wasm-vs-interpreter equivalence tests.
 
-**New in v0.5:**
-- Generic function/struct/enum syntax (monomorphization in progress)
-- SMT-based contract verification using Z3 (optional `smt` feature)
-- WASM-GC backend using reference types (experimental)
-- Package registry with SHA-256 content hashing and HTTP client
+**New in v0.6:**
+- Generic function/struct/enum syntax fully parsed and validated, monomorphization infrastructure complete
+- SMT-based contract verification using Z3 for int/bool arithmetic (optional `smt` feature)
+- WASM-GC backend with type section emission complete (experimental `wasmgc.rs`)
+- Package registry with SHA-256 content hashing and HTTP client ready for registry service
 
-Honest limits: generics are syntactically supported but full type inference is still in development, SMT verification works for int/bool contracts, WASM-GC requires newer runtimes, structs cap at 60 fields, compiled memory tops out at 1 GiB.
+Honest limits: generics are syntactically supported but full type inference is still in development, SMT verification works for int/bool contracts, WASM-GC backend requires newer runtimes and full expression compilation is in progress, structs cap at 60 fields, compiled memory tops out at 1 GiB.
 
-Planned for v0.6+: complete generics with full type inference, expanded SMT decidable subset, mature WASM-GC backend, public registry service.
+Planned for v0.7+: complete generic type inference, expanded SMT decidable subset (arrays/structs), mature WASM-GC backend with full expression compilation, public registry service with auth and search.
 
 ## License
 

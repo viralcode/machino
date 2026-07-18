@@ -1,4 +1,4 @@
-# The machino Language Specification (v0.5)
+# The machino Language Specification (v0.6)
 
 machino is an AI-first programming language. It is designed for code that is
 *written and verified by machines*: the syntax is small and canonical, the
@@ -357,10 +357,67 @@ Positions map to the correct file across imports. Error codes are stable:
 - Reference cycles are reclaimed by the compiled GC but leak in the
   interpreter (they require deliberately circular data).
 
-## Roadmap (v0.5+)
+## v0.6 Features
 
-- generics
-- WASM-GC proposal backend (engine-managed heap instead of the built-in
-  collector)
-- static contract verification (SMT) for a decidable subset
-- package registry with content hashes in machino.lock
+### Generics
+
+machino supports generic type parameters on functions, structs, and enums:
+
+```
+fn<T> identity(x: T) -> T {
+    return x
+}
+
+struct<T> Box {
+    value: T
+}
+
+enum<T> Result {
+    Ok(T)
+    Err(str)
+}
+```
+
+**Status**: Type parameter syntax is fully parsed and validated. Monomorphization infrastructure is in place for generating concrete instances. Type inference from call sites is in development.
+
+**Current limitations**: Generic functions require manual instantiation or explicit type arguments. Full type inference will arrive in v0.7.
+
+### SMT Verification
+
+machino integrates Z3 SMT solver for static contract verification:
+
+```
+fn safe_div(a: int, b: int) -> int
+    requires b != 0
+    ensures result * b <= a
+{
+    return a / b
+}
+```
+
+Compile with `--features smt` to enable verification. The checker translates contracts on int/bool parameters into SMT-LIB, proves postconditions from preconditions, and reports counterexamples when verification fails.
+
+**Status**: Fully working for int/bool contracts with arithmetic and boolean operators. Array and struct support is documented but verification returns "unsupported" for now.
+
+### WASM-GC Backend
+
+An experimental backend targeting the WebAssembly GC proposal (`wasmgc.rs`). Uses native reference types (`(ref struct)`, `(ref array)`) and relies on the engine's garbage collector instead of the manual mark-sweep collector.
+
+**Status**: Type section emission complete, basic structure in place. Full expression compilation is on the roadmap for v0.7. The existing mark-sweep GC backend remains the default and production-ready.
+
+### Package Registry
+
+The package system includes content-hash verification (`machino.lock` contains SHA-256 digests) and HTTP client infrastructure for a package registry (`registry.rs` with `--features registry`).
+
+**Status**: Client infrastructure complete. Public registry server, authentication, and search are planned for v0.7.
+
+## Roadmap (v0.7+)
+
+- Complete generic type inference
+- Expand SMT decidable subset (arrays, structs)
+- Mature WASM-GC backend with full expression compilation
+- Public package registry with auth and search
+- Static analysis passes (dead code, unused variables)
+- Incremental compilation
+
+
