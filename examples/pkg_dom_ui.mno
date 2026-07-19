@@ -1,0 +1,36 @@
+# Package demo: DOM building (virtual DOM under machino run; real DOM in browser).
+#   machino run examples/pkg_dom_ui.mno
+#   machino build examples/pkg_dom_ui.mno -o /tmp/dom.wasm
+#   open runners/run.html  # drop /tmp/dom.wasm
+#
+# In the browser host, prefer an element with id machino-root (run.html creates one).
+
+import "../packages/dom/dom.mno"
+
+fn main() {
+    let root = dom_get_element_by_id("machino-root")
+    if !dom_ok(root) {
+        root = dom_document()
+    }
+    let panel = dom_create_element("div")
+    dom_set_attr(panel, "id", "panel")
+    dom_add_class(panel, "card")
+    dom_set_style(panel, "padding", "12px")
+    dom_set_style(panel, "font-family", "sans-serif")
+    dom_set_text(panel, "Hello from machino DOM")
+    let note = dom_create_element("p")
+    dom_set_text(note, "built with packages/dom")
+    dom_append_child(panel, note)
+    dom_append_child(root, panel)
+    print(dom_get_text(dom_get_element_by_id("panel")))
+    print(dom_get_html(panel))
+}
+
+test "dom ui" {
+    let root = dom_document()
+    let el = dom_create_element("div")
+    dom_set_attr(el, "id", "x")
+    dom_set_text(el, "hi")
+    dom_append_child(root, el)
+    assert dom_get_text(dom_get_element_by_id("x")) == "hi"
+}

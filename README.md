@@ -186,11 +186,16 @@ deploy, packages, and the agent toolchain loop.
 
 ## Packages
 
-Ready-to-import libraries live in **[`packages/`](packages/)** (~40 packages):
-collections, HTTP/CLI, encoding/csv, plus an **advanced math** tier
-(`mathadv`, `linalg`, `complex`, `numeric`, `signal`, `bigint`, …).
-Install with `machino pkg add` and `import "pkg:mathadv/mathadv.mno"`.
-See [`packages/README.md`](packages/README.md) and try [`packages/demo`](packages/demo).
+Ready-to-import libraries live in **[`packages/`](packages/)** (~42 packages):
+collections, HTTP/CLI, encoding/csv, **regex**, **DOM**, plus an advanced math
+tier (`mathadv`, `linalg`, `complex`, `numeric`, `signal`, `bigint`, …).
+Install with `machino pkg add` and `import "pkg:regex/regex.mno"`.
+See [`packages/README.md`](packages/README.md), try [`packages/demo`](packages/demo),
+and the package demos `examples/pkg_*.mno` (math, text/regex, HTTP, DOM, science).
+
+DOM: declare via `packages/dom` → real browser bindings in
+[`runners/run.html`](runners/run.html) / [`runners/dom_host.mjs`](runners/dom_host.mjs);
+`machino run` uses a virtual DOM so the same programs test natively.
 
 ## Examples
 
@@ -228,6 +233,11 @@ Curated demos live in [`examples/`](examples/). A 100-file language corpus (each
 | [`examples/smt_contracts.mno`](examples/smt_contracts.mno) / [`complete_smt.mno`](examples/complete_smt.mno) | SMT-verifiable contracts |
 | [`examples/registry.mno`](examples/registry.mno) | Package registry client sketch |
 | [`examples/namespaces/`](examples/namespaces/) | Namespaced imports (`geo::Point`, …) |
+| [`examples/pkg_math_lab.mno`](examples/pkg_math_lab.mno) | Packages: mathadv / complex / linalg / numeric |
+| [`examples/pkg_text_pipeline.mno`](examples/pkg_text_pipeline.mno) | Packages: regex / encoding / template / csv |
+| [`examples/pkg_http_router.mno`](examples/pkg_http_router.mno) | Packages: httpkit / urlparse / cli |
+| [`examples/pkg_dom_ui.mno`](examples/pkg_dom_ui.mno) | Packages: DOM (virtual + browser WASM) |
+| [`examples/pkg_science.mno`](examples/pkg_science.mno) | Packages: statsadv / signal / bigint / geom2d |
 
 ### `test/` — 100 language examples + services
 

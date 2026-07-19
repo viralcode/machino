@@ -282,6 +282,19 @@ pub struct Interp<'a> {
     /// Running spawned tasks, keyed by the handle spawn returned.
     tasks: HashMap<i64, std::thread::JoinHandle<Result<SendVal, String>>>,
     next_task: i64,
+    /// Virtual DOM for `dom_*` externs (native runtime / tests).
+    dom_nodes: HashMap<i64, VDomNode>,
+    next_dom: i64,
+}
+
+#[derive(Clone)]
+struct VDomNode {
+    tag: String,
+    text: String,
+    attrs: HashMap<String, String>,
+    styles: HashMap<String, String>,
+    children: Vec<i64>,
+    parent: i64,
 }
 
 type RResult<T> = Result<T, RuntimeError>;
@@ -325,7 +338,47 @@ impl<'a> Interp<'a> {
             next_handle: 1,
             tasks: HashMap::new(),
             next_task: 1,
+            dom_nodes: {
+                let mut m = HashMap::new();
+                m.insert(
+                    1,
+                    VDomNode {
+                        tag: "#document".to_string(),
+                        text: String::new(),
+                        attrs: HashMap::new(),
+                        styles: HashMap::new(),
+                        children: Vec::new(),
+                        parent: 0,
+                    },
+                );
+                m
+            },
+            next_dom: 2,
         }
+    }
+
+    fn dom_html_of(&self, h: i64) -> String {
+        let Some(n) = self.dom_nodes.get(&h) else {
+            return String::new();
+        };
+        if n.tag == "#text" || n.tag == "#document" {
+            let mut s = n.text.clone();
+            for &c in &n.children {
+                s.push_str(&self.dom_html_of(c));
+            }
+            return s;
+        }
+        let mut s = format!("<{}", n.tag);
+        for (k, v) in &n.attrs {
+            s.push_str(&format!(" {}=\"{}\"", k, v));
+        }
+        s.push('>');
+        s.push_str(&n.text);
+        for &c in &n.children {
+            s.push_str(&self.dom_html_of(c));
+        }
+        s.push_str(&format!("</{}>", n.tag));
+        s
     }
 
     pub fn run_main(&mut self) -> RResult<()> {
@@ -711,11 +764,277 @@ impl<'a> Interp<'a> {
                 self.listeners.remove(&h);
                 Ok(Value::Unit)
             }
+            "dom_document" => {
+                check_sig!(
+                    Vec::<Type>::new(),
+                    Type::Int,
+                    "extern fn dom_document() -> int"
+                );
+                Ok(Value::Int(1))
+            }
+            "dom_create_element" => {
+                check_sig!(
+                    vec![Type::Str],
+                    Type::Int,
+                    "extern fn dom_create_element(tag: str) -> int"
+                );
+                let tag = as_string(&args[0]);
+                let h = self.next_dom;
+                self.next_dom += 1;
+                self.dom_nodes.insert(
+                    h,
+                    VDomNode {
+                        tag,
+                        text: String::new(),
+                        attrs: HashMap::new(),
+                        styles: HashMap::new(),
+                        children: Vec::new(),
+                        parent: 0,
+                    },
+                );
+                Ok(Value::Int(h))
+            }
+            "dom_get_element_by_id" => {
+                check_sig!(
+                    vec![Type::Str],
+                    Type::Int,
+                    "extern fn dom_get_element_by_id(id: str) -> int"
+                );
+                let id = as_string(&args[0]);
+                let found = self
+                    .dom_nodes
+                    .iter()
+                    .find(|(_, n)| n.attrs.get("id").map(|v| v == &id).unwrap_or(false))
+                    .map(|(h, _)| *h)
+                    .unwrap_or(0);
+                Ok(Value::Int(found))
+            }
+            "dom_query_selector" => {
+                check_sig!(
+                    vec![Type::Str],
+                    Type::Int,
+                    "extern fn dom_query_selector(sel: str) -> int"
+                );
+                let sel = as_string(&args[0]);
+                if let Some(id) = sel.strip_prefix('#').filter(|s| !s.is_empty()) {
+                    let found = self
+                        .dom_nodes
+                        .iter()
+                        .find(|(_, n)| n.attrs.get("id").map(|v| v == id).unwrap_or(false))
+                        .map(|(h, _)| *h)
+                        .unwrap_or(0);
+                    return Ok(Value::Int(found));
+                }
+                let found = self
+                    .dom_nodes
+                    .iter()
+                    .find(|(_, n)| n.tag == sel)
+                    .map(|(h, _)| *h)
+                    .unwrap_or(0);
+                Ok(Value::Int(found))
+            }
+            "dom_set_text" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Unit,
+                    "extern fn dom_set_text(el: int, text: str)"
+                );
+                if let Value::Int(h) = &args[0] {
+                    if let Some(n) = self.dom_nodes.get_mut(h) {
+                        n.text = as_string(&args[1]);
+                        n.children.clear();
+                    }
+                }
+                Ok(Value::Unit)
+            }
+            "dom_get_text" => {
+                check_sig!(
+                    vec![Type::Int],
+                    Type::Str,
+                    "extern fn dom_get_text(el: int) -> str"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let text = self
+                    .dom_nodes
+                    .get(&h)
+                    .map(|n| n.text.clone())
+                    .unwrap_or_default();
+                Ok(Value::str_value(&text))
+            }
+            "dom_set_html" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Unit,
+                    "extern fn dom_set_html(el: int, html: str)"
+                );
+                if let Value::Int(h) = &args[0] {
+                    if let Some(n) = self.dom_nodes.get_mut(h) {
+                        n.text = as_string(&args[1]);
+                        n.children.clear();
+                    }
+                }
+                Ok(Value::Unit)
+            }
+            "dom_get_html" => {
+                check_sig!(
+                    vec![Type::Int],
+                    Type::Str,
+                    "extern fn dom_get_html(el: int) -> str"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                Ok(Value::str_value(&self.dom_html_of(h)))
+            }
+            "dom_set_attr" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str, Type::Str],
+                    Type::Unit,
+                    "extern fn dom_set_attr(el: int, name: str, value: str)"
+                );
+                if let Value::Int(h) = &args[0] {
+                    if let Some(n) = self.dom_nodes.get_mut(h) {
+                        n.attrs.insert(as_string(&args[1]), as_string(&args[2]));
+                    }
+                }
+                Ok(Value::Unit)
+            }
+            "dom_get_attr" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Str,
+                    "extern fn dom_get_attr(el: int, name: str) -> str"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let name = as_string(&args[1]);
+                let v = self
+                    .dom_nodes
+                    .get(&h)
+                    .and_then(|n| n.attrs.get(&name).cloned())
+                    .unwrap_or_default();
+                Ok(Value::str_value(&v))
+            }
+            "dom_append_child" => {
+                check_sig!(
+                    vec![Type::Int, Type::Int],
+                    Type::Unit,
+                    "extern fn dom_append_child(parent: int, child: int)"
+                );
+                let p = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let c = match &args[1] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                if p != 0 && c != 0 && self.dom_nodes.contains_key(&p) && self.dom_nodes.contains_key(&c)
+                {
+                    if let Some(child) = self.dom_nodes.get_mut(&c) {
+                        let old = child.parent;
+                        child.parent = p;
+                        if old != 0 {
+                            if let Some(op) = self.dom_nodes.get_mut(&old) {
+                                op.children.retain(|x| *x != c);
+                            }
+                        }
+                    }
+                    if let Some(parent) = self.dom_nodes.get_mut(&p) {
+                        if !parent.children.contains(&c) {
+                            parent.children.push(c);
+                        }
+                    }
+                }
+                Ok(Value::Unit)
+            }
+            "dom_remove_child" => {
+                check_sig!(
+                    vec![Type::Int, Type::Int],
+                    Type::Unit,
+                    "extern fn dom_remove_child(parent: int, child: int)"
+                );
+                let p = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let c = match &args[1] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                if let Some(parent) = self.dom_nodes.get_mut(&p) {
+                    parent.children.retain(|x| *x != c);
+                }
+                if let Some(child) = self.dom_nodes.get_mut(&c) {
+                    child.parent = 0;
+                }
+                Ok(Value::Unit)
+            }
+            "dom_add_class" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Unit,
+                    "extern fn dom_add_class(el: int, cls: str)"
+                );
+                if let Value::Int(h) = &args[0] {
+                    let cls = as_string(&args[1]);
+                    if let Some(n) = self.dom_nodes.get_mut(h) {
+                        let cur = n.attrs.entry("class".to_string()).or_default();
+                        if cur.is_empty() {
+                            *cur = cls;
+                        } else if !cur.split_whitespace().any(|c| c == cls) {
+                            cur.push(' ');
+                            cur.push_str(&cls);
+                        }
+                    }
+                }
+                Ok(Value::Unit)
+            }
+            "dom_set_style" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str, Type::Str],
+                    Type::Unit,
+                    "extern fn dom_set_style(el: int, prop: str, value: str)"
+                );
+                if let Value::Int(h) = &args[0] {
+                    if let Some(n) = self.dom_nodes.get_mut(h) {
+                        n.styles.insert(as_string(&args[1]), as_string(&args[2]));
+                    }
+                }
+                Ok(Value::Unit)
+            }
+            "dom_get_style" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Str,
+                    "extern fn dom_get_style(el: int, prop: str) -> str"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let prop = as_string(&args[1]);
+                let v = self
+                    .dom_nodes
+                    .get(&h)
+                    .and_then(|n| n.styles.get(&prop).cloned())
+                    .unwrap_or_default();
+                Ok(Value::str_value(&v))
+            }
             other => Err(RuntimeError::new(
                 format!(
                     "extern '{}' is not provided by the machino native runtime. Available externs: \
                      clock_ms, sleep_ms, read_file, write_file, file_exists, read_line, getenv, http_get, \
-                     args, exit, tcp_listen, tcp_accept, tcp_read, tcp_write, tcp_close. \
+                     args, exit, tcp_listen, tcp_accept, tcp_read, tcp_write, tcp_close, \
+                     dom_document, dom_get_element_by_id, dom_query_selector, dom_create_element, \
+                     dom_set_text, dom_get_text, dom_set_html, dom_get_html, dom_set_attr, dom_get_attr, \
+                     dom_append_child, dom_remove_child, dom_add_class, dom_set_style, dom_get_style. \
                      For other capabilities, compile with 'machino build' and provide the import \
                      from your own host.",
                     other

@@ -69,12 +69,16 @@
     drop a .wasm file — or click to choose
     <input type="file" id="file" accept=".wasm" />
   </label>
+  <div id="stage" style="margin-top:1rem;min-height:2rem"></div>
   <pre id="out"><span class="meta">output will appear here</span></pre>
 </main>
 <script type="module">
+import { createDomHost } from "./dom_host.mjs";
+
 const out = document.getElementById("out");
 const drop = document.getElementById("drop");
 const fileInput = document.getElementById("file");
+const stage = document.getElementById("stage");
 
 let memory;
 let alloc;
@@ -102,7 +106,9 @@ function line(text, cls) {
 
 async function run(bytes, name) {
   out.textContent = "";
+  if (stage) stage.replaceChildren();
   line(`running ${name}`, "meta");
+  const dom = createDomHost({ readStr, makeStr, mode: "browser" });
   const imports = {
     env: {
       fail: (addr) => line(readStr(addr), "err"),
@@ -114,13 +120,19 @@ async function run(bytes, name) {
       getenv: () => makeStr(""),
       read_line: () => makeStr(window.prompt("machino read_line()") ?? ""),
       exit: () => { throw new WebAssembly.RuntimeError("exit"); },
-      // file and socket externs are not available in the browser sandbox
+      ...dom,
     },
   };
   try {
     const { instance } = await WebAssembly.instantiate(bytes, imports);
     memory = instance.exports.memory;
     alloc = instance.exports.alloc;
+    // Prefer mounting under #stage when present so demos don't fight the UI.
+    if (stage) {
+      const app = document.createElement("div");
+      app.id = "machino-root";
+      stage.appendChild(app);
+    }
     instance.exports.main();
     line("— finished —", "meta");
   } catch (e) {

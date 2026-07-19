@@ -1,0 +1,30 @@
+# Package demo: regex, encoding, templates, text helpers.
+#   machino run examples/pkg_text_pipeline.mno
+
+import "../packages/regex/regex.mno"
+import "../packages/encoding/encoding.mno"
+import "../packages/template/template.mno"
+import "../packages/text/text.mno"
+import "../packages/csv/csv.mno"
+
+fn main() {
+    let logline = "user=alice id=42 status=ok"
+    print(regex_capture("\\d+", logline))
+    print(regex_replace_all(" +", "a  b   c", "_"))
+    print(enc_base64_encode("machino"))
+    print(enc_hex_encode("OK"))
+    let vars = strmap_new()
+    strmap_set(vars, "name", "machino")
+    strmap_set(vars, "ver", "1.2")
+    print(tmpl_render("hello {{name}} v{{ver}}", vars))
+    print(text_pad_left("7", 3, "0"))
+    let rows = csv_parse("a,b\n1,2")
+    print(csv_serialize(rows))
+}
+
+test "text pipeline" {
+    assert regex_is_match("\\d+", "ab12cd")
+    assert regex_capture("[0-9]+", "x99y") == "99"
+    assert enc_hex_encode("A") == "41"
+    assert text_replace("a_b", "_", "/") == "a/b"
+}

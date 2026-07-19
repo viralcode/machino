@@ -91,12 +91,23 @@ import "pkg:mathx/mathx.mno" as mx
 | [`units`](units/) | pint lite | temp/length/mass/volume conversions |
 | [`template`](template/) | mustache lite | `{{key}}` via StrMap |
 | [`color`](color/) | CSS color | RGB hex, lerp, luma |
+| [`regex`](regex/) | JS `RegExp` lite | `. * + ? \| () ^ $ [] \d\w\s`, find/replace |
+| [`dom`](dom/) | browser DOM | create/query/text/attr/style; real DOM in `run.html`, virtual in `machino run` |
 
-That’s ~40 packages covering collections, text/wire formats, HTTP/CLI,
-geometry, and a serious pure-machino math stack. Still **not** the entire
-universe: no GPU/BLAS, no TLS, no full regex engine, no audited cryptography —
-those need host `extern`s or future packages. Everything here runs in
-`machino run` and compiles to WASM with the same APIs.
+That’s ~42 packages covering collections, text/wire formats, HTTP/CLI,
+geometry, math, **regex**, and **DOM**. Still not literally everything: no
+GPU/BLAS, TLS, or audited cryptography — those need host `extern`s. Regex is
+a practical subset (not full PCRE). DOM is capability-based via `extern fn`.
+
+### Package examples
+
+| Example | Packages shown |
+|---|---|
+| [`examples/pkg_math_lab.mno`](../examples/pkg_math_lab.mno) | mathadv, complex, linalg, numeric, fraction |
+| [`examples/pkg_text_pipeline.mno`](../examples/pkg_text_pipeline.mno) | regex, encoding, template, text, csv |
+| [`examples/pkg_http_router.mno`](../examples/pkg_http_router.mno) | httpkit, urlparse, pathutil, cli |
+| [`examples/pkg_dom_ui.mno`](../examples/pkg_dom_ui.mno) | dom (browser + virtual) |
+| [`examples/pkg_science.mno`](../examples/pkg_science.mno) | statsadv, signal, sortx, bigint, geom2d, … |
 
 ## Try the demo
 

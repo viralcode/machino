@@ -1,0 +1,35 @@
+# Package demo: stats, signal processing, sorting, bigint.
+#   machino run examples/pkg_science.mno
+
+import "../packages/statsadv/statsadv.mno"
+import "../packages/signal/signal.mno"
+import "../packages/sortx/sortx.mno"
+import "../packages/bigint/bigint.mno"
+import "../packages/geom2d/geom2d.mno"
+import "../packages/poly/poly.mno"
+import "../packages/units/units.mno"
+import "../packages/color/color.mno"
+import "../packages/uuid/uuid.mno"
+
+fn main() {
+    let xs = [1.0, 2.0, 3.0, 4.0]
+    print("mean=" + str_of_float(statsadv_mean(xs), 2))
+    print("stdev=" + str_of_float(statsadv_stdev(xs), 3))
+    let mag = signal_dft_mag([1.0, 1.0, 1.0, 1.0])
+    print("dft0=" + str_of_float(mag[0], 1))
+    let sorted = sortx_ints([9, 1, 5, 3])
+    print("sorted0=" + str_of_int(sorted[0]))
+    print("big=" + big_to_str(big_mul_small(big_from_int(999999), 999)))
+    print("dist=" + str_of_float(geom_dist(pt2(0.0, 0.0), pt2(3.0, 4.0)), 1))
+    print("poly(2)=" + str_of_float(poly_eval([1.0, 0.0, 1.0], 2.0), 1))
+    print("32F=" + str_of_float(units_c_to_f(0.0), 1) + "F")
+    print(color_to_hex(rgb(0, 128, 255)))
+    print(uuid_v4(uuid_rng_new(99)))
+}
+
+test "science" {
+    assert abs_float(statsadv_pearson([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]) - 1.0) < 0.0001
+    assert sortx_ints([3, 1, 2])[0] == 1
+    assert geom_dist(pt2(0.0, 0.0), pt2(3.0, 4.0)) == 5.0
+    assert poly_eval([1.0, 2.0], 3.0) == 7.0
+}

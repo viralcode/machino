@@ -1,0 +1,76 @@
+# dom — browser DOM via host imports (WASM) + virtual DOM in `machino run`
+#
+# Handles are opaque ints (0 = missing/null).
+# Browser: runners/run.html provides real document bindings.
+# Native: machino run uses an in-memory virtual DOM for tests/CLIs.
+# Node WASM: runners/run.mjs provides the same virtual DOM.
+
+extern fn dom_document() -> int
+extern fn dom_get_element_by_id(id: str) -> int
+extern fn dom_query_selector(sel: str) -> int
+extern fn dom_create_element(tag: str) -> int
+extern fn dom_set_text(el: int, text: str)
+extern fn dom_get_text(el: int) -> str
+extern fn dom_set_html(el: int, html: str)
+extern fn dom_get_html(el: int) -> str
+extern fn dom_set_attr(el: int, name: str, value: str)
+extern fn dom_get_attr(el: int, name: str) -> str
+extern fn dom_append_child(parent: int, child: int)
+extern fn dom_remove_child(parent: int, child: int)
+extern fn dom_add_class(el: int, cls: str)
+extern fn dom_set_style(el: int, prop: str, value: str)
+extern fn dom_get_style(el: int, prop: str) -> str
+
+fn dom_ok(el: int) -> bool {
+    return el != 0
+}
+
+fn dom_text(el: int, text: str) -> int {
+    if el != 0 {
+        dom_set_text(el, text)
+    }
+    return el
+}
+
+fn dom_attr(el: int, name: str, value: str) -> int {
+    if el != 0 {
+        dom_set_attr(el, name, value)
+    }
+    return el
+}
+
+fn dom_style(el: int, prop: str, value: str) -> int {
+    if el != 0 {
+        dom_set_style(el, prop, value)
+    }
+    return el
+}
+
+fn dom_append(parent: int, child: int) -> int {
+    if parent != 0 && child != 0 {
+        dom_append_child(parent, child)
+    }
+    return child
+}
+
+fn dom_el(tag: str) -> int {
+    return dom_create_element(tag)
+}
+
+test "virtual dom" {
+    let root = dom_document()
+    assert dom_ok(root)
+    let box = dom_create_element("div")
+    dom_set_attr(box, "id", "app")
+    dom_set_text(box, "hello")
+    dom_append_child(root, box)
+    let found = dom_get_element_by_id("app")
+    assert found == box
+    assert dom_get_text(found) == "hello"
+    dom_set_style(found, "color", "red")
+    assert dom_get_style(found, "color") == "red"
+    let child = dom_create_element("span")
+    dom_set_text(child, "!")
+    dom_append_child(found, child)
+    assert contains(dom_get_html(found), "!")
+}

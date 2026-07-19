@@ -209,11 +209,31 @@ extern fn tcp_accept(listener: int) -> int
 extern fn tcp_read(conn: int) -> str
 extern fn tcp_write(conn: int, data: str) -> int
 extern fn tcp_close(handle: int)
+
+# DOM (virtual in machino run; real document in runners/run.html)
+extern fn dom_document() -> int
+extern fn dom_get_element_by_id(id: str) -> int
+extern fn dom_query_selector(sel: str) -> int
+extern fn dom_create_element(tag: str) -> int
+extern fn dom_set_text(el: int, text: str)
+extern fn dom_get_text(el: int) -> str
+extern fn dom_set_html(el: int, html: str)
+extern fn dom_get_html(el: int) -> str
+extern fn dom_set_attr(el: int, name: str, value: str)
+extern fn dom_get_attr(el: int, name: str) -> str
+extern fn dom_append_child(parent: int, child: int)
+extern fn dom_remove_child(parent: int, child: int)
+extern fn dom_add_class(el: int, cls: str)
+extern fn dom_set_style(el: int, prop: str, value: str)
+extern fn dom_get_style(el: int, prop: str) -> str
 ```
 
 Servers: `tcp_listen` → loop `tcp_accept` → `tcp_read` → `tcp_write` →
 `tcp_close`. See `examples/http_server.mno` for a complete HTTP server.
-The Node WASM host provides everything except `tcp_*`.
+The Node WASM host provides everything except `tcp_*`. Prefer
+`import "../packages/dom/dom.mno"` (or `pkg:dom/dom.mno`) instead of redeclaring
+DOM externs. Regex is a pure package: `packages/regex` (`regex_is_match`,
+`regex_find`, `regex_capture`, `regex_replace_all`).
 
 ## Packages
 

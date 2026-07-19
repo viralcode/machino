@@ -26,6 +26,7 @@ Declare what you need with `extern fn`; undeclared host powers are unreachable.
 | `exit(code: int)` | Terminate the process |
 | `http_get(url: str) -> str` | Blocking HTTP GET body |
 | `tcp_listen` / `tcp_accept` / `tcp_read` / `tcp_write` / `tcp_close` | TCP sockets |
+| `dom_*` | Virtual DOM (create/query/text/attr/style/append). Same import names as the browser host in `runners/run.html` — see `packages/dom` |
 
 Contracts, asserts, bounds checks, and overflow traps are enforced the same way
 as in compiled WASM.

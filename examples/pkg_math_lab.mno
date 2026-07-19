@@ -1,0 +1,29 @@
+# Package demo: advanced math, linear algebra, complex numbers.
+#   machino run examples/pkg_math_lab.mno
+#   machino test examples/pkg_math_lab.mno
+
+import "../packages/mathadv/mathadv.mno"
+import "../packages/complex/complex.mno"
+import "../packages/linalg/linalg.mno"
+import "../packages/numeric/numeric.mno"
+import "../packages/fraction/fraction.mno"
+import "../packages/combinatorics/combinatorics.mno"
+
+fn main() {
+    print("sin(pi/2) ≈ " + str_of_float(mathadv_sin(mathadv_pi() / 2.0), 6))
+    print("|3+4i| = " + str_of_float(c_abs(c_new(3.0, 4.0)), 1))
+    print("|v2(3,4)| = " + str_of_float(v2_len(v2(3.0, 4.0)), 1))
+    let root = num_bisect(fn(x: float) -> float {
+        return x * x - 2.0
+    }, 0.0, 2.0, 40)
+    print("√2 ≈ " + str_of_float(root, 6))
+    print("1/2 + 1/3 = " + str_of_int(frac_add(frac_new(1, 2), frac_new(1, 3)).num) + "/" + str_of_int(frac_add(frac_new(1, 2), frac_new(1, 3)).den))
+    print("C(10,3) = " + str_of_int(comb_choose(10, 3)))
+}
+
+test "math lab" {
+    assert abs_float(mathadv_sin(mathadv_pi() / 2.0) - 1.0) < 0.01
+    assert c_abs(c_new(3.0, 4.0)) == 5.0
+    assert v2_len(v2(3.0, 4.0)) == 5.0
+    assert comb_choose(5, 2) == 10
+}

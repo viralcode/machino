@@ -1,0 +1,37 @@
+# Package demo: httpkit request parsing + response building (no sockets).
+#   machino run examples/pkg_http_router.mno
+
+import "../packages/httpkit/httpkit.mno"
+import "../packages/urlparse/urlparse.mno"
+import "../packages/pathutil/pathutil.mno"
+import "../packages/cli/cli.mno"
+
+fn route(raw: str) -> str {
+    let req = http_parse_request(raw)
+    if req.path == "/" {
+        return http_ok("home")
+    }
+    if starts_with(req.path, "/hello/") {
+        let name = substr(req.path, 7, len(req.path))
+        return http_ok("hello, " + name)
+    }
+    if req.path == "/api" {
+        return http_json("{\"ok\":true}")
+    }
+    return http_not_found("missing: " + req.path)
+}
+
+fn main() {
+    print(route("GET /hello/world HTTP/1.1\r\n\r\n"))
+    let u = url_parse("https://ex.com/a?x=1")
+    print(u.host + u.path)
+    print(path_join("static", "app.js"))
+    let argv = ["--port", "8080", "serve"]
+    print(cli_get_int(argv, "--port", 80))
+}
+
+test "http router" {
+    let body = route("GET /hello/ada HTTP/1.1\r\n\r\n")
+    assert contains(body, "hello, ada")
+    assert contains(route("GET /nope HTTP/1.1\r\n\r\n"), "404")
+}

@@ -40,3 +40,5 @@ dep uuid ../uuid
 dep units ../units
 dep template ../template
 dep color ../color
+dep regex ../regex
+dep dom ../dom

@@ -1,0 +1,468 @@
+# regex — practical pattern matcher (byte-oriented)
+# Supports: literals, ., *, +, ?, |, (), ^, $, [abc], [a-z], [^...],
+# escapes \d \D \w \W \s \S \n \t \\ \. \[ \] \( \) \| \* \+ \?
+# Not a full PCRE engine (no backrefs, lookaround, or Unicode classes).
+
+fn re_is_digit(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn re_is_word(c: int) -> bool {
+    return re_is_digit(c) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+}
+
+fn re_is_space(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn re_escape_class(esc: int) -> int {
+    # returns: 1=digit 2=word 3=space 4=notdigit 5=notword 6=notspace 7=lit
+    if esc == 100 { return 1 }
+    if esc == 68 { return 4 }
+    if esc == 119 { return 2 }
+    if esc == 87 { return 5 }
+    if esc == 115 { return 3 }
+    if esc == 83 { return 6 }
+    return 7
+}
+
+fn re_class_match(pat: str, start: int, end: int, negated: bool, c: int) -> bool {
+    let i = start
+    let hit = false
+    while i < end {
+        if i + 2 < end && char_at(pat, i + 1) == 45 {
+            let lo = char_at(pat, i)
+            let hi = char_at(pat, i + 2)
+            if c >= lo && c <= hi {
+                hit = true
+                break
+            }
+            i = i + 3
+        } else {
+            if char_at(pat, i) == c {
+                hit = true
+                break
+            }
+            i = i + 1
+        }
+    }
+    if negated {
+        return !hit
+    }
+    return hit
+}
+
+# Find matching ')' for '(' at pi (pat[pi] == '(')
+fn re_group_end(pat: str, pi: int) -> int {
+    let depth = 0
+    let i = pi
+    let n = len(pat)
+    while i < n {
+        let c = char_at(pat, i)
+        if c == 92 {
+            i = i + 2
+            continue
+        }
+        if c == 91 {
+            i = i + 1
+            while i < n && char_at(pat, i) != 93 {
+                if char_at(pat, i) == 92 {
+                    i = i + 2
+                } else {
+                    i = i + 1
+                }
+            }
+            i = i + 1
+            continue
+        }
+        if c == 40 {
+            depth = depth + 1
+        }
+        if c == 41 {
+            depth = depth - 1
+            if depth == 0 {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+# Split top-level alternation starting at pi until limit; returns next | index or -1
+fn re_next_alt(pat: str, pi: int, limit: int) -> int {
+    let depth = 0
+    let i = pi
+    while i < limit {
+        let c = char_at(pat, i)
+        if c == 92 {
+            i = i + 2
+            continue
+        }
+        if c == 91 {
+            i = i + 1
+            while i < limit && char_at(pat, i) != 93 {
+                if char_at(pat, i) == 92 {
+                    i = i + 2
+                } else {
+                    i = i + 1
+                }
+            }
+            i = i + 1
+            continue
+        }
+        if c == 40 {
+            depth = depth + 1
+        }
+        if c == 41 {
+            depth = depth - 1
+        }
+        if c == 124 && depth == 0 {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+# Match atom at pat[pi..] against text[ti]; returns (new_pi, new_ti) packed as
+# success via outs: we return end ti on success as >=0 with pi advanced via
+# mutual recursion structure below.
+
+fn re_match_atom(pat: str, pi: int, limit: int, text: str, ti: int) -> int {
+    # returns new ti on success, or -1; advances conceptually by one atom —
+    # caller must advance pi itself. For groups/classes we need both.
+    # This helper returns ti' only; use re_atom_span for pi advancement.
+    return 0 - 1
+}
+
+# Returns end index in pattern of atom starting at pi (exclusive)
+fn re_atom_end(pat: str, pi: int, limit: int) -> int {
+    if pi >= limit {
+        return pi
+    }
+    let c = char_at(pat, pi)
+    if c == 92 {
+        if pi + 1 < limit {
+            return pi + 2
+        }
+        return pi + 1
+    }
+    if c == 91 {
+        let i = pi + 1
+        if i < limit && char_at(pat, i) == 94 {
+            i = i + 1
+        }
+        while i < limit && char_at(pat, i) != 93 {
+            if char_at(pat, i) == 92 {
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+        }
+        if i < limit {
+            return i + 1
+        }
+        return limit
+    }
+    if c == 40 {
+        let ge = re_group_end(pat, pi)
+        if ge < 0 {
+            return limit
+        }
+        return ge + 1
+    }
+    return pi + 1
+}
+
+fn re_match_one(pat: str, pi: int, ae: int, text: str, ti: int) -> int {
+    # match atom pat[pi..ae) against text at ti; return new ti or -1
+    if pi >= ae {
+        return ti
+    }
+    let c = char_at(pat, pi)
+    if c == 46 {
+        if ti >= len(text) {
+            return 0 - 1
+        }
+        return ti + 1
+    }
+    if c == 92 {
+        if pi + 1 >= ae {
+            return 0 - 1
+        }
+        let e = char_at(pat, pi + 1)
+        let kind = re_escape_class(e)
+        if ti >= len(text) {
+            return 0 - 1
+        }
+        let ch = char_at(text, ti)
+        if kind == 1 {
+            if re_is_digit(ch) { return ti + 1 }
+            return 0 - 1
+        }
+        if kind == 4 {
+            if !re_is_digit(ch) { return ti + 1 }
+            return 0 - 1
+        }
+        if kind == 2 {
+            if re_is_word(ch) { return ti + 1 }
+            return 0 - 1
+        }
+        if kind == 5 {
+            if !re_is_word(ch) { return ti + 1 }
+            return 0 - 1
+        }
+        if kind == 3 {
+            if re_is_space(ch) { return ti + 1 }
+            return 0 - 1
+        }
+        if kind == 6 {
+            if !re_is_space(ch) { return ti + 1 }
+            return 0 - 1
+        }
+        if e == 110 {
+            if ch == 10 { return ti + 1 }
+            return 0 - 1
+        }
+        if e == 116 {
+            if ch == 9 { return ti + 1 }
+            return 0 - 1
+        }
+        if ch == e {
+            return ti + 1
+        }
+        return 0 - 1
+    }
+    if c == 91 {
+        if ti >= len(text) {
+            return 0 - 1
+        }
+        let negated = false
+        let start = pi + 1
+        if start < ae && char_at(pat, start) == 94 {
+            negated = true
+            start = start + 1
+        }
+        let end = ae - 1
+        if re_class_match(pat, start, end, negated, char_at(text, ti)) {
+            return ti + 1
+        }
+        return 0 - 1
+    }
+    if c == 40 {
+        return re_match_seq(pat, pi + 1, ae - 1, text, ti)
+    }
+    if ti >= len(text) {
+        return 0 - 1
+    }
+    if char_at(text, ti) == c {
+        return ti + 1
+    }
+    return 0 - 1
+}
+
+fn re_match_seq(pat: str, pi: int, limit: int, text: str, ti: int) -> int {
+    # handle top-level | inside [pi, limit)
+    let alt = re_next_alt(pat, pi, limit)
+    if alt >= 0 {
+        let a = re_match_seq(pat, pi, alt, text, ti)
+        if a >= 0 {
+            return a
+        }
+        return re_match_seq(pat, alt + 1, limit, text, ti)
+    }
+    return re_match_pieces(pat, pi, limit, text, ti)
+}
+
+fn re_match_pieces(pat: str, pi: int, limit: int, text: str, ti: int) -> int {
+    if pi >= limit {
+        return ti
+    }
+    # anchors
+    if char_at(pat, pi) == 94 {
+        if ti != 0 {
+            return 0 - 1
+        }
+        return re_match_pieces(pat, pi + 1, limit, text, ti)
+    }
+    if char_at(pat, pi) == 36 {
+        if ti != len(text) {
+            return 0 - 1
+        }
+        return re_match_pieces(pat, pi + 1, limit, text, ti)
+    }
+    let ae = re_atom_end(pat, pi, limit)
+    let quant = 0
+    # 0=none 1=? 2=* 3=+
+    let next = ae
+    if ae < limit {
+        let q = char_at(pat, ae)
+        if q == 63 {
+            quant = 1
+            next = ae + 1
+        }
+        if q == 42 {
+            quant = 2
+            next = ae + 1
+        }
+        if q == 43 {
+            quant = 3
+            next = ae + 1
+        }
+    }
+    if quant == 0 {
+        let t2 = re_match_one(pat, pi, ae, text, ti)
+        if t2 < 0 {
+            return 0 - 1
+        }
+        return re_match_pieces(pat, next, limit, text, t2)
+    }
+    if quant == 1 {
+        let t2 = re_match_one(pat, pi, ae, text, ti)
+        if t2 >= 0 {
+            let rest = re_match_pieces(pat, next, limit, text, t2)
+            if rest >= 0 {
+                return rest
+            }
+        }
+        return re_match_pieces(pat, next, limit, text, ti)
+    }
+    # * or +: greedy with backtrack
+    let minc = 0
+    if quant == 3 {
+        minc = 1
+    }
+    # collect greedy end positions
+    let positions: [int] = []
+    positions = push(positions, ti)
+    let cur = ti
+    while true {
+        let t2 = re_match_one(pat, pi, ae, text, cur)
+        if t2 < 0 {
+            break
+        }
+        positions = push(positions, t2)
+        cur = t2
+        if cur > len(text) {
+            break
+        }
+    }
+    let i = len(positions) - 1
+    while i >= minc {
+        let rest = re_match_pieces(pat, next, limit, text, positions[i])
+        if rest >= 0 {
+            return rest
+        }
+        i = i - 1
+    }
+    return 0 - 1
+}
+
+fn regex_match_at(pat: str, text: str, start: int) -> int {
+    # returns end index exclusive, or -1
+    if start < 0 || start > len(text) {
+        return 0 - 1
+    }
+    return re_match_seq(pat, 0, len(pat), text, start)
+}
+
+fn regex_is_match(pat: str, text: str) -> bool {
+    if len(pat) > 0 && char_at(pat, 0) == 94 {
+        return regex_match_at(pat, text, 0) >= 0
+    }
+    for i in 0..(len(text) + 1) {
+        if regex_match_at(pat, text, i) >= 0 {
+            return true
+        }
+    }
+    return false
+}
+
+fn regex_find(pat: str, text: str) -> int {
+    # start index of first match, or -1
+    if len(pat) > 0 && char_at(pat, 0) == 94 {
+        if regex_match_at(pat, text, 0) >= 0 {
+            return 0
+        }
+        return 0 - 1
+    }
+    for i in 0..(len(text) + 1) {
+        if regex_match_at(pat, text, i) >= 0 {
+            return i
+        }
+    }
+    return 0 - 1
+}
+
+fn regex_find_end(pat: str, text: str, start: int) -> int {
+    return regex_match_at(pat, text, start)
+}
+
+fn regex_capture(pat: str, text: str) -> str {
+    let s = regex_find(pat, text)
+    if s < 0 {
+        return ""
+    }
+    let e = regex_find_end(pat, text, s)
+    if e < s {
+        return ""
+    }
+    return substr(text, s, e)
+}
+
+fn regex_replace_first(pat: str, text: str, repl: str) -> str {
+    let s = regex_find(pat, text)
+    if s < 0 {
+        return text
+    }
+    let e = regex_find_end(pat, text, s)
+    return substr(text, 0, s) + repl + substr(text, e, len(text))
+}
+
+fn regex_replace_all(pat: str, text: str, repl: str) -> str {
+    let out = ""
+    let i = 0
+    let n = len(text)
+    while i <= n {
+        let e = regex_match_at(pat, text, i)
+        if e < 0 {
+            if i >= n {
+                break
+            }
+            out = out + chr(char_at(text, i))
+            i = i + 1
+        } else {
+            out = out + repl
+            if e == i {
+                if i >= n {
+                    break
+                }
+                out = out + chr(char_at(text, i))
+                i = i + 1
+            } else {
+                i = e
+            }
+        }
+    }
+    return out
+}
+
+test "regex basics" {
+    assert regex_is_match("hello", "say hello!")
+    assert regex_is_match("^hello$", "hello")
+    assert !regex_is_match("^hello$", "hello!")
+    assert regex_is_match("a.c", "abc")
+    assert regex_is_match("ab*c", "ac")
+    assert regex_is_match("ab*c", "abbbc")
+    assert regex_is_match("ab+c", "abbc")
+    assert !regex_is_match("ab+c", "ac")
+    assert regex_is_match("colou?r", "color")
+    assert regex_is_match("colou?r", "colour")
+    assert regex_is_match("cat|dog", "dog")
+    assert regex_is_match("(ab)+", "abab")
+    assert regex_is_match("\\d+", "id=42")
+    assert regex_is_match("[a-z]+", "ello")
+    assert regex_capture("\\d+", "x99y") == "99"
+    assert regex_replace_all("a+", "aaXaaa", "!") == "!X!"
+}

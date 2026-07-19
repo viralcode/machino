@@ -26,6 +26,7 @@ import {
   isMainThread,
   workerData,
 } from "node:worker_threads";
+import { createDomHost } from "./dom_host.mjs";
 
 let memory; // set after instantiation
 let alloc; // exported allocator
@@ -293,6 +294,7 @@ function copyStrBytes(addr) {
 }
 
 function makeImports(programArgs) {
+  const dom = createDomHost({ readStr, makeStr, mode: "virtual" });
   return {
     env: {
       // called just before the module traps on a contract/assert/bounds failure
@@ -460,6 +462,7 @@ function makeImports(programArgs) {
       // TCP sockets are provided by machino's native runtime (`machino run`).
       // Node's socket API is asynchronous, so this synchronous WASM host does
       // not implement them; provide your own host (or WASI sockets) if needed.
+      ...dom,
     },
   };
 }
