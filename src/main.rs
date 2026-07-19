@@ -6,6 +6,7 @@ mod fmt;
 mod interp;
 mod lexer;
 mod mono;
+mod native;
 mod ns;
 mod parser;
 mod pkg;
@@ -30,6 +31,7 @@ USAGE:
   machino run   <file.mno> [args...] [--trace]   run fn main(); --trace emits JSON call events
   machino build <file.mno> [-o out.wasm]         compile to a portable .wasm module
                 [--gc] [--native] [--stack-mib N] [--no-cache]
+                # --native: Clang/LLVM → host executable (not wasmtime AOT)
   machino query <file.mno>                       JSON signatures of every top-level item
   machino fmt   <file.mno> [--check]             canonical formatter
   machino fuzz  <file.mno> [--runs N] [--seed S] contract-driven property testing
@@ -664,7 +666,11 @@ fn cmd_build(rest: &[String]) -> ExitCode {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("out");
-            format!("{}.wasm", stem)
+            if use_native {
+                stem.to_string()
+            } else {
+                format!("{}.wasm", stem)
+            }
         });
     let Some(loaded) = load(path, false) else {
         return ExitCode::FAILURE;
@@ -683,6 +689,35 @@ fn cmd_build(rest: &[String]) -> ExitCode {
         eprintln!("{}", loaded.render_error(&d));
         return ExitCode::FAILURE;
     }
+
+    // --native: Clang/LLVM host executable (skips WASM entirely)
+    if use_native {
+        let unsupported = native::unsupported_constructs(&loaded.program);
+        if let Some(d) = unsupported.into_iter().next() {
+            eprintln!("{}", loaded.render_error(&d));
+            return ExitCode::FAILURE;
+        }
+        let exe = std::path::PathBuf::from(&out_path);
+        return match native::compile_native(&loaded.program, &exe) {
+            Ok(built) => {
+                println!(
+                    "wrote {} (native executable via Clang/LLVM)",
+                    built.exe_path.display()
+                );
+                println!("  C source:  {}", built.c_path.display());
+                if let Some(ll) = built.ll_path {
+                    println!("  LLVM IR:   {}", ll.display());
+                }
+                println!("run:  {}", built.exe_path.display());
+                ExitCode::SUCCESS
+            }
+            Err(d) => {
+                eprintln!("{}", loaded.render_error(&d));
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // incremental compilation: the cache key covers the whole source bundle
     // (entry file + imports + std), compiler version, backend, and flags
     let cache_key = {
@@ -732,60 +767,10 @@ fn cmd_build(rest: &[String]) -> ExitCode {
             } else {
                 println!("run it anywhere:  node runners/run.mjs {}", out_path);
             }
-            if use_native {
-                return aot_native(&out_path);
-            }
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("error: cannot write '{}': {}", out_path, e);
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// AOT-compile a linear `.wasm` with `wasmtime compile` when available.
-fn aot_native(wasm_path: &str) -> ExitCode {
-    let cwasm = {
-        let p = std::path::Path::new(wasm_path);
-        p.with_extension("cwasm")
-    };
-    let status = std::process::Command::new("wasmtime")
-        .args([
-            "compile",
-            wasm_path,
-            "-o",
-            cwasm.to_str().unwrap_or("out.cwasm"),
-        ])
-        .status();
-    match status {
-        Ok(s) if s.success() => {
-            println!(
-                "wrote {} (wasmtime AOT / Cranelift — not LLVM native codegen)",
-                cwasm.display()
-            );
-            println!(
-                "run the module with:  wasmtime run {}  (or node runners/run.mjs {})",
-                wasm_path, wasm_path
-            );
-            println!(
-                "note: host imports (print_*, fail, channels, TCP, …) still come from the wasmtime runtime / a custom linker; prefer 'machino run' for OS capabilities"
-            );
-            ExitCode::SUCCESS
-        }
-        Ok(s) => {
-            eprintln!(
-                "error: wasmtime compile failed (exit {}); is wasmtime installed?",
-                s.code().unwrap_or(-1)
-            );
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!(
-                "error: --native requires the 'wasmtime' CLI on PATH ({})",
-                e
-            );
-            eprintln!("install: https://wasmtime.dev/  (or use 'machino run' for the native OS runtime)");
             ExitCode::FAILURE
         }
     }

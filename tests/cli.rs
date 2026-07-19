@@ -1095,33 +1095,33 @@ fn main() {}
 }
 
 #[test]
-fn build_native_aot_smoke() {
-    if Command::new("wasmtime").arg("--version").output().is_err() {
+fn build_native_llvm_smoke() {
+    if Command::new("clang").arg("--version").output().is_err() {
         return;
     }
     let path = write_temp(
-        "native_aot.mno",
+        "native_llvm.mno",
         "fn main() {\n    print(1 + 1)\n}\n",
     );
-    let wasm = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native_aot.wasm");
+    let exe = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native_llvm_bin");
+    let _ = std::fs::remove_file(&exe);
     let out = machino(&[
         "build",
         "--native",
         "--no-cache",
         path.to_str().unwrap(),
         "-o",
-        wasm.to_str().unwrap(),
+        exe.to_str().unwrap(),
     ]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        wasm.with_extension("cwasm").is_file(),
-        "expected {}.cwasm",
-        wasm.with_extension("").display()
-    );
+    assert!(exe.is_file(), "expected native executable {}", exe.display());
+    let run = Command::new(&exe).output().expect("run native exe");
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "2");
 }
 
 #[test]

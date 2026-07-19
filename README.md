@@ -167,7 +167,7 @@ Full details in [SPEC.md](SPEC.md), the formal grammar in [docs/grammar.ebnf](do
 | `machino check [--json] [--verify]` | typecheck; `--verify` statically proves contracts with Z3 (build with `--features smt`) |
 | `machino test [--json]` | run `test` blocks, including `expects` snapshots |
 | `machino run [--trace]` | interpret; `--trace` streams `{"event":"call",...}` JSON per user function call to stderr |
-| `machino build [-o out.wasm] [--gc] [--native] [--stack-mib N] [--no-cache]` | compile to WebAssembly (content-hash cached); `--gc` → WASM-GC; `--native` → `wasmtime compile` AOT of the linear module |
+| `machino build [-o out] [--gc] [--native] [--stack-mib N] [--no-cache]` | compile to WebAssembly (cached), or `--native` → Clang/LLVM host executable |
 | `machino fmt [--check\|--stdout]` | canonical formatter; refuses any edit that would change the token stream |
 | `machino query file.mno [name]` | machine-readable signatures, generics, contracts of every top-level item |
 | `machino fuzz [--runs N]` | random-input property testing driven by `requires`/`ensures` |
@@ -283,9 +283,9 @@ What 1.3 adds (on top of 1.2):
 - **SMT** — `while cond invariant e { … }`; concat length for strings
 - **Hosts** — Node TCP; DOM last-event x/y/key/button/value; `packages/ws`
 - **DB** — `--features sqlite` embeds rusqlite; CLI fallback otherwise
-- **`--native`** — documented as wasmtime AOT (not LLVM)
+- **`--native`** — Clang/LLVM host executables via `runtime/native` (not wasmtime AOT)
 
-**Remaining bounds:** GC spawn of struct/array graphs; full PCRE/libm; hosted package registry; optional LLVM backend (not in-tree).
+**Remaining bounds:** GC spawn of struct/array graphs; native lambdas/spawn; full PCRE/libm; hosted package registry.
 
 ## License
 

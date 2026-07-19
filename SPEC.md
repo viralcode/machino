@@ -547,9 +547,10 @@ runtime-checked.
 - Embedded SQLite (`cargo build --features sqlite`) uses bundled `rusqlite`
   for the `sqlite` db driver; without the feature the native runtime shells
   out to `sqlite3` on PATH. MySQL/Postgres/Mongo remain CLI-backed.
-- `machino build --native` is **wasmtime AOT** of the linear WASM module
-  (Cranelift), not an LLVM/native-ISA backend. Prefer `machino run` for
-  OS capabilities.
+- `machino build --native` emits C, compiles with **Clang/LLVM** into a
+  host executable linked with `runtime/native/machino_rt.c` (also writes
+  LLVM IR). Lambdas, first-class function values, and spawn/channels are
+  not yet supported on this path — use `machino run` or WASM.
 - Browser hosts have no raw TCP; use WebSockets (`packages/ws`) or HTTP.
   Node `runners/run.mjs` provides TCP via a worker-backed `node:net` host.
 - DOM events expose type/target plus x/y/key/button/value; virtual CSSOM
@@ -562,6 +563,6 @@ runtime-checked.
 - Hosted public registry service (`pkg publish` already speaks the
   protocol; the server itself is out of scope for the toolchain)
 - GC spawn of struct/array argument graphs
-- Optional LLVM/native-ISA backend (not planned in-tree near-term)
+- Native backend: lambdas, closures, spawn/channels, cycle GC
 
 

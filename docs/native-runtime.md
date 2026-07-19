@@ -39,12 +39,12 @@ as in compiled WASM.
 | `machino run` | Native OS access (TCP, files, env) — **this runtime** |
 | `machino build` + `runners/run.mjs` | Portable linear WASM (Node); TCP via `tcp_host.mjs` |
 | `machino build --gc` + `runners/run-gc.mjs` | WASM-GC host (Node 22+); spawn args int/bool/float/str |
-| `machino build --native` | **wasmtime AOT** of the linear `.wasm` (Cranelift `.cwasm`) — not LLVM / native ISA codegen |
+| `machino build --native` | **Clang/LLVM host executable** — emits C, links `runtime/native/machino_rt.c`, produces a real native binary (also writes `.ll` LLVM IR beside the build) |
 
-`--native` still needs a WebAssembly runtime (or custom linker) for host imports
-(`print_*`, `fail`, TCP, …). Prefer `machino run` when you want real OS sockets
-and files without glue. There is no in-tree LLVM backend.
+`machino build --native` requires `clang` on `PATH` (or `MACHINO_CC`). The
+binary includes the host externs (files, TCP, env, …) from the C runtime — no
+WebAssembly host needed. Current limits: no lambdas / first-class function
+values, and no `spawn`/channels yet (use `machino run` or WASM for those).
 
 The WASM import surface mirrors the table above (Node TCP via `tcp_host.mjs`).
-Browsers have no raw TCP — use HTTP or `packages/ws`. A custom host can
-implement any subset of those import names.
+Browsers have no raw TCP — use HTTP or `packages/ws`.
