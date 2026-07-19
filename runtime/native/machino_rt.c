@@ -1503,18 +1503,27 @@ mno_i64 mno_file_exists(mno_i64 path) {
 }
 
 mno_i64 mno_read_line(void) {
-    char *line = NULL;
-    size_t cap = 0;
-    ssize_t n = getline(&line, &cap, stdin);
-    if (n < 0) {
-        free(line);
+    /* Portable line reader (avoids glibc-only getline under -std=c11). */
+    size_t cap = 128;
+    size_t len = 0;
+    char *buf = (char *)mno_xmalloc(cap);
+    int c;
+    while ((c = fgetc(stdin)) != EOF && c != '\n') {
+        if (c == '\r') {
+            continue;
+        }
+        if (len + 1 >= cap) {
+            cap *= 2;
+            buf = (char *)mno_xrealloc(buf, cap);
+        }
+        buf[len++] = (char)c;
+    }
+    if (c == EOF && len == 0) {
+        free(buf);
         return mno_str_from_bytes("", 0);
     }
-    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
-        n--;
-    }
-    mno_i64 out = mno_str_from_bytes(line, (size_t)n);
-    free(line);
+    mno_i64 out = mno_str_from_bytes(buf, len);
+    free(buf);
     return out;
 }
 
