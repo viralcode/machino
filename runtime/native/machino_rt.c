@@ -75,6 +75,82 @@ static void *mno_xrealloc(void *p, size_t n) {
     return q;
 }
 
+/* Registered heap object addresses (so float bit-patterns are never treated as
+ * pointers during opportunistic string/pointer checks). */
+static uintptr_t *g_heap_keys = NULL;
+static size_t g_heap_cap = 0;
+static size_t g_heap_len = 0;
+
+static size_t mno_heap_hash(uintptr_t key) {
+    /* SplitMix64-ish mix; good enough for pointer keys. */
+    key ^= key >> 30;
+    key *= 0xbf58476d1ce4e5b9ULL;
+    key ^= key >> 27;
+    key *= 0x94d049bb133111ebULL;
+    key ^= key >> 31;
+    return (size_t)key;
+}
+
+static void mno_heap_rehash(size_t new_cap) {
+    uintptr_t *next = (uintptr_t *)calloc(new_cap, sizeof(uintptr_t));
+    if (!next) {
+        mno_fail("runtime error: out of memory");
+    }
+    for (size_t i = 0; i < g_heap_cap; i++) {
+        uintptr_t k = g_heap_keys[i];
+        if (k == 0) {
+            continue;
+        }
+        size_t j = mno_heap_hash(k) & (new_cap - 1);
+        while (next[j] != 0) {
+            j = (j + 1) & (new_cap - 1);
+        }
+        next[j] = k;
+    }
+    free(g_heap_keys);
+    g_heap_keys = next;
+    g_heap_cap = new_cap;
+}
+
+static void mno_heap_register(void *p) {
+    if (!p) {
+        return;
+    }
+    if (g_heap_cap == 0) {
+        mno_heap_rehash(64);
+    } else if (g_heap_len * 2 >= g_heap_cap) {
+        mno_heap_rehash(g_heap_cap * 2);
+    }
+    uintptr_t key = (uintptr_t)p;
+    size_t i = mno_heap_hash(key) & (g_heap_cap - 1);
+    while (g_heap_keys[i] != 0) {
+        if (g_heap_keys[i] == key) {
+            return;
+        }
+        i = (i + 1) & (g_heap_cap - 1);
+    }
+    g_heap_keys[i] = key;
+    g_heap_len++;
+}
+
+static int mno_heap_contains(mno_i64 v) {
+    if (v == 0 || g_heap_cap == 0) {
+        return 0;
+    }
+    uintptr_t key = (uintptr_t)(intptr_t)v;
+    size_t i = mno_heap_hash(key) & (g_heap_cap - 1);
+    for (;;) {
+        uintptr_t k = g_heap_keys[i];
+        if (k == 0) {
+            return 0;
+        }
+        if (k == key) {
+            return 1;
+        }
+        i = (i + 1) & (g_heap_cap - 1);
+    }
+}
+
 /* ---- fail / init ---- */
 
 void mno_fail(const char *msg) {
@@ -177,6 +253,7 @@ static mno_i64 mno_str_from_bytes(const void *bytes, size_t len) {
     if (len > 0) {
         memcpy(h + 1, bytes, len);
     }
+    mno_heap_register(h);
     return mno_addr(h);
 }
 
@@ -435,6 +512,7 @@ mno_i64 mno_arr_new(mno_i64 len) {
     for (mno_i64 i = 0; i < len; i++) {
         slots[i] = 0;
     }
+    mno_heap_register(h);
     return mno_addr(h);
 }
 
@@ -473,6 +551,7 @@ mno_i64 mno_arr_push(mno_i64 a, mno_i64 v) {
         dst[i] = src[i];
     }
     dst[len] = v;
+    mno_heap_register(nh);
     return mno_addr(nh);
 }
 
@@ -497,6 +576,7 @@ mno_i64 mno_struct_new(mno_i64 nfields) {
     h->meta = mno_meta(TAG_STRUCT, nfields);
     h->word1 = 0;
     memset(mno_struct_fields(h), 0, (size_t)nfields * sizeof(mno_i64));
+    mno_heap_register(h);
     return mno_addr(h);
 }
 
@@ -546,6 +626,7 @@ mno_i64 mno_enum_new(mno_i64 tag, mno_i64 npayloads) {
     h->hdr.word1 = 0;
     h->tag = tag;
     memset(mno_enum_payloads(h), 0, (size_t)npayloads * sizeof(mno_i64));
+    mno_heap_register(h);
     return mno_addr(h);
 }
 
@@ -612,6 +693,7 @@ mno_i64 mno_closure_new(void *fn, mno_i64 ncaptures) {
     for (mno_i64 i = 1; i < nslots; i++) {
         slots[i] = 0;
     }
+    mno_heap_register(h);
     return mno_addr(h);
 }
 
@@ -635,11 +717,7 @@ void *mno_closure_fn(mno_i64 c) {
 /* ---- value clone ---- */
 
 static int mno_is_str(mno_i64 v) {
-    if (v == 0) {
-        return 0;
-    }
-    if ((uintptr_t)(intptr_t)v < 16 ||
-        (uintptr_t)(intptr_t)v % _Alignof(MnoHeader) != 0) {
+    if (!mno_heap_contains(v)) {
         return 0;
     }
     MnoHeader *h = (MnoHeader *)(intptr_t)v;
@@ -738,20 +816,23 @@ static MnoTaskSlot *mno_task_slot(mno_i64 h, const char *op) {
     return &g_tasks[h];
 }
 
-static mno_i64 *mno_task_argv_copy(mno_i64 *argv, mno_i64 argc) {
+static mno_i64 *mno_task_argv_copy(
+    mno_i64 *argv,
+    mno_i64 argc,
+    const char *arg_kinds
+) {
     if (argc < 0) {
         mno_fail("runtime error: negative task argc");
     }
     if (argc == 0) {
         return NULL;
     }
+    if (!argv || !arg_kinds) {
+        mno_fail("runtime error: missing task argv/kinds");
+    }
     mno_i64 *copy = (mno_i64 *)mno_xmalloc((size_t)argc * sizeof(mno_i64));
     for (mno_i64 i = 0; i < argc; i++) {
-        mno_i64 v = argv[i];
-        if (mno_is_str(v)) {
-            v = mno_str_clone(v);
-        }
-        copy[i] = v;
+        copy[i] = mno_value_clone(argv[i], arg_kinds[i]);
     }
     return copy;
 }
@@ -764,19 +845,28 @@ static void *mno_task_entry(void *arg) {
     return NULL;
 }
 
-mno_i64 mno_task_spawn(mno_task_fn fn, mno_i64 *argv, mno_i64 argc, char ret_kind) {
+mno_i64 mno_task_spawn(
+    mno_task_fn fn,
+    mno_i64 *argv,
+    mno_i64 argc,
+    char ret_kind,
+    const char *arg_kinds
+) {
     if (!fn) {
         mno_fail("runtime error: null task function pointer");
     }
     if (ret_kind != 'i' && ret_kind != 'b' && ret_kind != 'f' && ret_kind != 's') {
         mno_fail("runtime error: invalid task return kind");
     }
+    if (argc > 0 && !arg_kinds) {
+        mno_fail("runtime error: missing task arg kinds");
+    }
     mno_i64 h = mno_task_alloc();
     MnoTaskSlot *slot = &g_tasks[h];
     slot->fn = fn;
     slot->argc = argc;
     slot->ret_kind = ret_kind;
-    slot->argv = mno_task_argv_copy(argv, argc);
+    slot->argv = mno_task_argv_copy(argv, argc, arg_kinds);
     slot->spawn_ok = (pthread_create(&slot->thread, NULL, mno_task_entry, slot) == 0);
     if (!slot->spawn_ok) {
         free(slot->argv);

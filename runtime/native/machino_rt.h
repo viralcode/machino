@@ -100,9 +100,16 @@ void *mno_closure_fn(mno_i64 c);
 /* Deep copy for concurrency (kind: 'i'/'b' identity, 'f' bits, 's' string, 'p' pointer). */
 mno_i64 mno_value_clone(mno_i64 v, char kind);
 
-/* Tasks (pthreads). ret_kind: 'i', 'b', 'f', 's'. */
+/* Tasks (pthreads). ret_kind / arg_kinds: 'i','b','f','s','p'.
+ * arg_kinds may be NULL when argc==0; otherwise it is a string of length argc. */
 typedef mno_i64 (*mno_task_fn)(mno_i64 *argv);
-mno_i64 mno_task_spawn(mno_task_fn fn, mno_i64 *argv, mno_i64 argc, char ret_kind);
+mno_i64 mno_task_spawn(
+    mno_task_fn fn,
+    mno_i64 *argv,
+    mno_i64 argc,
+    char ret_kind,
+    const char *arg_kinds
+);
 mno_i64 mno_task_join_i64(mno_i64 h);
 mno_f64 mno_task_join_f64(mno_i64 h);
 mno_i64 mno_task_join_str(mno_i64 h);

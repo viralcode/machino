@@ -29,9 +29,12 @@ USAGE:
   machino check <file.mno> [--json] [--verify]   type-check; --verify proves contracts with Z3
   machino test  <file.mno> [--json]              run test blocks (contracts enforced)
   machino run   <file.mno> [args...] [--trace]   run fn main(); --trace emits JSON call events
-  machino build <file.mno> [-o out.wasm]         compile to a portable .wasm module
+  machino build <file.mno> [-o out]              compile to .wasm or native exe
                 [--gc] [--native] [--stack-mib N] [--no-cache]
-                # --native: Clang/LLVM → host executable (not wasmtime AOT)
+                [--target TRIPLE] [--universal]
+                # --native: Clang/LLVM host exe (-O3 -flto -pthread)
+                # --target: cross-compile triple (with --native)
+                # --universal: macOS arm64+x86_64 lipo (with --native)
   machino query <file.mno>                       JSON signatures of every top-level item
   machino fmt   <file.mno> [--check]             canonical formatter
   machino fuzz  <file.mno> [--runs N] [--seed S] contract-driven property testing
@@ -621,6 +624,12 @@ fn cmd_build(rest: &[String]) -> ExitCode {
     let use_gc = rest.iter().any(|a| a == "--gc");
     let use_native = rest.iter().any(|a| a == "--native");
     let no_cache = rest.iter().any(|a| a == "--no-cache");
+    let use_universal = rest.iter().any(|a| a == "--universal");
+    let native_target = rest
+        .iter()
+        .position(|a| a == "--target")
+        .and_then(|i| rest.get(i + 1))
+        .cloned();
     let stack_mib: u32 = rest
         .iter()
         .position(|a| a == "--stack-mib")
@@ -629,6 +638,14 @@ fn cmd_build(rest: &[String]) -> ExitCode {
         .unwrap_or(16);
     if use_gc && use_native {
         eprintln!("error: --native applies to the linear WASM backend; omit --gc");
+        return ExitCode::from(2);
+    }
+    if (use_universal || native_target.is_some()) && !use_native {
+        eprintln!("error: --target / --universal require --native");
+        return ExitCode::from(2);
+    }
+    if use_universal && native_target.is_some() {
+        eprintln!("error: use either --universal or --target, not both");
         return ExitCode::from(2);
     }
     // drop flag-value pairs so the positional file argument is found correctly
@@ -640,11 +657,11 @@ fn cmd_build(rest: &[String]) -> ExitCode {
                 skip = false;
                 continue;
             }
-            if a == "-o" || a == "--stack-mib" {
+            if a == "-o" || a == "--stack-mib" || a == "--target" {
                 skip = true;
                 continue;
             }
-            if a == "--gc" || a == "--native" || a == "--no-cache" {
+            if a == "--gc" || a == "--native" || a == "--no-cache" || a == "--universal" {
                 continue;
             }
             out.push(a.clone());
@@ -698,7 +715,16 @@ fn cmd_build(rest: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
         let exe = std::path::PathBuf::from(&out_path);
-        return match native::compile_native(&loaded.program, &exe) {
+        let result = if use_universal {
+            native::compile_native_universal(&loaded.program, &exe)
+        } else {
+            native::compile_native(
+                &loaded.program,
+                &exe,
+                native_target.as_deref(),
+            )
+        };
+        return match result {
             Ok(built) => {
                 println!(
                     "wrote {} (native executable via Clang/LLVM)",
@@ -707,6 +733,12 @@ fn cmd_build(rest: &[String]) -> ExitCode {
                 println!("  C source:  {}", built.c_path.display());
                 if let Some(ll) = built.ll_path {
                     println!("  LLVM IR:   {}", ll.display());
+                }
+                if let Some(t) = &native_target {
+                    println!("  target:    {}", t);
+                }
+                if use_universal {
+                    println!("  universal: arm64 + x86_64 (mach-o lipo)");
                 }
                 println!("run:  {}", built.exe_path.display());
                 ExitCode::SUCCESS

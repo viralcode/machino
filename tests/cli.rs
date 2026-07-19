@@ -1124,6 +1124,144 @@ fn build_native_llvm_smoke() {
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "2");
 }
 
+fn native_build_run(src: &str, bin: &str) -> (bool, String, String) {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let path = dir.join(src);
+    let exe = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(bin);
+    let _ = std::fs::remove_file(&exe);
+    let out = machino(&[
+        "build",
+        "--native",
+        "--no-cache",
+        path.to_str().unwrap(),
+        "-o",
+        exe.to_str().unwrap(),
+    ]);
+    if !out.status.success() {
+        return (
+            false,
+            String::new(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        );
+    }
+    let run = Command::new(&exe).output().expect("run");
+    (
+        run.status.success(),
+        String::from_utf8_lossy(&run.stdout).to_string(),
+        String::from_utf8_lossy(&run.stderr).to_string(),
+    )
+}
+
+#[test]
+fn build_native_closures_spawn_channels() {
+    if Command::new("clang").arg("--version").output().is_err() {
+        return;
+    }
+    let (ok, stdout, err) = native_build_run("test/ex_036_closure_capture.mno", "nat_clos");
+    assert!(ok, "closure: {err}");
+    assert_eq!(stdout.trim(), "15");
+
+    let (ok, stdout, err) = native_build_run("test/ex_081_spawn_join.mno", "nat_spawn");
+    assert!(ok, "spawn: {err}");
+    assert_eq!(stdout.trim(), "144");
+
+    let (ok, stdout, err) = native_build_run("test/ex_082_channels.mno", "nat_chan");
+    assert!(ok, "chan: {err}");
+    assert_eq!(stdout.replace('\r', "").trim(), "11\n22");
+
+    let (ok, stdout, err) = native_build_run("test/ex_034_map_hof.mno", "nat_map");
+    assert!(ok, "hof map: {err}");
+    assert_eq!(stdout.trim(), "6");
+
+    // Float/str spawn must not treat IEEE bits as heap pointers.
+    let (ok, stdout, err) = native_build_run("test/ex_104_gc_spawn_types.mno", "nat_gsp");
+    assert!(ok, "float spawn: {err}");
+    assert_eq!(stdout.trim(), "3.5");
+}
+
+#[test]
+fn build_native_universal_macos() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    if Command::new("clang").arg("--version").output().is_err() {
+        return;
+    }
+    if Command::new("lipo").arg("-info").arg("/usr/bin/true").output().is_err() {
+        return;
+    }
+    let path = write_temp("native_univ.mno", "fn main() {\n    print(42)\n}\n");
+    let exe = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native_univ_bin");
+    let _ = std::fs::remove_file(&exe);
+    let out = machino(&[
+        "build",
+        "--native",
+        "--universal",
+        "--no-cache",
+        path.to_str().unwrap(),
+        "-o",
+        exe.to_str().unwrap(),
+    ]);
+    if !out.status.success() {
+        // Cross slice may be unavailable without full Xcode SDK support.
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("E080") || err.contains("x86_64") || err.contains("lipo"),
+            "unexpected universal failure: {err}"
+        );
+        return;
+    }
+    let lipo = Command::new("lipo")
+        .args(["-archs", exe.to_str().unwrap()])
+        .output()
+        .expect("lipo -archs");
+    let archs = String::from_utf8_lossy(&lipo.stdout);
+    assert!(
+        archs.contains("arm64") && archs.contains("x86_64"),
+        "expected universal arches, got {archs}"
+    );
+    let run = Command::new(&exe).output().expect("run universal");
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
+}
+
+#[test]
+fn build_native_target_host_triple() {
+    if Command::new("clang").arg("--version").output().is_err() {
+        return;
+    }
+    let path = write_temp("native_tgt.mno", "fn main() {\n    print(9)\n}\n");
+    let exe = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native_tgt_bin");
+    let _ = std::fs::remove_file(&exe);
+    // Use the compiler's default target via an explicit empty skip — pass
+    // a known-good apple/linux host triple from `clang -dumpmachine`.
+    let dump = Command::new("clang")
+        .arg("-dumpmachine")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string());
+    let Some(triple) = dump else { return };
+    let out = machino(&[
+        "build",
+        "--native",
+        "--no-cache",
+        "--target",
+        &triple,
+        path.to_str().unwrap(),
+        "-o",
+        exe.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = Command::new(&exe).output().expect("run");
+    assert!(run.status.success());
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "9");
+}
+
 #[test]
 fn build_rejects_lambda_spawn_target() {
     let path = write_temp(

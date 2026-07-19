@@ -6,7 +6,7 @@
 
 use crate::ast::*;
 use crate::diag::{Diagnostic, Span};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,6 +27,58 @@ fn c_ident(name: &str) -> String {
         }
     }
     out
+}
+
+fn ret_kind(ty: &Type) -> char {
+    match ty {
+        Type::Int | Type::Bool => 'i',
+        Type::Float => 'f',
+        Type::Str => 's',
+        _ => 'i',
+    }
+}
+
+/// Kind tag for `mno_value_clone` / spawn argv deep-copy.
+fn value_kind(ty: &Type) -> char {
+    match ty {
+        Type::Int | Type::Bool => 'i',
+        Type::Float => 'f',
+        Type::Str => 's',
+        Type::Array(_)
+        | Type::Struct(_)
+        | Type::Enum(_)
+        | Type::App(_, _)
+        | Type::Fn(_, _) => 'p',
+        Type::Unit | Type::TypeVar(_) => 'i',
+    }
+}
+
+fn closure_fn_ptr_type(n_params: usize) -> String {
+    let mut s = String::from("mno_i64 (*)(");
+    for i in 0..=n_params {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str("mno_i64");
+    }
+    s.push(')');
+    s
+}
+
+fn i64_from_typed(name: &str, ty: &Type) -> String {
+    if *ty == Type::Float {
+        format!("mno_f64_to_bits({})", name)
+    } else {
+        name.to_string()
+    }
+}
+
+fn typed_from_i64(name: &str, ty: &Type) -> String {
+    if *ty == Type::Float {
+        format!("mno_bits_to_f64({})", name)
+    } else {
+        name.to_string()
+    }
 }
 
 fn escape_c_string(s: &str) -> String {
@@ -60,6 +112,18 @@ struct Emitter<'a> {
     label_n: usize,
     /// When set, `Var(name)` reads from these C identifiers (ensures shadows).
     ensures_alias: HashMap<String, String>,
+    /// Forward declarations for lambdas, wrappers, and spawn entries.
+    aux_fwd: String,
+    /// Lambda/wrapper/spawn C emitted before user functions.
+    aux_code: String,
+    lambdas: BTreeMap<usize, Lambda>,
+    lambda_captures: HashMap<usize, Vec<(String, Type)>>,
+    fn_value_names: Vec<String>,
+    spawn_targets: HashSet<String>,
+    wrapped_fns: HashSet<String>,
+    spawn_entries: HashSet<String>,
+    /// When emitting a lambda body, convert returns to i64 ABI.
+    in_lambda: bool,
 }
 
 impl<'a> Emitter<'a> {
@@ -99,7 +163,261 @@ impl<'a> Emitter<'a> {
             loop_labels: Vec::new(),
             label_n: 0,
             ensures_alias: HashMap::new(),
+            aux_fwd: String::new(),
+            aux_code: String::new(),
+            lambdas: BTreeMap::new(),
+            lambda_captures: HashMap::new(),
+            fn_value_names: Vec::new(),
+            spawn_targets: HashSet::new(),
+            wrapped_fns: HashSet::new(),
+            spawn_entries: HashSet::new(),
+            in_lambda: false,
         }
+    }
+
+    fn prepare(&mut self, reachable: &HashSet<String>) -> Result<(), Diagnostic> {
+        for f in &self.program.functions {
+            if f.is_extern || !f.type_params.is_empty() || !reachable.contains(&f.name) {
+                continue;
+            }
+            collect_lambdas_stmts(&f.body, &mut self.lambdas);
+            for c in f.requires.iter().chain(f.ensures.iter()) {
+                collect_lambdas_expr(&c.expr, &mut self.lambdas);
+            }
+            collect_fn_value_names_stmts(&f.body, &mut self.fn_value_names);
+            for c in f.requires.iter().chain(f.ensures.iter()) {
+                let wrapper = [Stmt {
+                    kind: StmtKind::Expr(c.expr.clone()),
+                    span: c.expr.span,
+                }];
+                collect_fn_value_names_stmts(&wrapper, &mut self.fn_value_names);
+            }
+            collect_spawn_targets_stmts(&f.body, &mut self.spawn_targets);
+            for c in f.requires.iter().chain(f.ensures.iter()) {
+                collect_spawn_targets_expr(&c.expr, &mut self.spawn_targets);
+            }
+        }
+        self.fn_value_names
+            .retain(|n| self.signatures.contains_key(n.as_str()));
+        self.fn_value_names.sort();
+        self.fn_value_names.dedup();
+        self.spawn_targets
+            .retain(|n| self.signatures.contains_key(n.as_str()));
+
+        for f in &self.program.functions {
+            if f.is_extern || !f.type_params.is_empty() || !reachable.contains(&f.name) {
+                continue;
+            }
+            let mut env = vec![HashMap::new()];
+            for p in &f.params {
+                env.last_mut().unwrap().insert(p.name.clone(), p.ty.clone());
+            }
+            analyze_lambda_captures_stmts(
+                &f.body,
+                &mut env,
+                &self.signatures,
+                &mut self.lambda_captures,
+            );
+            for c in f.requires.iter().chain(f.ensures.iter()) {
+                analyze_lambda_captures_expr(
+                    &c.expr,
+                    &mut env,
+                    &self.signatures,
+                    &mut self.lambda_captures,
+                );
+            }
+        }
+
+        for id in self.lambdas.keys().copied().collect::<Vec<_>>() {
+            self.emit_lambda_function(id)?;
+        }
+        for name in self.fn_value_names.clone() {
+            self.ensure_wrapper(&name)?;
+        }
+        for name in self.spawn_targets.clone().into_iter().collect::<Vec<_>>() {
+            self.ensure_spawn_entry(&name)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_wrapper(&mut self, name: &str) -> Result<(), Diagnostic> {
+        if !self.wrapped_fns.insert(name.to_string()) {
+            return Ok(());
+        }
+        let (params, ret) = self.signatures[name].clone();
+        let wrap = format!("mno_wrap_{}", c_ident(name));
+        let _ = writeln!(self.aux_fwd, "static mno_i64 {}({});", wrap, self.closure_params(params.len()));
+        let mut body = String::new();
+        let _ = writeln!(body, "static mno_i64 {}({}) {{", wrap, self.closure_params(params.len()));
+        let _ = writeln!(body, "  (void)__env;");
+        let mut arg_calls = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            let arg = format!("__a{}", i);
+            arg_calls.push(typed_from_i64(&arg, p));
+        }
+        let call = format!("{}({})", c_ident(name), arg_calls.join(", "));
+        if ret == Type::Unit {
+            let _ = writeln!(body, "  {};", call);
+            let _ = writeln!(body, "  return 0LL;");
+        } else if ret == Type::Float {
+            let _ = writeln!(body, "  return mno_f64_to_bits({});", call);
+        } else {
+            let _ = writeln!(body, "  return {};", call);
+        }
+        let _ = writeln!(body, "}}");
+        self.aux_code.push_str(&body);
+        self.aux_code.push('\n');
+        Ok(())
+    }
+
+    fn ensure_spawn_entry(&mut self, name: &str) -> Result<(), Diagnostic> {
+        if !self.spawn_entries.insert(name.to_string()) {
+            return Ok(());
+        }
+        let entry = format!("__spawn_{}", c_ident(name));
+        let (params, ret) = self.signatures[name].clone();
+        let _ = writeln!(
+            self.aux_fwd,
+            "static mno_i64 {}(mno_i64 *argv);",
+            entry
+        );
+        let mut body = String::new();
+        let _ = writeln!(body, "static mno_i64 {}(mno_i64 *argv) {{", entry);
+        let mut arg_calls = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            let raw = format!("argv[{}]", i);
+            arg_calls.push(typed_from_i64(&raw, p));
+        }
+        let call = format!("{}({})", c_ident(name), arg_calls.join(", "));
+        if ret == Type::Unit {
+            let _ = writeln!(body, "  {};", call);
+            let _ = writeln!(body, "  return 0LL;");
+        } else if ret == Type::Float {
+            let _ = writeln!(body, "  return mno_f64_to_bits({});", call);
+        } else {
+            let _ = writeln!(body, "  return {};", call);
+        }
+        let _ = writeln!(body, "}}");
+        self.aux_code.push_str(&body);
+        self.aux_code.push('\n');
+        Ok(())
+    }
+
+    fn closure_params(&self, n_params: usize) -> String {
+        let mut s = String::new();
+        for i in 0..n_params {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            let _ = write!(s, "mno_i64 __a{}", i);
+        }
+        if n_params > 0 {
+            s.push_str(", ");
+        }
+        s.push_str("mno_i64 __env");
+        s
+    }
+
+    fn emit_lambda_function(&mut self, id: usize) -> Result<(), Diagnostic> {
+        let l = self.lambdas[&id].clone();
+        let captures = self.lambda_captures.get(&id).cloned().unwrap_or_default();
+        let lam = format!("mno_lam_{}", id);
+        let n_params = l.params.len();
+        let _ = writeln!(
+            self.aux_fwd,
+            "static mno_i64 {}({});",
+            lam,
+            self.closure_params(n_params)
+        );
+
+        let mut body = String::new();
+        let _ = writeln!(body, "static mno_i64 {}({}) {{", lam, self.closure_params(n_params));
+
+        self.locals = vec![HashMap::new()];
+        for (i, p) in l.params.iter().enumerate() {
+            let raw = format!("__a{}", i);
+            self.bind(&p.name, p.ty.clone());
+            if p.ty == Type::Float {
+                let _ = writeln!(
+                    body,
+                    "  mno_f64 {} = mno_bits_to_f64({});",
+                    c_ident(&p.name),
+                    raw
+                );
+            } else {
+                let _ = writeln!(body, "  mno_i64 {} = {};", c_ident(&p.name), raw);
+            }
+        }
+        for (i, (name, ty)) in captures.iter().enumerate() {
+            let cap = self.fresh("cap");
+            let _ = writeln!(
+                body,
+                "  mno_i64 {} = mno_closure_get(__env, {}LL);",
+                cap, i
+            );
+            if *ty == Type::Float {
+                let _ = writeln!(
+                    body,
+                    "  mno_f64 {} = mno_bits_to_f64({});",
+                    c_ident(name),
+                    cap
+                );
+            } else {
+                let _ = writeln!(body, "  mno_i64 {} = {};", c_ident(name), cap);
+            }
+            self.bind(name, ty.clone());
+        }
+
+        let saved_out = std::mem::take(&mut self.out);
+        self.in_lambda = true;
+        let result_tmp = if l.ret != Type::Unit {
+            Some(self.fresh("lam_ret"))
+        } else {
+            None
+        };
+        if let Some(ref r) = result_tmp {
+            if l.ret == Type::Float {
+                let _ = writeln!(body, "  mno_f64 {} = 0;", r);
+            } else {
+                let _ = writeln!(body, "  mno_i64 {} = 0;", r);
+            }
+        }
+        let exit_lbl = self.fresh_label("lam_exit");
+        self.emit_block(&l.body, result_tmp.as_deref(), &l.ret, &exit_lbl)?;
+        let emitted = std::mem::take(&mut self.out);
+        self.out = saved_out;
+        self.in_lambda = false;
+
+        body.push_str(&emitted);
+        let _ = writeln!(body, "  {}:;", exit_lbl);
+        if let Some(r) = result_tmp {
+            if l.ret == Type::Float {
+                let _ = writeln!(body, "  return mno_f64_to_bits({});", r);
+            } else if l.ret == Type::Unit {
+                let _ = writeln!(body, "  return 0LL;");
+            } else {
+                let _ = writeln!(body, "  return {};", r);
+            }
+        } else {
+            let _ = writeln!(body, "  return 0LL;");
+        }
+        let _ = writeln!(body, "}}");
+        self.aux_code.push_str(&body);
+        self.aux_code.push('\n');
+        Ok(())
+    }
+
+    fn emit_fn_value(&mut self, name: &str, span: Span) -> Result<String, Diagnostic> {
+        self.ensure_wrapper(name)?;
+        let t = self.fresh("clos");
+        let wrap = format!("mno_wrap_{}", c_ident(name));
+        let _ = writeln!(
+            self.out,
+            "  mno_i64 {} = mno_closure_new((void *)&{}, 0LL);",
+            t, wrap
+        );
+        let _ = span;
+        Ok(t)
     }
 
     fn fresh(&mut self, prefix: &str) -> String {
@@ -139,6 +457,7 @@ impl<'a> Emitter<'a> {
         self.out.push_str("#include <stdint.h>\n\n");
 
         let reachable = reachable_from_main(self.program);
+        self.prepare(&reachable)?;
 
         // Forward declarations
         for f in &self.program.functions {
@@ -170,7 +489,14 @@ impl<'a> Emitter<'a> {
             }
             let _ = writeln!(self.out, "{} {}({});", ret, name, params);
         }
+        if !self.aux_fwd.is_empty() {
+            self.out.push_str(&self.aux_fwd);
+        }
         self.out.push('\n');
+        if !self.aux_code.is_empty() {
+            self.out.push_str(&self.aux_code);
+            self.out.push('\n');
+        }
 
         let fns: Vec<&Function> = self
             .program
@@ -335,7 +661,9 @@ impl<'a> Emitter<'a> {
                 let inferred = ty.clone().unwrap_or_else(|| self.type_of(value));
                 let v = self.emit_expr(value, Some(&inferred))?;
                 let cname = c_ident(name);
-                let pt = if inferred == Type::Float {
+                let pt = if matches!(inferred, Type::Fn(_, _)) {
+                    "mno_i64"
+                } else if inferred == Type::Float {
                     "mno_f64"
                 } else {
                     "mno_i64"
@@ -519,6 +847,9 @@ impl<'a> Emitter<'a> {
                     return Ok(alias.clone());
                 }
                 if let Some(ty) = self.lookup_ty(name) {
+                    if matches!(ty, Type::Fn(_, _)) {
+                        return Ok(c_ident(name));
+                    }
                     let _ = ty;
                     return Ok(c_ident(name));
                 }
@@ -540,12 +871,8 @@ impl<'a> Emitter<'a> {
                         return Ok(t);
                     }
                 }
-                // function value — not supported as first-class yet
                 if self.signatures.contains_key(name.as_str()) {
-                    return Err(e_native(
-                        "native backend: first-class function values are not yet supported; call the function directly",
-                        expr.span,
-                    ));
+                    return self.emit_fn_value(name, expr.span);
                 }
                 Err(e_native(
                     &format!("unknown variable '{}'", name),
@@ -660,10 +987,34 @@ impl<'a> Emitter<'a> {
             }
             ExprKind::Bin(op, lhs, rhs) => self.emit_bin(*op, lhs, rhs, expr.span),
             ExprKind::Call(name, _ta, args) => self.emit_call(name, args, expected, expr.span),
-            ExprKind::Lambda(_) => Err(e_native(
-                "native backend: lambdas are not yet supported; use a named top-level function",
-                expr.span,
-            )),
+            ExprKind::Lambda(l) => {
+                let captures = self
+                    .lambda_captures
+                    .get(&l.id)
+                    .cloned()
+                    .unwrap_or_default();
+                let lam = format!("mno_lam_{}", l.id);
+                let t = self.fresh("clos");
+                let _ = writeln!(
+                    self.out,
+                    "  mno_i64 {} = mno_closure_new((void *)&{}, {}LL);",
+                    t,
+                    lam,
+                    captures.len()
+                );
+                for (i, (cap_name, cap_ty)) in captures.iter().enumerate() {
+                    let v = self.emit_expr(
+                        &Expr {
+                            kind: ExprKind::Var(cap_name.clone()),
+                            span: expr.span,
+                        },
+                        Some(cap_ty),
+                    )?;
+                    let bits = i64_from_typed(&v, cap_ty);
+                    let _ = writeln!(self.out, "  mno_closure_set({}, {}LL, {});", t, i, bits);
+                }
+                Ok(t)
+            }
             ExprKind::Match(m) => self.emit_match(m, expected, expr.span),
         }
     }
@@ -812,9 +1163,48 @@ impl<'a> Emitter<'a> {
         &mut self,
         name: &str,
         args: &[Expr],
-        _expected: Option<&Type>,
+        expected: Option<&Type>,
         span: Span,
     ) -> Result<String, Diagnostic> {
+        // Indirect call through a local function value.
+        if let Some(Type::Fn(params, ret)) = self.lookup_ty(name) {
+            let clos = c_ident(name);
+            let mut i64_args = Vec::new();
+            for (a, p) in args.iter().zip(params.iter()) {
+                let v = self.emit_expr(a, Some(p))?;
+                i64_args.push(i64_from_typed(&v, p));
+            }
+            let cast = closure_fn_ptr_type(params.len());
+            let mut call_args = i64_args.join(", ");
+            if !call_args.is_empty() {
+                call_args.push_str(", ");
+            }
+            call_args.push_str(&clos);
+            let t = self.fresh("icall");
+            if *ret == Type::Float {
+                let raw = self.fresh("icall_raw");
+                let _ = writeln!(
+                    self.out,
+                    "  mno_i64 {} = (({})mno_closure_fn({}))({});",
+                    raw, cast, clos, call_args
+                );
+                let _ = writeln!(
+                    self.out,
+                    "  mno_f64 {} = mno_bits_to_f64({});",
+                    t, raw
+                );
+            } else {
+                let pt = "mno_i64";
+                let _ = writeln!(
+                    self.out,
+                    "  {} {} = (({})mno_closure_fn({}))({});",
+                    pt, t, cast, clos, call_args
+                );
+            }
+            let _ = expected;
+            return Ok(t);
+        }
+
         // Host / builtin surface
         match name {
             "print" => {
@@ -969,14 +1359,120 @@ impl<'a> Emitter<'a> {
                 }
                 return Ok(t);
             }
-            "spawn" | "join_int" | "join_float" | "join_bool" | "join_str" | "chan_new"
-            | "chan_close" | "chan_send_int" | "chan_send_bool" | "chan_send_float"
-            | "chan_send_str" | "chan_recv_int" | "chan_recv_bool" | "chan_recv_float"
-            | "chan_recv_str" => {
-                return Err(e_native(
-                    "native backend: spawn/channels are not yet supported; use machino run or WASM",
-                    span,
-                ));
+            "spawn" => {
+                let ExprKind::Var(target) = &args[0].kind else {
+                    return Err(e_native("spawn of a non-named function", span));
+                };
+                let (params, ret) = self
+                    .signatures
+                    .get(target.as_str())
+                    .cloned()
+                    .ok_or_else(|| e_native(&format!("unknown spawn target '{}'", target), span))?;
+                self.ensure_spawn_entry(target)?;
+                let n = params.len();
+                // Emit argument expressions first (they may introduce statements),
+                // then pack them into the argv array.
+                let mut arg_words = Vec::new();
+                for (a, p) in args[1..].iter().zip(params.iter()) {
+                    let v = self.emit_expr(a, Some(p))?;
+                    arg_words.push(i64_from_typed(&v, p));
+                }
+                let argv = self.fresh("spawn_argv");
+                if n > 0 {
+                    let _ = writeln!(self.out, "  mno_i64 {}[{}] = {{", argv, n);
+                    for w in &arg_words {
+                        let _ = writeln!(self.out, "    {},", w);
+                    }
+                    let _ = writeln!(self.out, "  }};");
+                } else {
+                    let _ = writeln!(self.out, "  mno_i64 *{} = NULL;", argv);
+                }
+                let entry = format!("__spawn_{}", c_ident(target));
+                let t = self.fresh("spawn");
+                let rk = ret_kind(&ret);
+                let kinds = params.iter().map(value_kind).collect::<String>();
+                let kinds_lit = if n == 0 {
+                    "NULL".to_string()
+                } else {
+                    let k = self.fresh("spawn_kinds");
+                    let _ = writeln!(
+                        self.out,
+                        "  static const char {}[] = {};",
+                        k,
+                        escape_c_string(&kinds)
+                    );
+                    k
+                };
+                let _ = writeln!(
+                    self.out,
+                    "  mno_i64 {} = mno_task_spawn(&{}, {}, {}LL, '{}', {});",
+                    t, entry, argv, n, rk, kinds_lit
+                );
+                return Ok(t);
+            }
+            "join_int" | "join_bool" => {
+                let h = self.emit_expr(&args[0], Some(&Type::Int))?;
+                let t = self.fresh("join");
+                let _ = writeln!(self.out, "  mno_i64 {} = mno_task_join_i64({});", t, h);
+                return Ok(t);
+            }
+            "join_float" => {
+                let h = self.emit_expr(&args[0], Some(&Type::Int))?;
+                let t = self.fresh("join");
+                let _ = writeln!(self.out, "  mno_f64 {} = mno_task_join_f64({});", t, h);
+                return Ok(t);
+            }
+            "join_str" => {
+                let h = self.emit_expr(&args[0], Some(&Type::Int))?;
+                let t = self.fresh("join");
+                let _ = writeln!(self.out, "  mno_i64 {} = mno_task_join_str({});", t, h);
+                return Ok(t);
+            }
+            "chan_new" => {
+                let t = self.fresh("chan");
+                let _ = writeln!(self.out, "  mno_i64 {} = mno_chan_new();", t);
+                return Ok(t);
+            }
+            "chan_close" => {
+                let ch = self.emit_expr(&args[0], Some(&Type::Int))?;
+                let _ = writeln!(self.out, "  mno_chan_close({});", ch);
+                return Ok("0LL".into());
+            }
+            "chan_send_int" | "chan_send_bool" => {
+                let ch = self.emit_expr(&args[0], Some(&Type::Int))?;
+                let v = self.emit_expr(&args[1], Some(&Type::Int))?;
+                let _ = writeln!(self.out, "  mno_chan_send_i64({}, {});", ch, v);
+                return Ok("0LL".into());
+            }
+            "chan_send_float" => {
+                let ch = self.emit_expr(&args[0], Some(&Type::Int))?;
+                let v = self.emit_expr(&args[1], Some(&Type::Float))?;
+                let _ = writeln!(self.out, "  mno_chan_send_f64({}, {});", ch, v);
+                return Ok("0LL".into());
+            }
+            "chan_send_str" => {
+                let ch = self.emit_expr(&args[0], Some(&Type::Int))?;
+                let v = self.emit_expr(&args[1], Some(&Type::Str))?;
+                let _ = writeln!(self.out, "  mno_chan_send_str({}, {});", ch, v);
+                return Ok("0LL".into());
+            }
+            "chan_recv_int" | "chan_recv_bool" => {
+                let ch = self.emit_expr(&args[0], Some(&Type::Int))?;
+                let t = self.fresh("recv");
+                let _ = writeln!(self.out, "  mno_i64 {} = mno_chan_recv_i64({});", t, ch);
+                return Ok(t);
+            }
+            "chan_recv_float" => {
+                let ch = self.emit_expr(&args[0], Some(&Type::Int))?;
+                let t = self.fresh("recv");
+                let _ = writeln!(self.out, "  mno_f64 {} = mno_chan_recv_f64({});", t, ch);
+                return Ok(t);
+            }
+            "chan_recv_str" => {
+                let ch = self.emit_expr(&args[0], Some(&Type::Int))?;
+                let t = self.fresh("recv");
+                let _ = writeln!(self.out, "  mno_i64 {} = mno_chan_recv_str({});", t, ch);
+                return Ok(t);
             }
             _ => {}
         }
@@ -1424,6 +1920,26 @@ impl<'a> Emitter<'a> {
                 if name == "to_float" {
                     return Type::Float;
                 }
+                if matches!(
+                    name.as_str(),
+                    "spawn" | "join_int" | "join_bool" | "chan_new" | "chan_recv_int"
+                        | "chan_recv_bool"
+                ) {
+                    return Type::Int;
+                }
+                if name == "join_float" || name == "chan_recv_float" {
+                    return Type::Float;
+                }
+                if name == "join_str" || name == "chan_recv_str" {
+                    return Type::Str;
+                }
+                if matches!(
+                    name.as_str(),
+                    "chan_close" | "chan_send_int" | "chan_send_bool" | "chan_send_float"
+                        | "chan_send_str" | "print"
+                ) {
+                    return Type::Unit;
+                }
                 if name == "push" {
                     return self.type_of(&args[0]);
                 }
@@ -1498,7 +2014,11 @@ fn runtime_dir() -> PathBuf {
 }
 
 /// Compile a monomorphized program to a native executable via Clang/LLVM.
-pub fn compile_native(program: &Program, out_exe: &Path) -> Result<NativeBuild, Diagnostic> {
+pub fn compile_native(
+    program: &Program,
+    out_exe: &Path,
+    target: Option<&str>,
+) -> Result<NativeBuild, Diagnostic> {
     let c_source = emit_c(program)?;
     let rt = runtime_dir();
     let rt_c = rt.join("machino_rt.c");
@@ -1538,15 +2058,33 @@ pub fn compile_native(program: &Program, out_exe: &Path) -> Result<NativeBuild, 
     let _ = std::fs::copy(&rt_h, &hdr_dst);
 
     let clang = std::env::var("MACHINO_CC").unwrap_or_else(|_| "clang".into());
+    let mut compile_args = vec![
+        "-O3".to_string(),
+        "-flto".to_string(),
+        "-ffunction-sections".to_string(),
+        "-fdata-sections".to_string(),
+        "-pthread".to_string(),
+        "-std=c11".to_string(),
+        "-o".to_string(),
+        out_exe.to_str().unwrap_or("a.out").to_string(),
+        c_path.to_str().unwrap_or("program.c").to_string(),
+        rt_c.to_str().unwrap_or("machino_rt.c").to_string(),
+    ];
+    if let Some(triple) = target {
+        compile_args.insert(0, "-target".to_string());
+        compile_args.insert(1, triple.to_string());
+    } else {
+        // Host builds: tune for the CPU running the compiler.
+        compile_args.insert(0, "-march=native".to_string());
+    }
+    // Dead-strip unused sections on common linkers (best-effort).
+    if cfg!(target_os = "macos") {
+        compile_args.push("-Wl,-dead_strip".to_string());
+    } else if cfg!(target_os = "linux") {
+        compile_args.push("-Wl,--gc-sections".to_string());
+    }
     let status = Command::new(&clang)
-        .args([
-            "-O2",
-            "-std=c11",
-            "-o",
-            out_exe.to_str().unwrap_or("a.out"),
-            c_path.to_str().unwrap_or("program.c"),
-            rt_c.to_str().unwrap_or("machino_rt.c"),
-        ])
+        .args(&compile_args)
         .status()
         .map_err(|e| {
             Diagnostic::new(
@@ -1573,7 +2111,9 @@ pub fn compile_native(program: &Program, out_exe: &Path) -> Result<NativeBuild, 
     let ll_path = work.join("program.ll");
     let ll_status = Command::new(&clang)
         .args([
-            "-O2",
+            "-O3",
+            "-flto",
+            "-pthread",
             "-std=c11",
             "-S",
             "-emit-llvm",
@@ -1596,11 +2136,69 @@ pub fn compile_native(program: &Program, out_exe: &Path) -> Result<NativeBuild, 
     })
 }
 
+/// Build a macOS universal (arm64 + x86_64) binary via `lipo`.
+pub fn compile_native_universal(
+    program: &Program,
+    out_exe: &Path,
+) -> Result<NativeBuild, Diagnostic> {
+    if !cfg!(target_os = "macos") {
+        return Err(Diagnostic::new(
+            "E080",
+            "--universal is only supported when building on macOS (lipo)",
+            Span::new(0, 0),
+        )
+        .with_help("on other hosts use --target <triple> for cross-compilation, or ship .wasm for portable deploy"));
+    }
+    let arm_out = out_exe.with_extension("native-arm64");
+    let x64_out = out_exe.with_extension("native-x86_64");
+    let arm = compile_native(program, &arm_out, Some("arm64-apple-macosx"))?;
+    let x64_build = compile_native(program, &x64_out, Some("x86_64-apple-macosx")).map_err(|e| {
+        e.with_help(
+            "could not build the x86_64 slice; install an Xcode clang that supports -target x86_64-apple-macosx, or omit --universal",
+        )
+    })?;
+    let status = Command::new("lipo")
+        .args([
+            "-create",
+            "-output",
+            out_exe.to_str().unwrap_or("a.out"),
+            arm_out.to_str().unwrap_or("a.arm64"),
+            x64_out.to_str().unwrap_or("a.x64"),
+        ])
+        .status()
+        .map_err(|e| {
+            Diagnostic::new(
+                "E080",
+                format!("lipo failed ({e}); --universal requires macOS lipo"),
+                Span::new(0, 0),
+            )
+        })?;
+    if !status.success() {
+        return Err(Diagnostic::new(
+            "E080",
+            "lipo -create failed while building universal binary",
+            Span::new(0, 0),
+        ));
+    }
+    let _ = std::fs::remove_file(&arm_out);
+    let _ = std::fs::remove_file(&x64_out);
+    Ok(NativeBuild {
+        exe_path: out_exe.to_path_buf(),
+        c_path: arm.c_path,
+        ll_path: arm.ll_path.or(x64_build.ll_path),
+    })
+}
+
 fn collect_calls(stmts: &[Stmt], out: &mut HashSet<String>) {
     fn expr(e: &Expr, out: &mut HashSet<String>) {
         match &e.kind {
             ExprKind::Call(name, _, args) => {
                 out.insert(name.clone());
+                if name == "spawn" {
+                    if let Some(ExprKind::Var(target)) = args.first().map(|a| &a.kind) {
+                        out.insert(target.clone());
+                    }
+                }
                 for a in args {
                     expr(a, out);
                 }
@@ -1618,6 +2216,10 @@ fn collect_calls(stmts: &[Stmt], out: &mut HashSet<String>) {
                 }
             }
             ExprKind::Lambda(l) => walk_stmts_calls(&l.body, out),
+            // bare function name used as a value (e.g. map(xs, double))
+            ExprKind::Var(name) => {
+                out.insert(name.clone());
+            }
             _ => {}
         }
     }
@@ -1705,118 +2307,332 @@ fn reachable_from_main(program: &Program) -> HashSet<String> {
     reachable
 }
 
-/// Collect diagnostics for unsupported constructs in code reachable from main.
-pub fn unsupported_constructs(program: &Program) -> Vec<Diagnostic> {
-    let mut diags = Vec::new();
-    let reachable = reachable_from_main(program);
+fn lookup_env(env: &[HashMap<String, Type>], name: &str) -> Option<Type> {
+    for scope in env.iter().rev() {
+        if let Some(t) = scope.get(name) {
+            return Some(t.clone());
+        }
+    }
+    None
+}
 
-    fn walk_expr(e: &Expr, diags: &mut Vec<Diagnostic>) {
+fn collect_lambdas_stmts(stmts: &[Stmt], out: &mut BTreeMap<usize, Lambda>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Let { value, .. }
+            | StmtKind::Assign { value, .. }
+            | StmtKind::Assert(value)
+            | StmtKind::Expr(value)
+            | StmtKind::Return(Some(value)) => collect_lambdas_expr(value, out),
+            StmtKind::IndexAssign { base, index, value } => {
+                collect_lambdas_expr(base, out);
+                collect_lambdas_expr(index, out);
+                collect_lambdas_expr(value, out);
+            }
+            StmtKind::FieldAssign { base, value, .. } => {
+                collect_lambdas_expr(base, out);
+                collect_lambdas_expr(value, out);
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                collect_lambdas_expr(cond, out);
+                collect_lambdas_stmts(then_body, out);
+                collect_lambdas_stmts(else_body, out);
+            }
+            StmtKind::While { cond, invariant: _, body } => {
+                collect_lambdas_expr(cond, out);
+                collect_lambdas_stmts(body, out);
+            }
+            StmtKind::For {
+                start, end, body, ..
+            } => {
+                collect_lambdas_expr(start, out);
+                collect_lambdas_expr(end, out);
+                collect_lambdas_stmts(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_lambdas_expr(e: &Expr, out: &mut BTreeMap<usize, Lambda>) {
+    match &e.kind {
+        ExprKind::Lambda(l) => {
+            out.insert(l.id, (**l).clone());
+            collect_lambdas_stmts(&l.body, out);
+        }
+        ExprKind::Array(elems) => elems.iter().for_each(|e| collect_lambdas_expr(e, out)),
+        ExprKind::Index(a, b) | ExprKind::Bin(_, a, b) => {
+            collect_lambdas_expr(a, out);
+            collect_lambdas_expr(b, out);
+        }
+        ExprKind::Field(a, _) | ExprKind::Un(_, a) => collect_lambdas_expr(a, out),
+        ExprKind::Call(_, _, args) => args.iter().for_each(|a| collect_lambdas_expr(a, out)),
+        ExprKind::Match(m) => {
+            collect_lambdas_expr(&m.scrutinee, out);
+            for arm in &m.arms {
+                collect_lambdas_expr(&arm.body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_fn_value_names_stmts(stmts: &[Stmt], out: &mut Vec<String>) {
+    fn in_expr(e: &Expr, out: &mut Vec<String>) {
         match &e.kind {
-            ExprKind::Lambda(_) => diags.push(e_native(
-                "native backend: lambdas are not yet supported",
-                e.span,
-            )),
-            ExprKind::Call(name, _, args) => {
-                if matches!(
-                    name.as_str(),
-                    "spawn"
-                        | "join_int"
-                        | "join_float"
-                        | "join_bool"
-                        | "join_str"
-                        | "chan_new"
-                        | "chan_close"
-                        | "chan_send_int"
-                        | "chan_send_bool"
-                        | "chan_send_float"
-                        | "chan_send_str"
-                        | "chan_recv_int"
-                        | "chan_recv_bool"
-                        | "chan_recv_float"
-                        | "chan_recv_str"
-                ) {
-                    diags.push(e_native(
-                        "native backend: spawn/channels are not yet supported",
-                        e.span,
-                    ));
-                }
-                for a in args {
-                    walk_expr(a, diags);
-                }
-            }
-            ExprKind::Array(xs) => xs.iter().for_each(|x| walk_expr(x, diags)),
+            ExprKind::Var(name) => out.push(name.clone()),
+            ExprKind::Array(elems) => elems.iter().for_each(|e| in_expr(e, out)),
             ExprKind::Index(a, b) | ExprKind::Bin(_, a, b) => {
-                walk_expr(a, diags);
-                walk_expr(b, diags);
+                in_expr(a, out);
+                in_expr(b, out);
             }
-            ExprKind::Field(a, _) | ExprKind::Un(_, a) => walk_expr(a, diags),
+            ExprKind::Field(a, _) | ExprKind::Un(_, a) => in_expr(a, out),
+            ExprKind::Call(_, _, args) => args.iter().for_each(|a| in_expr(a, out)),
+            ExprKind::Lambda(l) => collect_fn_value_names_stmts(&l.body, out),
             ExprKind::Match(m) => {
-                walk_expr(&m.scrutinee, diags);
+                in_expr(&m.scrutinee, out);
                 for arm in &m.arms {
-                    walk_expr(&arm.body, diags);
+                    in_expr(&arm.body, out);
                 }
             }
             _ => {}
         }
     }
-    fn walk_stmts(stmts: &[Stmt], diags: &mut Vec<Diagnostic>) {
-        for s in stmts {
-            match &s.kind {
-                StmtKind::Let { value, .. }
-                | StmtKind::Assign { value, .. }
-                | StmtKind::Assert(value)
-                | StmtKind::Expr(value)
-                | StmtKind::Return(Some(value)) => walk_expr(value, diags),
-                StmtKind::IndexAssign {
-                    base, index, value, ..
-                } => {
-                    walk_expr(base, diags);
-                    walk_expr(index, diags);
-                    walk_expr(value, diags);
-                }
-                StmtKind::FieldAssign { base, value, .. } => {
-                    walk_expr(base, diags);
-                    walk_expr(value, diags);
-                }
-                StmtKind::If {
-                    cond,
-                    then_body,
-                    else_body,
-                } => {
-                    walk_expr(cond, diags);
-                    walk_stmts(then_body, diags);
-                    walk_stmts(else_body, diags);
-                }
-                StmtKind::While {
-                    cond,
-                    invariant,
-                    body,
-                } => {
-                    walk_expr(cond, diags);
-                    if let Some(inv) = invariant {
-                        walk_expr(inv, diags);
-                    }
-                    walk_stmts(body, diags);
-                }
-                StmtKind::For {
-                    start, end, body, ..
-                } => {
-                    walk_expr(start, diags);
-                    walk_expr(end, diags);
-                    walk_stmts(body, diags);
-                }
-                _ => {}
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Let { value, .. }
+            | StmtKind::Assign { value, .. }
+            | StmtKind::Assert(value)
+            | StmtKind::Expr(value)
+            | StmtKind::Return(Some(value)) => in_expr(value, out),
+            StmtKind::IndexAssign { base, index, value } => {
+                in_expr(base, out);
+                in_expr(index, out);
+                in_expr(value, out);
+            }
+            StmtKind::FieldAssign { base, value, .. } => {
+                in_expr(base, out);
+                in_expr(value, out);
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                in_expr(cond, out);
+                collect_fn_value_names_stmts(then_body, out);
+                collect_fn_value_names_stmts(else_body, out);
+            }
+            StmtKind::While { cond, invariant: _, body } => {
+                in_expr(cond, out);
+                collect_fn_value_names_stmts(body, out);
+            }
+            StmtKind::For {
+                start, end, body, ..
+            } => {
+                in_expr(start, out);
+                in_expr(end, out);
+                collect_fn_value_names_stmts(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_spawn_targets_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Let { value, .. }
+            | StmtKind::Assign { value, .. }
+            | StmtKind::Assert(value)
+            | StmtKind::Expr(value)
+            | StmtKind::Return(Some(value)) => collect_spawn_targets_expr(value, out),
+            StmtKind::IndexAssign { base, index, value } => {
+                collect_spawn_targets_expr(base, out);
+                collect_spawn_targets_expr(index, out);
+                collect_spawn_targets_expr(value, out);
+            }
+            StmtKind::FieldAssign { base, value, .. } => {
+                collect_spawn_targets_expr(base, out);
+                collect_spawn_targets_expr(value, out);
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                collect_spawn_targets_expr(cond, out);
+                collect_spawn_targets_stmts(then_body, out);
+                collect_spawn_targets_stmts(else_body, out);
+            }
+            StmtKind::While { cond, invariant: _, body } => {
+                collect_spawn_targets_expr(cond, out);
+                collect_spawn_targets_stmts(body, out);
+            }
+            StmtKind::For {
+                start, end, body, ..
+            } => {
+                collect_spawn_targets_expr(start, out);
+                collect_spawn_targets_expr(end, out);
+                collect_spawn_targets_stmts(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_spawn_targets_expr(e: &Expr, out: &mut HashSet<String>) {
+    match &e.kind {
+        ExprKind::Call(name, _, args) if name == "spawn" => {
+            if let Some(ExprKind::Var(target)) = args.first().map(|a| &a.kind) {
+                out.insert(target.clone());
+            }
+            for a in args {
+                collect_spawn_targets_expr(a, out);
             }
         }
-    }
-    for f in &program.functions {
-        if f.is_extern || !f.type_params.is_empty() || !reachable.contains(&f.name) {
-            continue;
+        ExprKind::Array(elems) => elems.iter().for_each(|e| collect_spawn_targets_expr(e, out)),
+        ExprKind::Index(a, b) | ExprKind::Bin(_, a, b) => {
+            collect_spawn_targets_expr(a, out);
+            collect_spawn_targets_expr(b, out);
         }
-        walk_stmts(&f.body, &mut diags);
-        for c in f.requires.iter().chain(f.ensures.iter()) {
-            walk_expr(&c.expr, &mut diags);
+        ExprKind::Field(a, _) | ExprKind::Un(_, a) => collect_spawn_targets_expr(a, out),
+        ExprKind::Call(_, _, args) => args.iter().for_each(|a| collect_spawn_targets_expr(a, out)),
+        ExprKind::Lambda(l) => collect_spawn_targets_stmts(&l.body, out),
+        ExprKind::Match(m) => {
+            collect_spawn_targets_expr(&m.scrutinee, out);
+            for arm in &m.arms {
+                collect_spawn_targets_expr(&arm.body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn analyze_lambda_captures_stmts(
+    stmts: &[Stmt],
+    env: &mut Vec<HashMap<String, Type>>,
+    signatures: &HashMap<&str, (Vec<Type>, Type)>,
+    out: &mut HashMap<usize, Vec<(String, Type)>>,
+) {
+    env.push(HashMap::new());
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Let { name, ty, value } => {
+                analyze_lambda_captures_expr(value, env, signatures, out);
+                let inferred = ty.clone().unwrap_or(Type::Int);
+                env.last_mut().unwrap().insert(name.clone(), inferred);
+            }
+            StmtKind::Assign { name, value } => {
+                analyze_lambda_captures_expr(value, env, signatures, out);
+                let _ = name;
+            }
+            StmtKind::IndexAssign { base, index, value } => {
+                analyze_lambda_captures_expr(base, env, signatures, out);
+                analyze_lambda_captures_expr(index, env, signatures, out);
+                analyze_lambda_captures_expr(value, env, signatures, out);
+            }
+            StmtKind::FieldAssign { base, value, .. } => {
+                analyze_lambda_captures_expr(base, env, signatures, out);
+                analyze_lambda_captures_expr(value, env, signatures, out);
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                analyze_lambda_captures_expr(cond, env, signatures, out);
+                analyze_lambda_captures_stmts(then_body, env, signatures, out);
+                analyze_lambda_captures_stmts(else_body, env, signatures, out);
+            }
+            StmtKind::While {
+                cond,
+                invariant: _,
+                body,
+            } => {
+                analyze_lambda_captures_expr(cond, env, signatures, out);
+                analyze_lambda_captures_stmts(body, env, signatures, out);
+            }
+            StmtKind::For {
+                var,
+                start,
+                end,
+                body,
+            } => {
+                analyze_lambda_captures_expr(start, env, signatures, out);
+                analyze_lambda_captures_expr(end, env, signatures, out);
+                env.push(HashMap::new());
+                env.last_mut().unwrap().insert(var.clone(), Type::Int);
+                analyze_lambda_captures_stmts(body, env, signatures, out);
+                env.pop();
+            }
+            StmtKind::Assert(e) | StmtKind::Expr(e) | StmtKind::Return(Some(e)) => {
+                analyze_lambda_captures_expr(e, env, signatures, out);
+            }
+            _ => {}
         }
     }
-    diags
+    env.pop();
+}
+
+fn analyze_lambda_captures_expr(
+    e: &Expr,
+    env: &[HashMap<String, Type>],
+    signatures: &HashMap<&str, (Vec<Type>, Type)>,
+    out: &mut HashMap<usize, Vec<(String, Type)>>,
+) {
+    match &e.kind {
+        ExprKind::Lambda(l) => {
+            let mut caps = Vec::new();
+            for n in l.free_names() {
+                if signatures.contains_key(n.as_str()) {
+                    continue;
+                }
+                if let Some(ty) = lookup_env(env, &n) {
+                    caps.push((n, ty));
+                }
+            }
+            out.insert(l.id, caps);
+            let mut inner = env.to_vec();
+            inner.push(HashMap::new());
+            for p in &l.params {
+                inner.last_mut().unwrap().insert(p.name.clone(), p.ty.clone());
+            }
+            analyze_lambda_captures_stmts(&l.body, &mut inner, signatures, out);
+        }
+        ExprKind::Array(elems) => {
+            for x in elems {
+                analyze_lambda_captures_expr(x, env, signatures, out);
+            }
+        }
+        ExprKind::Index(a, b) | ExprKind::Bin(_, a, b) => {
+            analyze_lambda_captures_expr(a, env, signatures, out);
+            analyze_lambda_captures_expr(b, env, signatures, out);
+        }
+        ExprKind::Field(a, _) | ExprKind::Un(_, a) => {
+            analyze_lambda_captures_expr(a, env, signatures, out);
+        }
+        ExprKind::Call(_, _, args) => {
+            for a in args {
+                analyze_lambda_captures_expr(a, env, signatures, out);
+            }
+        }
+        ExprKind::Match(m) => {
+            analyze_lambda_captures_expr(&m.scrutinee, env, signatures, out);
+            for arm in &m.arms {
+                analyze_lambda_captures_expr(&arm.body, env, signatures, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect diagnostics for unsupported constructs in code reachable from main.
+pub fn unsupported_constructs(program: &Program) -> Vec<Diagnostic> {
+    let _ = program;
+    Vec::new()
 }

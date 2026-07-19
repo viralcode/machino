@@ -8,15 +8,15 @@ Clang to produce a native executable.
 ## Build
 
 ```sh
-clang -pthread -O2 -o prog prog.c runtime/native/machino_rt.c
+clang -pthread -O3 -flto -march=native -o prog prog.c runtime/native/machino_rt.c
 ```
 
 Link with `-pthread` (on macOS, `clang` also accepts `-pthread` and links
 libpthread). Or compile the runtime object once and link it:
 
 ```sh
-clang -c -std=c11 -pthread runtime/native/machino_rt.c -o machino_rt.o
-clang -pthread -O2 -o prog prog.c machino_rt.o
+clang -c -std=c11 -pthread -O3 runtime/native/machino_rt.c -o machino_rt.o
+clang -pthread -O3 -flto -o prog prog.c machino_rt.o
 ```
 
 Include the header from generated code:
