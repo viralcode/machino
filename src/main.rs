@@ -673,7 +673,7 @@ fn cmd_build(rest: &[String]) -> ExitCode {
         if let Some(span) = find_concurrency_use(&loaded.program) {
             let d = Diagnostic::new(
                 "E072",
-                "the WASM-GC backend has no thread support; use the default backend for spawn/join",
+                "the WASM-GC backend has no thread or channel support; use the default backend for spawn/join and channels",
                 span,
             )
             .with_help("compile without --gc, or run with 'machino run'");
@@ -818,16 +818,32 @@ fn validate_spawn_targets(program: &ast::Program) -> Option<Diagnostic> {
         .find_map(|f| in_stmts(&f.body, &fns))
 }
 
-/// Returns the span of the first spawn/join call, if any. The WASM-GC
-/// backend has no thread support, so `machino build --gc` rejects these
-/// programs.
+/// Returns the span of the first spawn/join or chan_* call, if any. The
+/// WASM-GC backend has no thread or channel support, so `machino build --gc`
+/// rejects these programs.
 fn find_concurrency_use(program: &ast::Program) -> Option<Span> {
-    const CONCURRENCY: &[&str] = &["spawn", "join_int", "join_float", "join_bool", "join_str"];
+    const UNSUPPORTED: &[&str] = &[
+        "spawn",
+        "join_int",
+        "join_float",
+        "join_bool",
+        "join_str",
+        "chan_new",
+        "chan_close",
+        "chan_send_int",
+        "chan_send_float",
+        "chan_send_bool",
+        "chan_send_str",
+        "chan_recv_int",
+        "chan_recv_float",
+        "chan_recv_bool",
+        "chan_recv_str",
+    ];
     fn in_expr(e: &ast::Expr) -> Option<Span> {
         use ast::ExprKind::*;
         match &e.kind {
             Call(name, args) => {
-                if CONCURRENCY.contains(&name.as_str()) {
+                if UNSUPPORTED.contains(&name.as_str()) {
                     return Some(e.span);
                 }
                 args.iter().find_map(in_expr)

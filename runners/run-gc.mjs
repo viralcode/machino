@@ -27,6 +27,11 @@ function readStr(ref) {
 
 const imports = {
   env: {
+    fail(ref) {
+      const msg = readStr(ref);
+      console.error(msg);
+      throw new Error(msg);
+    },
     print_i64(v) {
       console.log(v.toString());
     },
@@ -51,6 +56,10 @@ try {
 } catch (e) {
   if (e instanceof WebAssembly.RuntimeError) {
     console.error("runtime error: trap (contract violation, assert failure, integer overflow, or out-of-bounds)");
+    process.exit(1);
+  }
+  // fail() throws a normal Error after printing the message
+  if (e instanceof Error && String(e.message).startsWith("runtime error:")) {
     process.exit(1);
   }
   throw e;

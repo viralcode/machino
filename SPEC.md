@@ -1,4 +1,4 @@
-# The machino Language Specification (v1.0)
+# The machino Language Specification (v1.1)
 
 machino is an AI-first programming language. It is designed for code that is
 *written and verified by machines*: the syntax is small and canonical, the
@@ -356,9 +356,11 @@ from compiled WASM.
   `parse_int`, `is_int_str`, `is_digit`
 - **Strings:** `find`, `find_from`, `contains`, `starts_with`, `ends_with`,
   `split`, `join`, `trim`, `is_space`, `to_upper`, `to_lower`, `repeat`
-- **Maps:** `struct StrMap` (str → str) with `strmap_new`, `strmap_set`,
-  `strmap_get`, `strmap_get_or`, `strmap_has`, `strmap_index`, `strmap_len`;
-  `struct IntMap` (int → int) with the same operations under `intmap_*`
+- **Maps:** `struct<K: Eq + Hash, V> HashMap` with `hashmap_new`,
+  `hashmap_set`, `hashmap_get`, `hashmap_get_or`, `hashmap_has`,
+  `hashmap_len` (open addressing; `hash()` builtin for `int`/`bool`/`str`);
+  plus specialized `struct StrMap` / `struct IntMap` with `strmap_*` /
+  `intmap_*` helpers
 - **Ints:** `abs_int`, `min_int`, `max_int`, `sum_ints`, `index_of_int`,
   `sort_ints`
 - **Float math** (pure machino, identical in both backends): `sqrt`
@@ -455,9 +457,12 @@ fn<T, U> pair_max(a: T, b: T, tag: U) -> T where T: Ord + Num, U: Eq {
 - The compiler **monomorphizes**: each distinct instantiation becomes a
   concrete function before codegen, so both backends see only concrete
   types. `machino query` still reports the generic template as written.
-- `struct<T>`/`enum<T>` declarations parse, but constructing a generic
-  struct/enum directly is rejected (`E066`); pass values through generic
-  functions instead.
+- `struct<T>`/`enum<T>` may be constructed directly (`Box(42)`,
+  `HashMap(ks, vs, buckets, cap)`); the compiler monomorphizes each
+  distinct instantiation (`HashMap$str$int`) before codegen, the same
+  way it does for generic functions. Type arguments are inferred at the
+  constructor site — there is no turbofish or `HashMap<str, int>`
+  annotation syntax yet.
 
 ## Static verification (`machino check --verify`)
 
@@ -495,17 +500,21 @@ runtime, as always.
   package and uploads it to a registry over HTTP (client side; running a
   registry server is out of scope).
 
-## Known limits (v1.0)
+## Known limits (v1.1)
 
-- Generic structs/enums cannot be instantiated directly (`E066`); generic
-  functions cover the common cases.
 - Compiled `spawn` targets must be named top-level functions (`E074`);
   lambdas and function-typed variables spawn in the interpreter only.
   Spawned functions must return a scalar (`E071`). The WASM-GC backend
-  has no thread support (`E072` with `--gc`).
-- The WASM-GC backend wraps on integer overflow (the linear backend
-  traps), provides no extern fns beyond print, and needs a GC-capable
-  host (Node 22+, modern browsers).
+  has no thread or channel support (`E072` with `--gc`).
+- Channels are host-mediated and work in the interpreter and the linear
+  WASM runner; cross-worker channel state in compiled WASM is best-effort
+  (prefer channels with the interpreter for multi-task messaging today).
+- Strings are UTF-8 byte strings: `len`/`char_at`/`substr`/`chr` are
+  byte-indexed; use `len_cp`/`char_at_cp`/`substr_cp`/`chr_cp` for
+  Unicode scalar values.
+- The WASM-GC backend provides no extern fns beyond print/fail and needs
+  a GC-capable host (Node 22+, modern browsers). Integer overflow traps
+  on both backends with matching messages.
 - SMT verification covers int/bool contracts with bounded inlining and
   loop unrolling; floats, strings, and while loops stay runtime-checked.
 - Enum variants carry at most one payload value; 255 variants max.
@@ -522,7 +531,7 @@ runtime, as always.
 
 - Hosted public registry service (`pkg publish` already speaks the
   protocol; the server itself is out of scope for the toolchain)
-- Generic structs/enums instantiated directly
-- Shared-memory primitives (channels) on top of shared-nothing tasks
+- Cross-worker channel sharing in compiled WASM hosts
+- Generic type-argument syntax in annotations (`let m: HashMap<str, int>`)
 
 

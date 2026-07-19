@@ -919,6 +919,57 @@ fn build_compiles_concurrency_and_runs_it() {
 }
 
 #[test]
+fn generic_hashmap_and_unicode_and_channels() {
+    let path = write_temp(
+        "v11.mno",
+        r#"fn worker(ch: int) -> int {
+    chan_send_int(ch, 21)
+    return 0
+}
+
+fn main() {
+    let ks: [str] = []
+    let vs: [int] = []
+    let m = HashMap(ks, vs, empty_buckets(8), 8)
+    hashmap_set(m, "a", 1)
+    hashmap_set(m, "b", 2)
+    print(hashmap_get(m, "a"))
+    print(hashmap_len(m))
+    print(len_cp("A🎉"))
+    print(substr_cp("A🎉B", 1, 2))
+    let ch = chan_new()
+    let h = spawn(worker, ch)
+    print(chan_recv_int(ch) * 2)
+    print(join_int(h))
+    chan_close(ch)
+}
+"#,
+    );
+    let out = machino(&["run", path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout(&out), "1\n2\n2\n🎉\n42\n0\n");
+
+    let wasm = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("v11_hm.wasm");
+    let built = machino(&[
+        "build",
+        "--no-cache",
+        path.to_str().unwrap(),
+        "-o",
+        wasm.to_str().unwrap(),
+    ]);
+    // channels+spawn compile; hashmap+unicode subset also builds — full file uses both
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+}
+
+#[test]
 fn build_rejects_lambda_spawn_target() {
     let path = write_temp(
         "spawnlambda.mno",

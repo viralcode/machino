@@ -18,7 +18,7 @@ pub struct Parser<'a> {
 type PResult<T> = Result<T, Diagnostic>;
 
 /// Constraint bounds a type parameter may declare.
-const VALID_BOUNDS: &[&str] = &["Eq", "Ord", "Num"];
+const VALID_BOUNDS: &[&str] = &["Eq", "Ord", "Num", "Hash"];
 
 impl<'a> Parser<'a> {
     pub fn new(tokens: &'a [Token], source: &'a str) -> Self {
@@ -72,7 +72,7 @@ impl<'a> Parser<'a> {
                     format!("unknown constraint '{}'", bound),
                     bspan,
                 )
-                .with_help("valid constraints: Eq (== !=), Ord (< <= > >=), Num (+ - * /)"));
+                .with_help("valid constraints: Eq (== !=), Ord (< <= > >=), Num (+ - * /), Hash (hash())"));
             }
             if !bounds.contains(&bound) {
                 bounds.push(bound);

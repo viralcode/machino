@@ -371,6 +371,9 @@ impl FnBuilder {
     fn i64_div_s(&mut self) {
         self.op(0x7F);
     }
+    fn i64_rem_u(&mut self) {
+        self.op(0x80);
+    }
     fn i64_rem_s(&mut self) {
         self.op(0x81);
     }
@@ -458,7 +461,9 @@ const IMP_PRINT_I64: u32 = 1;
 const IMP_PRINT_F64: u32 = 2;
 const IMP_PRINT_BOOL: u32 = 3;
 const IMP_PRINT_STR: u32 = 4;
-const N_HELPERS: u32 = 21;
+const N_HELPERS: u32 = 26;
+const HASH_MUL: i64 = -7030230956028963701; // 11400714819323198485u64 as i64
+const HASH_MOD: i64 = 1_000_000_007;
 
 pub struct WasmCompiler<'a> {
     program: &'a Program,
@@ -498,6 +503,11 @@ pub struct WasmCompiler<'a> {
     h_char_at: u32,
     h_substr: u32,
     h_chr: u32,
+    h_len_cp: u32,
+    h_char_at_cp: u32,
+    h_substr_cp: u32,
+    h_chr_cp: u32,
+    h_hash_str: u32,
     h_obj_size: u32,
     h_mark_push: u32,
     h_gc_collect: u32,
@@ -508,6 +518,14 @@ pub struct WasmCompiler<'a> {
     imp_join_i64: u32,
     imp_join_f64: u32,
     imp_join_str: u32,
+    imp_chan_new: u32,
+    imp_chan_close: u32,
+    imp_chan_send_i64: u32,
+    imp_chan_send_f64: u32,
+    imp_chan_send_str: u32,
+    imp_chan_recv_i64: u32,
+    imp_chan_recv_f64: u32,
+    imp_chan_recv_str: u32,
     /// Functions passed to spawn(); exported so worker instances can call
     /// them by name.
     spawn_targets: std::collections::BTreeSet<String>,
@@ -601,6 +619,33 @@ fn program_uses_concurrency(program: &Program, reachable: &HashSet<String>) -> b
         collect_fn_names_stmts(&t.body, &mut names);
     }
     names.iter().any(|n| CONC.contains(n))
+}
+
+/// True if any reachable function (or test) calls chan_* builtins.
+fn program_uses_channels(program: &Program, reachable: &HashSet<String>) -> bool {
+    const CHAN: &[&str] = &[
+        "chan_new",
+        "chan_close",
+        "chan_send_int",
+        "chan_send_float",
+        "chan_send_bool",
+        "chan_send_str",
+        "chan_recv_int",
+        "chan_recv_float",
+        "chan_recv_bool",
+        "chan_recv_str",
+    ];
+    let mut names: Vec<&str> = Vec::new();
+    for f in &program.functions {
+        if f.is_extern || !reachable.contains(&f.name) {
+            continue;
+        }
+        collect_fn_names_stmts(&f.body, &mut names);
+    }
+    for t in &program.tests {
+        collect_fn_names_stmts(&t.body, &mut names);
+    }
+    names.iter().any(|n| CHAN.contains(n))
 }
 
 /// Pointer bitmap for a struct's payload, one u64 per 64 fields.
@@ -839,6 +884,11 @@ impl<'a> WasmCompiler<'a> {
             h_char_at: 0,
             h_substr: 0,
             h_chr: 0,
+            h_len_cp: 0,
+            h_char_at_cp: 0,
+            h_substr_cp: 0,
+            h_chr_cp: 0,
+            h_hash_str: 0,
             h_obj_size: 0,
             h_mark_push: 0,
             h_gc_collect: 0,
@@ -848,6 +898,14 @@ impl<'a> WasmCompiler<'a> {
             imp_join_i64: 0,
             imp_join_f64: 0,
             imp_join_str: 0,
+            imp_chan_new: 0,
+            imp_chan_close: 0,
+            imp_chan_send_i64: 0,
+            imp_chan_send_f64: 0,
+            imp_chan_send_str: 0,
+            imp_chan_recv_i64: 0,
+            imp_chan_recv_f64: 0,
+            imp_chan_recv_str: 0,
             spawn_targets: std::collections::BTreeSet::new(),
         }
     }
@@ -981,6 +1039,31 @@ impl<'a> WasmCompiler<'a> {
             self.imp_join_str = imports.len() as u32;
             imports.push(("task_join_str".to_string(), t_i64_i64));
         }
+        let uses_channels = program_uses_channels(self.program, &reachable);
+        if uses_channels {
+            let t_i64 = self.get_type(&[], &[VT_I64]);
+            let t_i64_void = self.get_type(&[VT_I64], &[]);
+            let t_i64_i64_void = self.get_type(&[VT_I64, VT_I64], &[]);
+            let t_i64_f64_void = self.get_type(&[VT_I64, VT_F64], &[]);
+            let t_i64_i64 = self.get_type(&[VT_I64], &[VT_I64]);
+            let t_i64_f64 = self.get_type(&[VT_I64], &[VT_F64]);
+            self.imp_chan_new = imports.len() as u32;
+            imports.push(("chan_new".to_string(), t_i64));
+            self.imp_chan_close = imports.len() as u32;
+            imports.push(("chan_close".to_string(), t_i64_void));
+            self.imp_chan_send_i64 = imports.len() as u32;
+            imports.push(("chan_send_i64".to_string(), t_i64_i64_void));
+            self.imp_chan_send_f64 = imports.len() as u32;
+            imports.push(("chan_send_f64".to_string(), t_i64_f64_void));
+            self.imp_chan_send_str = imports.len() as u32;
+            imports.push(("chan_send_str".to_string(), t_i64_i64_void));
+            self.imp_chan_recv_i64 = imports.len() as u32;
+            imports.push(("chan_recv_i64".to_string(), t_i64_i64));
+            self.imp_chan_recv_f64 = imports.len() as u32;
+            imports.push(("chan_recv_f64".to_string(), t_i64_f64));
+            self.imp_chan_recv_str = imports.len() as u32;
+            imports.push(("chan_recv_str".to_string(), t_i64_i64));
+        }
         let extern_base = imports.len() as u32;
         let externs: Vec<&Function> = self
             .program
@@ -1041,10 +1124,15 @@ impl<'a> WasmCompiler<'a> {
         self.h_char_at = base + 14;
         self.h_substr = base + 15;
         self.h_chr = base + 16;
-        self.h_obj_size = base + 17;
-        self.h_mark_push = base + 18;
-        self.h_gc_collect = base + 19;
-        self.h_gc_maybe = base + 20;
+        self.h_len_cp = base + 17;
+        self.h_char_at_cp = base + 18;
+        self.h_substr_cp = base + 19;
+        self.h_chr_cp = base + 20;
+        self.h_hash_str = base + 21;
+        self.h_obj_size = base + 22;
+        self.h_mark_push = base + 23;
+        self.h_gc_collect = base + 24;
+        self.h_gc_maybe = base + 25;
 
         let user_fns: Vec<&Function> = self
             .program
@@ -1112,6 +1200,11 @@ impl<'a> WasmCompiler<'a> {
             t_bin_i64,  // char_at
             t_substr,   // substr
             t_alloc,    // chr
+            t_alloc,    // len_cp
+            t_bin_i64,  // char_at_cp
+            t_substr,   // substr_cp
+            t_alloc,    // chr_cp
+            t_alloc,    // hash_str
             t_alloc,    // obj_size
             t_void_i64, // mark_push
             t_void_void, // gc_collect
@@ -1135,6 +1228,11 @@ impl<'a> WasmCompiler<'a> {
             self.emit_char_at(),
             self.emit_substr(),
             self.emit_chr(),
+            self.emit_len_cp(),
+            self.emit_char_at_cp(),
+            self.emit_substr_cp(),
+            self.emit_chr_cp(),
+            self.emit_hash_str(),
             self.emit_obj_size(),
             self.emit_mark_push(),
             self.emit_gc_collect(),
@@ -1979,7 +2077,599 @@ impl<'a> WasmCompiler<'a> {
         b.finish()
     }
 
-    // ---- garbage collector ----
+    /// Count Unicode scalar values by walking UTF-8 leading bytes.
+    fn emit_len_cp(&mut self) -> Vec<u8> {
+        let mut b = FnBuilder::new(1);
+        let len = b.new_local(VT_I64);
+        let i = b.new_local(VT_I64);
+        let count = b.new_local(VT_I64);
+        let byte = b.new_local(VT_I64);
+        b.local_get(0);
+        self.emit_len_read(&mut b);
+        b.local_set(len);
+        b.i64_const(0);
+        b.local_set(i);
+        b.i64_const(0);
+        b.local_set(count);
+        b.block_void();
+        b.loop_void();
+        {
+            b.local_get(i);
+            b.local_get(len);
+            b.i64_ge_u();
+            b.br_if(1);
+            b.local_get(0);
+            b.i64_const(HDR);
+            b.i64_add();
+            b.local_get(i);
+            b.i64_add();
+            b.i32_wrap_i64();
+            b.i64_load8_u(0);
+            b.local_set(byte);
+            b.local_get(byte);
+            b.i64_const(0x80);
+            b.i64_and();
+            b.i64_const(0x80);
+            b.i64_ne();
+            b.if_void();
+            {
+                b.local_get(count);
+                b.i64_const(1);
+                b.i64_add();
+                b.local_set(count);
+            }
+            b.end();
+            b.local_get(i);
+            b.i64_const(1);
+            b.i64_add();
+            b.local_set(i);
+            b.br(0);
+        }
+        b.end();
+        b.end();
+        b.local_get(count);
+        b.finish()
+    }
+
+    /// Decode one UTF-8 codepoint at `off` bytes into `str` (local 0); result on stack.
+    fn emit_utf8_decode_at(&self, b: &mut FnBuilder, str: u32, off: u32) {
+        let b0 = b.new_local(VT_I64);
+        let b1 = b.new_local(VT_I64);
+        let b2 = b.new_local(VT_I64);
+        let b3 = b.new_local(VT_I64);
+        b.local_get(str);
+        b.i64_const(HDR);
+        b.i64_add();
+        b.local_get(off);
+        b.i64_add();
+        b.i32_wrap_i64();
+        b.i64_load8_u(0);
+        b.local_tee(b0);
+        b.i64_const(0x80);
+        b.i64_lt_u();
+        b.if_void();
+        {
+            b.local_get(b0);
+            b.ret();
+        }
+        b.end();
+        b.local_get(b0);
+        b.i64_const(0xE0);
+        b.i64_lt_u();
+        b.if_void();
+        {
+            b.local_get(str);
+            b.i64_const(HDR);
+            b.i64_add();
+            b.local_get(off);
+            b.i64_const(1);
+            b.i64_add();
+            b.i64_add();
+            b.i32_wrap_i64();
+            b.i64_load8_u(0);
+            b.local_set(b1);
+            b.local_get(b0);
+            b.i64_const(0x1F);
+            b.i64_and();
+            b.i64_const(6);
+            b.i64_shl();
+            b.local_get(b1);
+            b.i64_const(0x3F);
+            b.i64_and();
+            b.i64_or();
+            b.ret();
+        }
+        b.end();
+        b.local_get(b0);
+        b.i64_const(0xF0);
+        b.i64_lt_u();
+        b.if_void();
+        {
+            b.local_get(str);
+            b.i64_const(HDR);
+            b.i64_add();
+            b.local_get(off);
+            b.i64_const(1);
+            b.i64_add();
+            b.i64_add();
+            b.i32_wrap_i64();
+            b.i64_load8_u(0);
+            b.local_set(b1);
+            b.local_get(str);
+            b.i64_const(HDR);
+            b.i64_add();
+            b.local_get(off);
+            b.i64_const(2);
+            b.i64_add();
+            b.i64_add();
+            b.i32_wrap_i64();
+            b.i64_load8_u(0);
+            b.local_set(b2);
+            b.local_get(b0);
+            b.i64_const(0x0F);
+            b.i64_and();
+            b.i64_const(12);
+            b.i64_shl();
+            b.local_get(b1);
+            b.i64_const(0x3F);
+            b.i64_and();
+            b.i64_const(6);
+            b.i64_shl();
+            b.i64_or();
+            b.local_get(b2);
+            b.i64_const(0x3F);
+            b.i64_and();
+            b.i64_or();
+            b.ret();
+        }
+        b.end();
+        b.local_get(str);
+        b.i64_const(HDR);
+        b.i64_add();
+        b.local_get(off);
+        b.i64_const(1);
+        b.i64_add();
+        b.i64_add();
+        b.i32_wrap_i64();
+        b.i64_load8_u(0);
+        b.local_set(b1);
+        b.local_get(str);
+        b.i64_const(HDR);
+        b.i64_add();
+        b.local_get(off);
+        b.i64_const(2);
+        b.i64_add();
+        b.i64_add();
+        b.i32_wrap_i64();
+        b.i64_load8_u(0);
+        b.local_set(b2);
+        b.local_get(str);
+        b.i64_const(HDR);
+        b.i64_add();
+        b.local_get(off);
+        b.i64_const(3);
+        b.i64_add();
+        b.i64_add();
+        b.i32_wrap_i64();
+        b.i64_load8_u(0);
+        b.local_set(b3);
+        b.local_get(b0);
+        b.i64_const(0x07);
+        b.i64_and();
+        b.i64_const(18);
+        b.i64_shl();
+        b.local_get(b1);
+        b.i64_const(0x3F);
+        b.i64_and();
+        b.i64_const(12);
+        b.i64_shl();
+        b.i64_or();
+        b.local_get(b2);
+        b.i64_const(0x3F);
+        b.i64_and();
+        b.i64_const(6);
+        b.i64_shl();
+        b.i64_or();
+        b.local_get(b3);
+        b.i64_const(0x3F);
+        b.i64_and();
+        b.i64_or();
+    }
+
+    /// Find the byte offset of codepoint `target` in `str` (local 0); stores in `off`
+    /// and sets `found` to 1 on success, leaves it 0 otherwise.
+    fn emit_cp_byte_offset(
+        &self,
+        b: &mut FnBuilder,
+        str: u32,
+        target: u32,
+        off: u32,
+        found: u32,
+    ) {
+        let len = b.new_local(VT_I64);
+        let i = b.new_local(VT_I64);
+        let cp = b.new_local(VT_I64);
+        let byte = b.new_local(VT_I64);
+        b.i64_const(0);
+        b.local_set(found);
+        b.local_get(str);
+        self.emit_len_read(b);
+        b.local_set(len);
+        b.i64_const(0);
+        b.local_set(i);
+        b.i64_const(0);
+        b.local_set(cp);
+        b.block_void();
+        b.loop_void();
+        {
+            b.local_get(i);
+            b.local_get(len);
+            b.i64_ge_u();
+            b.br_if(1);
+            b.local_get(str);
+            b.i64_const(HDR);
+            b.i64_add();
+            b.local_get(i);
+            b.i64_add();
+            b.i32_wrap_i64();
+            b.i64_load8_u(0);
+            b.local_set(byte);
+            b.local_get(byte);
+            b.i64_const(0x80);
+            b.i64_and();
+            b.i64_const(0x80);
+            b.i64_ne();
+            b.if_void();
+            {
+                b.local_get(cp);
+                b.local_get(target);
+                b.i64_eq();
+                b.if_void();
+                {
+                    b.local_get(i);
+                    b.local_set(off);
+                    b.i64_const(1);
+                    b.local_set(found);
+                    b.br(1);
+                }
+                b.end();
+                b.local_get(cp);
+                b.i64_const(1);
+                b.i64_add();
+                b.local_set(cp);
+            }
+            b.end();
+            b.local_get(i);
+            b.i64_const(1);
+            b.i64_add();
+            b.local_set(i);
+            b.br(0);
+        }
+        b.end();
+        b.end();
+    }
+
+    fn emit_char_at_cp(&mut self) -> Vec<u8> {
+        let mut b = FnBuilder::new(2);
+        let total = b.new_local(VT_I64);
+        let off = b.new_local(VT_I64);
+        let found = b.new_local(VT_I64);
+        b.local_get(1);
+        b.i64_const(0);
+        b.i64_lt_s();
+        b.if_void();
+        self.emit_fail(&mut b, "runtime error: codepoint index out of bounds");
+        b.end();
+        b.local_get(0);
+        b.call(self.h_len_cp);
+        b.local_tee(total);
+        b.local_get(1);
+        b.i64_ge_s();
+        b.if_void();
+        self.emit_fail(&mut b, "runtime error: codepoint index out of bounds");
+        b.end();
+        self.emit_cp_byte_offset(&mut b, 0, 1, off, found);
+        b.local_get(found);
+        b.i64_eqz();
+        b.if_void();
+        self.emit_fail(&mut b, "runtime error: codepoint index out of bounds");
+        b.end();
+        self.emit_utf8_decode_at(&mut b, 0, off);
+        b.finish()
+    }
+
+    fn emit_substr_cp(&mut self) -> Vec<u8> {
+        let mut b = FnBuilder::new(3);
+        let total = b.new_local(VT_I64);
+        let byte_start = b.new_local(VT_I64);
+        let byte_end = b.new_local(VT_I64);
+        let found = b.new_local(VT_I64);
+        let n = b.new_local(VT_I64);
+        let out = b.new_local(VT_I64);
+        b.local_get(1);
+        b.i64_const(0);
+        b.i64_lt_s();
+        b.local_get(1);
+        b.local_get(2);
+        b.i64_gt_s();
+        b.i32_or();
+        b.if_void();
+        self.emit_fail(&mut b, "runtime error: codepoint index out of bounds");
+        b.end();
+        b.local_get(0);
+        b.call(self.h_len_cp);
+        b.local_set(total);
+        b.local_get(2);
+        b.local_get(total);
+        b.i64_gt_s();
+        b.if_void();
+        self.emit_fail(&mut b, "runtime error: codepoint index out of bounds");
+        b.end();
+        self.emit_cp_byte_offset(&mut b, 0, 1, byte_start, found);
+        b.local_get(found);
+        b.i64_eqz();
+        b.if_void();
+        self.emit_fail(&mut b, "runtime error: codepoint index out of bounds");
+        b.end();
+        self.emit_cp_byte_offset(&mut b, 0, 2, byte_end, found);
+        b.local_get(found);
+        b.i64_eqz();
+        b.if_void();
+        self.emit_fail(&mut b, "runtime error: codepoint index out of bounds");
+        b.end();
+        b.local_get(byte_end);
+        b.local_get(byte_start);
+        b.i64_sub();
+        b.local_set(n);
+        b.i64_const(HDR);
+        b.local_get(n);
+        b.i64_add();
+        b.call(self.h_alloc);
+        b.local_set(out);
+        b.local_get(out);
+        b.i32_wrap_i64();
+        b.local_get(n);
+        b.i64_const(4);
+        b.i64_shl();
+        b.i64_store(0);
+        b.local_get(out);
+        b.i64_const(HDR);
+        b.i64_add();
+        b.i32_wrap_i64();
+        b.local_get(0);
+        b.i64_const(HDR);
+        b.i64_add();
+        b.local_get(byte_start);
+        b.i64_add();
+        b.i32_wrap_i64();
+        b.local_get(n);
+        b.i32_wrap_i64();
+        b.memory_copy();
+        b.local_get(out);
+        b.finish()
+    }
+
+    fn emit_chr_cp(&mut self) -> Vec<u8> {
+        let mut b = FnBuilder::new(1);
+        let out = b.new_local(VT_I64);
+        let n = b.new_local(VT_I64);
+        let b0 = b.new_local(VT_I64);
+        let b1 = b.new_local(VT_I64);
+        let b2 = b.new_local(VT_I64);
+        let b3 = b.new_local(VT_I64);
+        b.local_get(0);
+        b.i64_const(0);
+        b.i64_lt_s();
+        b.local_get(0);
+        b.i64_const(0x10FFFF);
+        b.i64_gt_s();
+        b.i32_or();
+        b.if_void();
+        self.emit_fail(&mut b, "runtime error: invalid Unicode scalar value");
+        b.end();
+        b.local_get(0);
+        b.i64_const(0xD800);
+        b.i64_ge_s();
+        b.local_get(0);
+        b.i64_const(0xDFFF);
+        b.i64_le_s();
+        b.i32_and();
+        b.if_void();
+        self.emit_fail(&mut b, "runtime error: invalid Unicode scalar value");
+        b.end();
+        b.block_void();
+        b.local_get(0);
+        b.i64_const(0x80);
+        b.i64_lt_u();
+        b.if_void();
+        {
+            b.i64_const(1);
+            b.local_set(n);
+            b.local_get(0);
+            b.local_set(b0);
+            b.br(0);
+        }
+        b.end();
+        b.local_get(0);
+        b.i64_const(0x800);
+        b.i64_lt_u();
+        b.if_void();
+        {
+            b.i64_const(2);
+            b.local_set(n);
+            b.i64_const(0xC0);
+            b.local_get(0);
+            b.i64_const(6);
+            b.i64_shr_u();
+            b.i64_or();
+            b.local_set(b0);
+            b.i64_const(0x80);
+            b.local_get(0);
+            b.i64_const(0x3F);
+            b.i64_and();
+            b.i64_or();
+            b.local_set(b1);
+            b.br(0);
+        }
+        b.end();
+        b.local_get(0);
+        b.i64_const(0x10000);
+        b.i64_lt_u();
+        b.if_void();
+        {
+            b.i64_const(3);
+            b.local_set(n);
+            b.i64_const(0xE0);
+            b.local_get(0);
+            b.i64_const(12);
+            b.i64_shr_u();
+            b.i64_or();
+            b.local_set(b0);
+            b.i64_const(0x80);
+            b.local_get(0);
+            b.i64_const(6);
+            b.i64_shr_u();
+            b.i64_const(0x3F);
+            b.i64_and();
+            b.i64_or();
+            b.local_set(b1);
+            b.i64_const(0x80);
+            b.local_get(0);
+            b.i64_const(0x3F);
+            b.i64_and();
+            b.i64_or();
+            b.local_set(b2);
+            b.br(0);
+        }
+        b.end();
+        b.i64_const(4);
+        b.local_set(n);
+        b.i64_const(0xF0);
+        b.local_get(0);
+        b.i64_const(18);
+        b.i64_shr_u();
+        b.i64_or();
+        b.local_set(b0);
+        b.i64_const(0x80);
+        b.local_get(0);
+        b.i64_const(12);
+        b.i64_shr_u();
+        b.i64_const(0x3F);
+        b.i64_and();
+        b.i64_or();
+        b.local_set(b1);
+        b.i64_const(0x80);
+        b.local_get(0);
+        b.i64_const(6);
+        b.i64_shr_u();
+        b.i64_const(0x3F);
+        b.i64_and();
+        b.i64_or();
+        b.local_set(b2);
+        b.i64_const(0x80);
+        b.local_get(0);
+        b.i64_const(0x3F);
+        b.i64_and();
+        b.i64_or();
+        b.local_set(b3);
+        b.end();
+        b.i64_const(HDR);
+        b.local_get(n);
+        b.i64_add();
+        b.call(self.h_alloc);
+        b.local_set(out);
+        b.local_get(out);
+        b.i32_wrap_i64();
+        b.local_get(n);
+        b.i64_const(4);
+        b.i64_shl();
+        b.i64_store(0);
+        b.local_get(out);
+        b.i32_wrap_i64();
+        b.local_get(b0);
+        b.i64_store8(HDR as u32);
+        b.local_get(n);
+        b.i64_const(2);
+        b.i64_ge_s();
+        b.if_void();
+        {
+            b.local_get(out);
+            b.i32_wrap_i64();
+            b.local_get(b1);
+            b.i64_store8(HDR as u32 + 1);
+        }
+        b.end();
+        b.local_get(n);
+        b.i64_const(3);
+        b.i64_ge_s();
+        b.if_void();
+        {
+            b.local_get(out);
+            b.i32_wrap_i64();
+            b.local_get(b2);
+            b.i64_store8(HDR as u32 + 2);
+        }
+        b.end();
+        b.local_get(n);
+        b.i64_const(4);
+        b.i64_ge_s();
+        b.if_void();
+        {
+            b.local_get(out);
+            b.i32_wrap_i64();
+            b.local_get(b3);
+            b.i64_store8(HDR as u32 + 3);
+        }
+        b.end();
+        b.local_get(out);
+        b.finish()
+    }
+
+    /// fn hash_str(s) -> i64: polynomial hash over UTF-8 bytes.
+    fn emit_hash_str(&mut self) -> Vec<u8> {
+        let mut b = FnBuilder::new(1);
+        let len = b.new_local(VT_I64);
+        let i = b.new_local(VT_I64);
+        let h = b.new_local(VT_I64);
+        b.local_get(0);
+        self.emit_len_read(&mut b);
+        b.local_set(len);
+        b.i64_const(0);
+        b.local_set(i);
+        b.i64_const(0);
+        b.local_set(h);
+        b.block_void();
+        b.loop_void();
+        {
+            b.local_get(i);
+            b.local_get(len);
+            b.i64_ge_u();
+            b.br_if(1);
+            b.local_get(h);
+            b.i64_const(31);
+            b.i64_mul();
+            b.local_get(0);
+            b.i64_const(HDR);
+            b.i64_add();
+            b.local_get(i);
+            b.i64_add();
+            b.i32_wrap_i64();
+            b.i64_load8_u(0);
+            b.i64_add();
+            b.i64_const(HASH_MOD);
+            b.i64_rem_s();
+            b.local_set(h);
+            b.local_get(i);
+            b.i64_const(1);
+            b.i64_add();
+            b.local_set(i);
+            b.br(0);
+        }
+        b.end();
+        b.end();
+        b.local_get(h);
+        b.finish()
+    }
 
     /// fn obj_size(meta: i64) -> i64 (total block bytes, 8-aligned)
     fn emit_obj_size(&mut self) -> Vec<u8> {
@@ -3605,6 +4295,98 @@ impl<'a> WasmCompiler<'a> {
                 self.expr(ctx, scope, &args[0], Some(&Type::Int));
                 ctx.b.call(self.h_chr);
             }
+            "len_cp" => {
+                self.expr(ctx, scope, &args[0], Some(&Type::Str));
+                ctx.b.call(self.h_len_cp);
+            }
+            "char_at_cp" => {
+                self.eval_operands_smart(
+                    ctx,
+                    scope,
+                    &[(&args[0], Some(Type::Str)), (&args[1], Some(Type::Int))],
+                );
+                ctx.b.call(self.h_char_at_cp);
+            }
+            "substr_cp" => {
+                self.eval_operands_smart(
+                    ctx,
+                    scope,
+                    &[
+                        (&args[0], Some(Type::Str)),
+                        (&args[1], Some(Type::Int)),
+                        (&args[2], Some(Type::Int)),
+                    ],
+                );
+                ctx.b.call(self.h_substr_cp);
+            }
+            "chr_cp" => {
+                self.expr(ctx, scope, &args[0], Some(&Type::Int));
+                ctx.b.call(self.h_chr_cp);
+            }
+            "hash" => {
+                let ty = self.type_of(&args[0], scope);
+                match ty {
+                    Type::Int => {
+                        self.expr(ctx, scope, &args[0], Some(&Type::Int));
+                        ctx.b.i64_const(HASH_MUL);
+                        ctx.b.i64_mul();
+                        ctx.b.i64_const(HASH_MOD);
+                        ctx.b.i64_rem_u();
+                    }
+                    Type::Bool => {
+                        // bool is already 0/1 as i64
+                        self.expr(ctx, scope, &args[0], Some(&Type::Bool));
+                    }
+                    Type::Str => {
+                        self.expr(ctx, scope, &args[0], Some(&Type::Str));
+                        ctx.b.call(self.h_hash_str);
+                    }
+                    _ => unreachable!("checked"),
+                }
+            }
+            "chan_new" => {
+                ctx.b.call(self.imp_chan_new);
+            }
+            "chan_close" => {
+                self.expr(ctx, scope, &args[0], Some(&Type::Int));
+                ctx.b.call(self.imp_chan_close);
+            }
+            "chan_send_int" | "chan_send_bool" => {
+                self.eval_operands_smart(
+                    ctx,
+                    scope,
+                    &[(&args[0], Some(Type::Int)), (&args[1], Some(Type::Int))],
+                );
+                ctx.b.call(self.imp_chan_send_i64);
+            }
+            "chan_send_float" => {
+                self.eval_operands_smart(
+                    ctx,
+                    scope,
+                    &[(&args[0], Some(Type::Int)), (&args[1], Some(Type::Float))],
+                );
+                ctx.b.call(self.imp_chan_send_f64);
+            }
+            "chan_send_str" => {
+                self.eval_operands_smart(
+                    ctx,
+                    scope,
+                    &[(&args[0], Some(Type::Int)), (&args[1], Some(Type::Str))],
+                );
+                ctx.b.call(self.imp_chan_send_str);
+            }
+            "chan_recv_int" | "chan_recv_bool" => {
+                self.expr(ctx, scope, &args[0], Some(&Type::Int));
+                ctx.b.call(self.imp_chan_recv_i64);
+            }
+            "chan_recv_float" => {
+                self.expr(ctx, scope, &args[0], Some(&Type::Int));
+                ctx.b.call(self.imp_chan_recv_f64);
+            }
+            "chan_recv_str" => {
+                self.expr(ctx, scope, &args[0], Some(&Type::Int));
+                ctx.b.call(self.imp_chan_recv_str);
+            }
             "spawn" => {
                 // spawn(f, args...) compiles to the task_spawn host import:
                 // the host deep-copies the argument graph out of this
@@ -3836,13 +4618,18 @@ impl<'a> WasmCompiler<'a> {
                 }
                 match name.as_str() {
                     "print" => Type::Unit,
-                    "len" | "to_int" | "char_at" => Type::Int,
-                    "spawn" | "join_int" => Type::Int,
-                    "join_bool" => Type::Bool,
-                    "to_float" => Type::Float,
-                    "join_float" => Type::Float,
-                    "substr" | "chr" => Type::Str,
-                    "join_str" => Type::Str,
+                    "len" | "to_int" | "char_at" | "len_cp" | "char_at_cp" | "hash" => Type::Int,
+                    "spawn" | "join_int" | "chan_new" | "chan_recv_int" => Type::Int,
+                    "join_bool" | "chan_recv_bool" => Type::Bool,
+                    "to_float" | "join_float" | "chan_recv_float" => Type::Float,
+                    "substr" | "chr" | "substr_cp" | "chr_cp" | "join_str" | "chan_recv_str" => {
+                        Type::Str
+                    }
+                    "chan_close"
+                    | "chan_send_int"
+                    | "chan_send_float"
+                    | "chan_send_bool"
+                    | "chan_send_str" => Type::Unit,
                     "push" => match self.type_of(&args[0], scope) {
                         t @ Type::Array(_) => t,
                         _ => Type::Array(Box::new(Type::Int)),

@@ -10,10 +10,11 @@
 use crate::ast::*;
 use crate::diag::Span;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::rc::Rc;
+use std::sync::{Arc, Condvar, Mutex};
 use ureq;
 
 #[derive(Debug, Clone)]
@@ -65,6 +66,78 @@ enum SendVal {
     Fn(String),
     Closure(usize, Vec<(String, SendVal)>),
     Unit,
+}
+
+// ---- channels (shared across spawn threads) ----
+
+struct ChanInner {
+    queue: Mutex<VecDeque<SendVal>>,
+    closed: std::sync::atomic::AtomicBool,
+    cvar: Condvar,
+}
+
+fn channels() -> &'static Mutex<HashMap<i64, Arc<ChanInner>>> {
+    static CHANNELS: std::sync::OnceLock<Mutex<HashMap<i64, Arc<ChanInner>>>> =
+        std::sync::OnceLock::new();
+    CHANNELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static NEXT_CHAN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+fn channel_new() -> i64 {
+    let id = NEXT_CHAN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ch = Arc::new(ChanInner {
+        queue: Mutex::new(VecDeque::new()),
+        closed: std::sync::atomic::AtomicBool::new(false),
+        cvar: Condvar::new(),
+    });
+    channels().lock().unwrap().insert(id, ch);
+    id
+}
+
+fn channel_close(id: i64) -> Result<(), String> {
+    let map = channels().lock().unwrap();
+    let ch = map
+        .get(&id)
+        .ok_or_else(|| format!("no channel with handle {}", id))?;
+    ch.closed
+        .store(true, std::sync::atomic::Ordering::Release);
+    ch.cvar.notify_all();
+    Ok(())
+}
+
+fn channel_send(id: i64, v: SendVal) -> Result<(), String> {
+    let ch = {
+        let map = channels().lock().unwrap();
+        map.get(&id)
+            .cloned()
+            .ok_or_else(|| format!("no channel with handle {}", id))?
+    };
+    if ch.closed.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(format!("send on closed channel {}", id));
+    }
+    ch.queue.lock().unwrap().push_back(v);
+    ch.cvar.notify_one();
+    Ok(())
+}
+
+fn channel_recv(id: i64) -> Result<SendVal, String> {
+    let ch = {
+        let map = channels().lock().unwrap();
+        map.get(&id)
+            .cloned()
+            .ok_or_else(|| format!("no channel with handle {}", id))?
+    };
+    let mut q = ch.queue.lock().unwrap();
+    loop {
+        if let Some(v) = q.pop_front() {
+            return Ok(v);
+        }
+        if ch.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(format!("receive on closed empty channel {}", id));
+        }
+        q = ch.cvar.wait(q).unwrap();
+    }
 }
 
 fn to_sendval(v: &Value) -> SendVal {
@@ -1052,6 +1125,139 @@ impl<'a> Interp<'a> {
                         }
                         _ => unreachable!(),
                     },
+                    "len_cp" => match &vals[0] {
+                        Value::Str(s) => {
+                            let st = std::str::from_utf8(s).map_err(|_| {
+                                RuntimeError::new("invalid UTF-8 in string", expr.span)
+                            })?;
+                            Ok(Value::Int(st.chars().count() as i64))
+                        }
+                        _ => unreachable!(),
+                    },
+                    "char_at_cp" => match (&vals[0], &vals[1]) {
+                        (Value::Str(s), Value::Int(i)) => {
+                            let st = std::str::from_utf8(s).map_err(|_| {
+                                RuntimeError::new("invalid UTF-8 in string", expr.span)
+                            })?;
+                            if *i < 0 {
+                                return Err(RuntimeError::new(
+                                    format!("codepoint index out of bounds: index {}", i),
+                                    expr.span,
+                                ));
+                            }
+                            st.chars()
+                                .nth(*i as usize)
+                                .map(|c| Value::Int(c as u32 as i64))
+                                .ok_or_else(|| {
+                                    RuntimeError::new(
+                                        format!(
+                                            "codepoint index out of bounds: index {} but length is {}",
+                                            i,
+                                            st.chars().count()
+                                        ),
+                                        expr.span,
+                                    )
+                                })
+                        }
+                        _ => unreachable!(),
+                    },
+                    "substr_cp" => match (&vals[0], &vals[1], &vals[2]) {
+                        (Value::Str(s), Value::Int(a), Value::Int(b)) => {
+                            let st = std::str::from_utf8(s).map_err(|_| {
+                                RuntimeError::new("invalid UTF-8 in string", expr.span)
+                            })?;
+                            let chars: Vec<char> = st.chars().collect();
+                            if *a < 0 || *a > *b || *b as usize > chars.len() {
+                                return Err(RuntimeError::new(
+                                    format!(
+                                        "codepoint index out of bounds: [{}, {}) on a string of length {}",
+                                        a,
+                                        b,
+                                        chars.len()
+                                    ),
+                                    expr.span,
+                                ));
+                            }
+                            let out: String = chars[*a as usize..*b as usize].iter().collect();
+                            Ok(Value::Str(Rc::new(out.into_bytes())))
+                        }
+                        _ => unreachable!(),
+                    },
+                    "chr_cp" => match vals[0] {
+                        Value::Int(c) => {
+                            if c < 0 || c > 0x10FFFF || (0xD800..=0xDFFF).contains(&c) {
+                                return Err(RuntimeError::new(
+                                    format!("invalid Unicode scalar value: {}", c),
+                                    expr.span,
+                                ));
+                            }
+                            let ch = char::from_u32(c as u32).ok_or_else(|| {
+                                RuntimeError::new(
+                                    format!("invalid Unicode scalar value: {}", c),
+                                    expr.span,
+                                )
+                            })?;
+                            let mut buf = [0u8; 4];
+                            let encoded = ch.encode_utf8(&mut buf);
+                            Ok(Value::Str(Rc::new(encoded.as_bytes().to_vec())))
+                        }
+                        _ => unreachable!(),
+                    },
+                    "hash" => match &vals[0] {
+                        Value::Int(n) => {
+                            let h = (*n as u64).wrapping_mul(11400714819323198485) % 1_000_000_007;
+                            Ok(Value::Int(h as i64))
+                        }
+                        Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
+                        Value::Str(s) => {
+                            let mut h: i64 = 0;
+                            for &b in s.iter() {
+                                h = (h * 31 + b as i64).rem_euclid(1_000_000_007);
+                            }
+                            Ok(Value::Int(h))
+                        }
+                        _ => unreachable!(),
+                    },
+                    "chan_new" => {
+                        let id = channel_new();
+                        Ok(Value::Int(id))
+                    }
+                    "chan_close" => match vals[0] {
+                        Value::Int(id) => {
+                            channel_close(id).map_err(|m| RuntimeError::new(m, expr.span))?;
+                            Ok(Value::Unit)
+                        }
+                        _ => unreachable!(),
+                    },
+                    "chan_send_int" | "chan_send_float" | "chan_send_bool" | "chan_send_str" => {
+                        let Value::Int(id) = vals[0] else { unreachable!() };
+                        channel_send(id, to_sendval(&vals[1]))
+                            .map_err(|m| RuntimeError::new(m, expr.span))?;
+                        Ok(Value::Unit)
+                    }
+                    "chan_recv_int" | "chan_recv_float" | "chan_recv_bool" | "chan_recv_str" => {
+                        let Value::Int(id) = vals[0] else { unreachable!() };
+                        let sv = channel_recv(id).map_err(|m| RuntimeError::new(m, expr.span))?;
+                        let val = from_sendval(sv);
+                        let ok = matches!(
+                            (name.as_str(), &val),
+                            ("chan_recv_int", Value::Int(_))
+                                | ("chan_recv_float", Value::Float(_))
+                                | ("chan_recv_bool", Value::Bool(_))
+                                | ("chan_recv_str", Value::Str(_))
+                        );
+                        if !ok {
+                            return Err(RuntimeError::new(
+                                format!(
+                                    "{}: channel delivered a value of a different type ({})",
+                                    name,
+                                    val.display()
+                                ),
+                                expr.span,
+                            ));
+                        }
+                        Ok(val)
+                    }
                     "spawn" => {
                         let Some(program) = SPAWN_PROGRAM.get() else {
                             return Err(RuntimeError::new(

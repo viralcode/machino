@@ -1,6 +1,6 @@
 [package]
 name = "machino"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "An AI-first programming language that compiles to WebAssembly"
 license = "MIT"

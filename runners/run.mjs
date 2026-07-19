@@ -164,6 +164,61 @@ const tasks = new Map();
 let nextTask = 1;
 let wasmModule; // compiled module, shared with workers
 
+// ---- channels (main-thread host queues) ----
+
+const channels = new Map();
+let nextChan = 1;
+
+function runtimeError(msg) {
+  console.error(msg);
+  process.exit(1);
+}
+
+function getChan(id) {
+  const ch = channels.get(Number(id));
+  if (!ch) {
+    runtimeError(`runtime error: no channel with handle ${id}`);
+  }
+  return ch;
+}
+
+function makeChannel() {
+  return {
+    queue: [],
+    closed: false,
+    signal: new Int32Array(new SharedArrayBuffer(4)),
+  };
+}
+
+function chanSendEnqueue(ch, val) {
+  if (ch.closed) {
+    runtimeError("runtime error: send on closed channel");
+  }
+  ch.queue.push(val);
+  Atomics.add(ch.signal, 0, 1);
+  Atomics.notify(ch.signal, 0);
+}
+
+function chanRecvWait(ch) {
+  for (;;) {
+    if (ch.queue.length > 0) {
+      return ch.queue.shift();
+    }
+    if (ch.closed) {
+      runtimeError("runtime error: receive on closed empty channel");
+    }
+    const epoch = Atomics.load(ch.signal, 0);
+    Atomics.wait(ch.signal, 0, epoch);
+  }
+}
+
+function copyStrBytes(addr) {
+  const a = Number(addr);
+  const view = new DataView(memory.buffer);
+  const len = Number(view.getBigInt64(a, true) >> 4n);
+  return new Uint8Array(memory.buffer.slice(a + 16, a + 16 + len));
+}
+
 function makeImports(programArgs) {
   return {
     env: {
@@ -224,6 +279,55 @@ function makeImports(programArgs) {
         const len = new DataView(sab).getInt32(4, true);
         const bytes = new Uint8Array(sab.slice(8, 8 + len));
         return makeBytes(bytes);
+      },
+      // ---- channels (blocking queues on the main host thread) ----
+      chan_new() {
+        const id = nextChan++;
+        channels.set(id, makeChannel());
+        return BigInt(id);
+      },
+      chan_close(id) {
+        const ch = getChan(id);
+        if (ch.closed) return;
+        ch.closed = true;
+        Atomics.add(ch.signal, 0, 1);
+        Atomics.notify(ch.signal, 0);
+      },
+      chan_send_i64(id, val) {
+        chanSendEnqueue(getChan(id), { kind: "i64", v: val });
+      },
+      chan_send_f64(id, val) {
+        chanSendEnqueue(getChan(id), { kind: "f64", v: val });
+      },
+      chan_send_str(id, ptr) {
+        chanSendEnqueue(getChan(id), { kind: "str", bytes: copyStrBytes(ptr) });
+      },
+      chan_recv_i64(id) {
+        const v = chanRecvWait(getChan(id));
+        if (v.kind !== "i64") {
+          runtimeError(
+            "runtime error: chan_recv_i64: channel delivered a value of a different type"
+          );
+        }
+        return v.v;
+      },
+      chan_recv_f64(id) {
+        const v = chanRecvWait(getChan(id));
+        if (v.kind !== "f64") {
+          runtimeError(
+            "runtime error: chan_recv_f64: channel delivered a value of a different type"
+          );
+        }
+        return v.v;
+      },
+      chan_recv_str(id) {
+        const v = chanRecvWait(getChan(id));
+        if (v.kind !== "str") {
+          runtimeError(
+            "runtime error: chan_recv_str: channel delivered a value of a different type"
+          );
+        }
+        return makeBytes(v.bytes);
       },
       // ---- native externs (declare the ones you need with `extern fn`) ----
       clock_ms() {

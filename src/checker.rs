@@ -4,6 +4,7 @@
 
 use crate::ast::*;
 use crate::diag::{Diagnostic, Span};
+use crate::mono::{contains_typevar, mangle};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -23,11 +24,15 @@ pub struct Checker<'a> {
     pub type_params: Vec<String>,
     /// Constraint bounds of the type parameters currently in scope.
     pub type_param_bounds: HashMap<String, Vec<String>>,
+    type_params_stack: Vec<Vec<String>>,
+    type_param_bounds_stack: Vec<HashMap<String, Vec<String>>>,
     /// Names of generic (templated) functions in the program.
     pub generic_fns: HashMap<String, usize>,
     /// Generic call instantiations discovered during checking:
     /// call span -> (function name, inferred type arguments).
     pub instantiations: std::cell::RefCell<Vec<(Span, String, Vec<Type>)>>,
+    /// mangled struct/enum name -> (template name, type arguments)
+    mangle_map: std::cell::RefCell<HashMap<String, (String, Vec<Type>)>>,
     diags: Vec<Diagnostic>,
     loop_depth: u32,
 }
@@ -67,7 +72,15 @@ pub fn apply_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
 /// substitutable type variables in `tps`) against a concrete argument type,
 /// extending `subst`. Type variables NOT in `tps` are rigid (they belong to
 /// an enclosing generic function) and only match themselves.
-fn unify_ty(param: &Type, arg: &Type, tps: &[&str], subst: &mut HashMap<String, Type>) -> bool {
+fn unify_ty(
+    param: &Type,
+    arg: &Type,
+    tps: &[&str],
+    subst: &mut HashMap<String, Type>,
+    demangle: &HashMap<String, (String, Vec<Type>)>,
+    struct_tps: &HashMap<String, Vec<String>>,
+    enum_tps: &HashMap<String, Vec<String>>,
+) -> bool {
     match (param, arg) {
         (Type::TypeVar(n), a) if tps.contains(&n.as_str()) => match subst.get(n) {
             Some(bound) => bound == a,
@@ -77,11 +90,73 @@ fn unify_ty(param: &Type, arg: &Type, tps: &[&str], subst: &mut HashMap<String, 
             }
         },
         (Type::TypeVar(n), Type::TypeVar(m)) => n == m,
-        (Type::Array(p), Type::Array(a)) => unify_ty(p, a, tps, subst),
+        (Type::Array(p), Type::Array(a)) => unify_ty(p, a, tps, subst, demangle, struct_tps, enum_tps),
         (Type::Fn(pp, pr), Type::Fn(ap, ar)) => {
             pp.len() == ap.len()
-                && pp.iter().zip(ap).all(|(p, a)| unify_ty(p, a, tps, subst))
-                && unify_ty(pr, ar, tps, subst)
+                && pp.iter().zip(ap).all(|(p, a)| {
+                    unify_ty(p, a, tps, subst, demangle, struct_tps, enum_tps)
+                })
+                && unify_ty(pr, ar, tps, subst, demangle, struct_tps, enum_tps)
+        }
+        (Type::Struct(p), Type::Struct(a)) | (Type::Enum(p), Type::Enum(a)) => {
+            if p == a {
+                return true;
+            }
+            let nominal_tps = |name: &str| -> Option<&Vec<String>> {
+                struct_tps.get(name).or_else(|| enum_tps.get(name))
+            };
+            let polymorphic_key = |template: &str, tp_list: &[String]| -> String {
+                mangle(
+                    template,
+                    &tp_list
+                        .iter()
+                        .map(|n| Type::TypeVar(n.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            if let Some((template, args)) = demangle.get(a) {
+                if p == template || Some(p.as_str()) == Some(template.as_str()) {
+                    if let Some(tp_list) = nominal_tps(template) {
+                        if tp_list.len() == args.len() {
+                            return tp_list.iter().zip(args).all(|(tp_name, arg_ty)| {
+                                unify_ty(
+                                    &Type::TypeVar(tp_name.clone()),
+                                    arg_ty,
+                                    tps,
+                                    subst,
+                                    demangle,
+                                    struct_tps,
+                                    enum_tps,
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+            for (template, tp_list) in struct_tps.iter().chain(enum_tps.iter()) {
+                if tp_list.is_empty() {
+                    continue;
+                }
+                let poly = polymorphic_key(template, tp_list);
+                if p == &poly {
+                    if let Some((template2, args)) = demangle.get(a) {
+                        if template2 == template && tp_list.len() == args.len() {
+                            return tp_list.iter().zip(args).all(|(tp_name, arg_ty)| {
+                                unify_ty(
+                                    &Type::TypeVar(tp_name.clone()),
+                                    arg_ty,
+                                    tps,
+                                    subst,
+                                    demangle,
+                                    struct_tps,
+                                    enum_tps,
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+            false
         }
         _ => param == arg,
     }
@@ -99,8 +174,20 @@ fn closest<'x>(name: &str, candidates: impl Iterator<Item = &'x str>) -> Option<
     best.filter(|&(_, d)| d > 0).map(|(c, _)| c)
 }
 
+fn bound_help(bound: &str) -> &'static str {
+    match bound {
+        "Num" | "Ord" => "satisfied by: int, float",
+        "Hash" => "satisfied by: int, bool, str (for hash())",
+        _ => "satisfied by: int, float, bool, str",
+    }
+}
+
 pub const BUILTINS: &[&str] = &[
     "print", "len", "push", "to_float", "to_int", "char_at", "substr", "chr",
+    "len_cp", "char_at_cp", "substr_cp", "chr_cp", "hash",
+    "chan_new", "chan_close",
+    "chan_send_int", "chan_send_float", "chan_send_bool", "chan_send_str",
+    "chan_recv_int", "chan_recv_float", "chan_recv_bool", "chan_recv_str",
     "spawn", "join_int", "join_float", "join_bool", "join_str",
 ];
 
@@ -170,8 +257,11 @@ impl<'a> Checker<'a> {
             enums: HashMap::new(),
             type_params: Vec::new(),
             type_param_bounds: HashMap::new(),
+            type_params_stack: Vec::new(),
+            type_param_bounds_stack: Vec::new(),
             generic_fns: HashMap::new(),
             instantiations: std::cell::RefCell::new(Vec::new()),
+            mangle_map: std::cell::RefCell::new(HashMap::new()),
             diags: Vec::new(),
             loop_depth: 0,
         }
@@ -179,6 +269,9 @@ impl<'a> Checker<'a> {
 
     /// Puts a function/struct/enum's type parameters (and bounds) in scope.
     fn enter_type_params(&mut self, tps: &[TypeParam]) {
+        self.type_params_stack.push(self.type_params.clone());
+        self.type_param_bounds_stack
+            .push(self.type_param_bounds.clone());
         self.type_params = tps.iter().map(|tp| tp.name.clone()).collect();
         self.type_param_bounds = tps
             .iter()
@@ -187,8 +280,501 @@ impl<'a> Checker<'a> {
     }
 
     fn exit_type_params(&mut self) {
-        self.type_params.clear();
-        self.type_param_bounds.clear();
+        self.type_params = self.type_params_stack.pop().unwrap_or_default();
+        self.type_param_bounds = self
+            .type_param_bounds_stack
+            .pop()
+            .unwrap_or_default();
+    }
+
+    fn struct_type_params(&self) -> HashMap<String, Vec<String>> {
+        self.program
+            .structs
+            .iter()
+            .filter(|s| !s.type_params.is_empty())
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    s.type_params.iter().map(|tp| tp.name.clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn enum_type_params(&self) -> HashMap<String, Vec<String>> {
+        self.program
+            .enums
+            .iter()
+            .filter(|e| !e.type_params.is_empty())
+            .map(|e| {
+                (
+                    e.name.clone(),
+                    e.type_params.iter().map(|tp| tp.name.clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn unify(
+        &self,
+        param: &Type,
+        arg: &Type,
+        tps: &[&str],
+        subst: &mut HashMap<String, Type>,
+    ) -> bool {
+        unify_ty(
+            param,
+            arg,
+            tps,
+            subst,
+            &self.mangle_map.borrow(),
+            &self.struct_type_params(),
+            &self.enum_type_params(),
+        )
+    }
+
+    fn expand_generic_nominal(&mut self, ty: &Type) -> Type {
+        match ty {
+            Type::Struct(name) => {
+                if let Some(sd) = self.program.structs.iter().find(|s| s.name == *name) {
+                    if !sd.type_params.is_empty()
+                        && sd
+                            .type_params
+                            .iter()
+                            .all(|tp| self.type_params.contains(&tp.name))
+                    {
+                        let args: Vec<Type> = sd
+                            .type_params
+                            .iter()
+                            .map(|tp| Type::TypeVar(tp.name.clone()))
+                            .collect();
+                        self.ensure_struct_instance(name, &args);
+                        return Type::Struct(mangle(name, &args));
+                    }
+                }
+                ty.clone()
+            }
+            Type::Enum(name) => {
+                if let Some(ed) = self.program.enums.iter().find(|e| e.name == *name) {
+                    if !ed.type_params.is_empty()
+                        && ed
+                            .type_params
+                            .iter()
+                            .all(|tp| self.type_params.contains(&tp.name))
+                    {
+                        let args: Vec<Type> = ed
+                            .type_params
+                            .iter()
+                            .map(|tp| Type::TypeVar(tp.name.clone()))
+                            .collect();
+                        self.ensure_enum_instance(name, &args);
+                        return Type::Enum(mangle(name, &args));
+                    }
+                }
+                ty.clone()
+            }
+            Type::Array(inner) => Type::Array(Box::new(self.expand_generic_nominal(inner))),
+            Type::Fn(ps, r) => Type::Fn(
+                ps.iter().map(|p| self.expand_generic_nominal(p)).collect(),
+                Box::new(self.expand_generic_nominal(r)),
+            ),
+            _ => ty.clone(),
+        }
+    }
+
+    fn ensure_struct_instance(&mut self, template: &str, type_args: &[Type]) {
+        let mangled = mangle(template, type_args);
+        if self.structs.contains_key(&mangled) {
+            self.mangle_map
+                .borrow_mut()
+                .entry(mangled)
+                .or_insert((template.to_string(), type_args.to_vec()));
+            return;
+        }
+        let Some(sd) = self.program.structs.iter().find(|s| s.name == template) else {
+            return;
+        };
+        let subst: HashMap<String, Type> = sd
+            .type_params
+            .iter()
+            .map(|tp| tp.name.clone())
+            .zip(type_args.iter().cloned())
+            .collect();
+        let fields: Vec<Param> = sd
+            .fields
+            .iter()
+            .map(|f| Param {
+                name: f.name.clone(),
+                ty: apply_subst(&f.ty, &subst),
+                span: f.span,
+            })
+            .collect();
+        self.structs.insert(mangled.clone(), fields);
+        self.mangle_map
+            .borrow_mut()
+            .insert(mangled, (template.to_string(), type_args.to_vec()));
+    }
+
+    fn ensure_enum_instance(&mut self, template: &str, type_args: &[Type]) {
+        let mangled = mangle(template, type_args);
+        if self.enums.contains_key(&mangled) {
+            self.mangle_map
+                .borrow_mut()
+                .entry(mangled)
+                .or_insert((template.to_string(), type_args.to_vec()));
+            return;
+        }
+        let Some(ed) = self.program.enums.iter().find(|e| e.name == template) else {
+            return;
+        };
+        let subst: HashMap<String, Type> = ed
+            .type_params
+            .iter()
+            .map(|tp| tp.name.clone())
+            .zip(type_args.iter().cloned())
+            .collect();
+        let variants: Vec<EnumVariant> = ed
+            .variants
+            .iter()
+            .map(|v| EnumVariant {
+                name: v.name.clone(),
+                payload: v
+                    .payload
+                    .as_ref()
+                    .map(|p| apply_subst(p, &subst)),
+                span: v.span,
+            })
+            .collect();
+        self.enums.insert(mangled.clone(), variants);
+        self.mangle_map
+            .borrow_mut()
+            .insert(mangled, (template.to_string(), type_args.to_vec()));
+    }
+
+    fn subst_type(&mut self, ty: &Type, subst: &HashMap<String, Type>) -> Type {
+        match ty {
+            Type::TypeVar(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
+            Type::Array(inner) => Type::Array(Box::new(self.subst_type(inner, subst))),
+            Type::Fn(ps, r) => Type::Fn(
+                ps.iter().map(|p| self.subst_type(p, subst)).collect(),
+                Box::new(self.subst_type(r, subst)),
+            ),
+            Type::Struct(name) => {
+                if let Some(tp_list) = self.struct_type_params().get(name) {
+                    let mut args = Vec::new();
+                    for tp in tp_list {
+                        match subst.get(tp) {
+                            Some(t) => args.push(self.subst_type(t, subst)),
+                            None => return Type::Struct(name.clone()),
+                        }
+                    }
+                    let mangled = mangle(name, &args);
+                    if args.iter().any(contains_typevar) {
+                        return Type::Struct(mangled);
+                    }
+                    self.ensure_struct_instance(name, &args);
+                    Type::Struct(mangled)
+                } else {
+                    Type::Struct(name.clone())
+                }
+            }
+            Type::Enum(name) => {
+                if let Some(tp_list) = self.enum_type_params().get(name) {
+                    let mut args = Vec::new();
+                    for tp in tp_list {
+                        match subst.get(tp) {
+                            Some(t) => args.push(self.subst_type(t, subst)),
+                            None => return Type::Enum(name.clone()),
+                        }
+                    }
+                    let mangled = mangle(name, &args);
+                    if args.iter().any(contains_typevar) {
+                        return Type::Enum(mangled);
+                    }
+                    self.ensure_enum_instance(name, &args);
+                    Type::Enum(mangled)
+                } else {
+                    Type::Enum(name.clone())
+                }
+            }
+            _ => ty.clone(),
+        }
+    }
+
+    fn type_args_from_expected(&self, enum_name: &str, expected: &Type) -> Option<Vec<Type>> {
+        if let Type::Enum(en) = expected {
+            if let Some((template, args)) = self.mangle_map.borrow().get(en).cloned() {
+                if template == enum_name && !args.iter().any(contains_typevar) {
+                    return Some(args);
+                }
+            }
+        }
+        None
+    }
+
+    fn check_struct_ctor(
+        &mut self,
+        name: &str,
+        sd: &StructDef,
+        args: &[Expr],
+        span: Span,
+        scope: &mut Scope,
+    ) -> Option<Type> {
+        if args.len() != sd.fields.len() {
+            self.diags.push(Diagnostic::new(
+                "E045",
+                format!(
+                    "'{}' takes {} field argument(s), found {}",
+                    name,
+                    sd.fields.len(),
+                    args.len()
+                ),
+                span,
+            ));
+            return None;
+        }
+        self.enter_type_params(&sd.type_params);
+        let tp_names: Vec<&str> = sd.type_params.iter().map(|tp| tp.name.as_str()).collect();
+        let mut subst: HashMap<String, Type> = HashMap::new();
+        let mut ok = true;
+        for (field, arg) in sd.fields.iter().zip(args) {
+            let Some(aty) = self.infer(arg, scope, None) else {
+                ok = false;
+                continue;
+            };
+            let aty = self.normalize_type(&aty);
+            let fty = self.expand_generic_nominal(&self.normalize_type(&field.ty));
+            if !self.unify(&fty, &aty, &tp_names, &mut subst) {
+                self.diags.push(Diagnostic::new(
+                    "E030",
+                    format!(
+                        "type mismatch: field '{}' of '{}' expects '{}', found '{}'",
+                        field.name,
+                        name,
+                        apply_subst(&fty, &subst),
+                        aty
+                    ),
+                    arg.span,
+                ));
+                ok = false;
+            }
+        }
+        self.exit_type_params();
+        if !ok {
+            return None;
+        }
+        let mut type_args = Vec::new();
+        for tp in &sd.type_params {
+            match subst.get(&tp.name) {
+                Some(t) => type_args.push(t.clone()),
+                None => {
+                    self.diags.push(
+                        Diagnostic::new(
+                            "E064",
+                            format!(
+                                "cannot infer type parameter '{}' of '{}' from the arguments",
+                                tp.name, name
+                            ),
+                            span,
+                        )
+                        .with_help(
+                            "every type parameter must appear in at least one field type",
+                        ),
+                    );
+                    return None;
+                }
+            }
+        }
+        for (tp, ta) in sd.type_params.iter().zip(type_args.iter()) {
+            for b in &tp.bounds {
+                if !self.satisfies_bound(ta, b) {
+                    self.diags.push(
+                        Diagnostic::new(
+                            "E069",
+                            format!(
+                                "type '{}' does not satisfy the constraint '{}: {}' of '{}'",
+                                ta, tp.name, b, name
+                            ),
+                            span,
+                        )
+                        .with_help(bound_help(b)),
+                    );
+                    return None;
+                }
+            }
+        }
+        self.ensure_struct_instance(name, &type_args);
+        if !type_args.iter().any(contains_typevar) {
+            self.instantiations
+                .borrow_mut()
+                .push((span, name.to_string(), type_args.clone()));
+        }
+        Some(Type::Struct(mangle(name, &type_args)))
+    }
+
+    fn check_enum_variant_call(
+        &mut self,
+        enum_name: &str,
+        variant_name: &str,
+        ed: &EnumDef,
+        args: &[Expr],
+        span: Span,
+        scope: &mut Scope,
+        expected: Option<&Type>,
+    ) -> Option<Type> {
+        let Some(variant) = ed.variants.iter().find(|v| v.name == variant_name) else {
+            self.diags.push(Diagnostic::new(
+                "E060",
+                format!("enum '{}' has no variant '{}'", enum_name, variant_name),
+                span,
+            ));
+            return None;
+        };
+        if ed.type_params.is_empty() {
+            if let Some(ref payload_ty) = variant.payload {
+                if args.len() != 1 {
+                    self.diags.push(Diagnostic::new(
+                        "E045",
+                        format!(
+                            "{}::{} takes exactly 1 argument, found {}",
+                            enum_name,
+                            variant_name,
+                            args.len()
+                        ),
+                        span,
+                    ));
+                } else {
+                    self.check_args(
+                        &format!("{}::{}", enum_name, variant_name),
+                        &[payload_ty.clone()],
+                        args,
+                        span,
+                        scope,
+                    );
+                }
+            } else if !args.is_empty() {
+                self.diags.push(Diagnostic::new(
+                    "E045",
+                    format!(
+                        "{}::{} takes no arguments, found {}",
+                        enum_name, variant_name, args.len()
+                    ),
+                    span,
+                ));
+            }
+            return Some(Type::Enum(enum_name.to_string()));
+        }
+
+        self.enter_type_params(&ed.type_params);
+        let tp_names: Vec<&str> = ed.type_params.iter().map(|tp| tp.name.as_str()).collect();
+        let mut subst: HashMap<String, Type> = HashMap::new();
+        let mut ok = true;
+
+        if let Some(ref payload_ty) = variant.payload {
+            if args.len() != 1 {
+                self.diags.push(Diagnostic::new(
+                    "E045",
+                    format!(
+                        "{}::{} takes exactly 1 argument, found {}",
+                        enum_name,
+                        variant_name,
+                        args.len()
+                    ),
+                    span,
+                ));
+                self.exit_type_params();
+                return None;
+            }
+            let Some(aty) = self.infer(&args[0], scope, None) else {
+                self.exit_type_params();
+                return None;
+            };
+            let aty = self.normalize_type(&aty);
+            let pty = self.expand_generic_nominal(&self.normalize_type(payload_ty));
+            if !self.unify(&pty, &aty, &tp_names, &mut subst) {
+                self.diags.push(Diagnostic::new(
+                    "E030",
+                    format!(
+                        "type mismatch: {}::{} expects payload '{}', found '{}'",
+                        enum_name,
+                        variant_name,
+                        apply_subst(&pty, &subst),
+                        aty
+                    ),
+                    args[0].span,
+                ));
+                ok = false;
+            }
+        } else if !args.is_empty() {
+            self.diags.push(Diagnostic::new(
+                "E045",
+                format!(
+                    "{}::{} takes no arguments, found {}",
+                    enum_name, variant_name, args.len()
+                ),
+                span,
+            ));
+            ok = false;
+        } else if let Some(exp) = expected {
+            if let Some(args_from_exp) = self.type_args_from_expected(enum_name, exp) {
+                for (tp, ta) in ed.type_params.iter().zip(args_from_exp.iter()) {
+                    subst.insert(tp.name.clone(), ta.clone());
+                }
+            }
+        }
+
+        self.exit_type_params();
+        if !ok {
+            return None;
+        }
+
+        let mut type_args = Vec::new();
+        for tp in &ed.type_params {
+            match subst.get(&tp.name) {
+                Some(t) => type_args.push(t.clone()),
+                None => {
+                    self.diags.push(
+                        Diagnostic::new(
+                            "E064",
+                            format!(
+                                "cannot infer type parameter '{}' of '{}::{}'",
+                                tp.name, enum_name, variant_name
+                            ),
+                            span,
+                        )
+                        .with_help(
+                            "provide a payload, or annotate the expected enum type",
+                        ),
+                    );
+                    return None;
+                }
+            }
+        }
+        for (tp, ta) in ed.type_params.iter().zip(type_args.iter()) {
+            for b in &tp.bounds {
+                if !self.satisfies_bound(ta, b) {
+                    self.diags.push(
+                        Diagnostic::new(
+                            "E069",
+                            format!(
+                                "type '{}' does not satisfy the constraint '{}: {}' of '{}'",
+                                ta, tp.name, b, enum_name
+                            ),
+                            span,
+                        )
+                        .with_help(bound_help(b)),
+                    );
+                    return None;
+                }
+            }
+        }
+        self.ensure_enum_instance(enum_name, &type_args);
+        if !type_args.iter().any(contains_typevar) {
+            self.instantiations
+                .borrow_mut()
+                .push((span, enum_name.to_string(), type_args.clone()));
+        }
+        Some(Type::Enum(mangle(enum_name, &type_args)))
     }
 
     /// Does `ty` satisfy the named constraint bound?
@@ -205,6 +791,7 @@ impl<'a> Checker<'a> {
             "Eq" => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
             "Ord" => matches!(ty, Type::Int | Type::Float),
             "Num" => matches!(ty, Type::Int | Type::Float),
+            "Hash" => matches!(ty, Type::Int | Type::Bool | Type::Str),
             _ => false,
         }
     }
@@ -461,7 +1048,10 @@ impl<'a> Checker<'a> {
                 }
             }
             Type::Struct(name) => {
-                if !self.structs.contains_key(name) && !self.enums.contains_key(name) {
+                if !self.structs.contains_key(name)
+                    && !self.enums.contains_key(name)
+                    && !self.mangle_map.borrow().contains_key(name)
+                {
                     self.diags.push(
                         Diagnostic::new("E018", format!("unknown type '{}'", name), span).with_help(
                             "valid types: int, float, bool, str, [T], fn(T...) -> R, or a declared struct/enum",
@@ -470,7 +1060,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Type::Enum(name) => {
-                if !self.enums.contains_key(name) {
+                if !self.enums.contains_key(name) && !self.mangle_map.borrow().contains_key(name) {
                     self.diags.push(
                         Diagnostic::new("E018", format!("unknown enum '{}'", name), span).with_help(
                             "valid types: int, float, bool, str, [T], fn(T...) -> R, or a declared struct/enum",
@@ -528,7 +1118,8 @@ impl<'a> Checker<'a> {
     fn check_function_inner(&mut self, f: &Function) {
         let mut scope = Scope::new();
         for p in &f.params {
-            if !scope.declare(&p.name, p.ty.clone()) {
+            let pty = self.expand_generic_nominal(&p.ty);
+            if !scope.declare(&p.name, pty) {
                 self.diags.push(Diagnostic::new(
                     "E023",
                     format!("duplicate parameter name '{}'", p.name),
@@ -545,10 +1136,10 @@ impl<'a> Checker<'a> {
             // 'result' is in scope for ensures clauses
             let mut ens_scope = Scope::new();
             for p in &f.params {
-                ens_scope.declare(&p.name, p.ty.clone());
+                ens_scope.declare(&p.name, self.expand_generic_nominal(&p.ty));
             }
             if f.ret != Type::Unit {
-                ens_scope.declare("result", f.ret.clone());
+                ens_scope.declare("result", self.expand_generic_nominal(&f.ret));
             } else if !f.ensures.is_empty() {
                 self.diags.push(
                     Diagnostic::new(
@@ -572,7 +1163,8 @@ impl<'a> Checker<'a> {
             return;
         }
 
-        self.check_stmts(&f.body, &mut scope, &f.ret, false);
+        let body_ret = self.expand_generic_nominal(&f.ret);
+        self.check_stmts(&f.body, &mut scope, &body_ret, false);
 
         if f.ret != Type::Unit && !always_returns(&f.body) {
             self.diags.push(
@@ -967,8 +1559,8 @@ impl<'a> Checker<'a> {
                 if let Some(colon_pos) = name.rfind("::") {
                     let enum_name = &name[..colon_pos];
                     let variant_name = &name[colon_pos + 2..];
-                    if let Some(variants) = self.enums.get(enum_name) {
-                        if let Some(variant) = variants.iter().find(|v| v.name == variant_name) {
+                    if let Some(ed) = self.program.enums.iter().find(|e| e.name == enum_name) {
+                        if let Some(variant) = ed.variants.iter().find(|v| v.name == variant_name) {
                             if variant.payload.is_some() {
                                 self.diags.push(Diagnostic::new(
                                     "E063",
@@ -979,6 +1571,17 @@ impl<'a> Checker<'a> {
                                     expr.span,
                                 ).with_help(format!("use {}::{}(value)", enum_name, variant_name)));
                                 return None;
+                            }
+                            if !ed.type_params.is_empty() {
+                                return self.check_enum_variant_call(
+                                    enum_name,
+                                    variant_name,
+                                    ed,
+                                    &[],
+                                    expr.span,
+                                    scope,
+                                    expected,
+                                );
                             }
                             return Some(Type::Enum(enum_name.to_string()));
                         }
@@ -1641,6 +2244,113 @@ impl<'a> Checker<'a> {
                 "substr",
             ),
             "chr" => self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Str, "chr"),
+            "len_cp" => {
+                self.check_builtin_sig(args, span, scope, &[Type::Str], Type::Int, "len_cp")
+            }
+            "char_at_cp" => self.check_builtin_sig(
+                args,
+                span,
+                scope,
+                &[Type::Str, Type::Int],
+                Type::Int,
+                "char_at_cp",
+            ),
+            "substr_cp" => self.check_builtin_sig(
+                args,
+                span,
+                scope,
+                &[Type::Str, Type::Int, Type::Int],
+                Type::Str,
+                "substr_cp",
+            ),
+            "chr_cp" => {
+                self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Str, "chr_cp")
+            }
+            "hash" => {
+                if args.len() != 1 {
+                    self.diags.push(Diagnostic::new(
+                        "E045",
+                        format!("hash takes exactly 1 argument, found {}", args.len()),
+                        span,
+                    ));
+                    return Some(Type::Int);
+                }
+                if let Some(ty) = self.infer(&args[0], scope, None) {
+                    if !self.satisfies_bound(&ty, "Hash") {
+                        self.diags.push(
+                            Diagnostic::new(
+                                "E046",
+                                format!("hash requires a Hash type, found '{}'", ty),
+                                args[0].span,
+                            )
+                            .with_help("satisfied by: int, bool, str"),
+                        );
+                    }
+                }
+                Some(Type::Int)
+            }
+            "chan_new" => {
+                if args.len() != 0 {
+                    self.diags.push(Diagnostic::new(
+                        "E045",
+                        format!("chan_new takes no arguments, found {}", args.len()),
+                        span,
+                    ));
+                }
+                Some(Type::Int)
+            }
+            "chan_close" => {
+                self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Unit, "chan_close")
+            }
+            "chan_send_int" => self.check_builtin_sig(
+                args,
+                span,
+                scope,
+                &[Type::Int, Type::Int],
+                Type::Unit,
+                "chan_send_int",
+            ),
+            "chan_send_float" => self.check_builtin_sig(
+                args,
+                span,
+                scope,
+                &[Type::Int, Type::Float],
+                Type::Unit,
+                "chan_send_float",
+            ),
+            "chan_send_bool" => self.check_builtin_sig(
+                args,
+                span,
+                scope,
+                &[Type::Int, Type::Bool],
+                Type::Unit,
+                "chan_send_bool",
+            ),
+            "chan_send_str" => self.check_builtin_sig(
+                args,
+                span,
+                scope,
+                &[Type::Int, Type::Str],
+                Type::Unit,
+                "chan_send_str",
+            ),
+            "chan_recv_int" => {
+                self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Int, "chan_recv_int")
+            }
+            "chan_recv_float" => self.check_builtin_sig(
+                args,
+                span,
+                scope,
+                &[Type::Int],
+                Type::Float,
+                "chan_recv_float",
+            ),
+            "chan_recv_bool" => {
+                self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Bool, "chan_recv_bool")
+            }
+            "chan_recv_str" => {
+                self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Str, "chan_recv_str")
+            }
             "spawn" => {
                 // spawn(f, args...) -> int (task handle). Runs f on its own
                 // OS thread with deep-copied arguments (interpreter only).
@@ -1723,80 +2433,26 @@ impl<'a> Checker<'a> {
                 if let Some(colon_pos) = name.rfind("::") {
                     let enum_name = &name[..colon_pos];
                     let variant_name = &name[colon_pos + 2..];
-                    if let Some(variants) = self.enums.get(enum_name).cloned() {
+                    if self.enums.contains_key(enum_name) {
                         if let Some(ed) = self.program.enums.iter().find(|e| e.name == enum_name) {
-                            if !ed.type_params.is_empty() {
-                                self.diags.push(
-                                    Diagnostic::new(
-                                        "E066",
-                                        format!(
-                                            "generic enum '{}' cannot be constructed: only functions support generics in this version",
-                                            enum_name
-                                        ),
-                                        span,
-                                    )
-                                    .with_help("declare a concrete enum per payload type, or pass values through generic functions"),
-                                );
-                                return None;
-                            }
-                        }
-                        if let Some(variant) = variants.iter().find(|v| v.name == variant_name) {
-                            if let Some(ref payload_ty) = variant.payload {
-                                if args.len() != 1 {
-                                    self.diags.push(Diagnostic::new(
-                                        "E045",
-                                        format!(
-                                            "{}::{} takes exactly 1 argument, found {}",
-                                            enum_name,
-                                            variant_name,
-                                            args.len()
-                                        ),
-                                        span,
-                                    ));
-                                } else {
-                                    self.check_args(name, &[payload_ty.clone()], args, span, scope);
-                                }
-                            } else {
-                                if !args.is_empty() {
-                                    self.diags.push(Diagnostic::new(
-                                        "E045",
-                                        format!(
-                                            "{}::{} takes no arguments, found {}",
-                                            enum_name, variant_name, args.len()
-                                        ),
-                                        span,
-                                    ));
-                                }
-                            }
-                            return Some(Type::Enum(enum_name.to_string()));
-                        } else {
-                            self.diags.push(Diagnostic::new(
-                                "E060",
-                                format!("enum '{}' has no variant '{}'", enum_name, variant_name),
+                            return self.check_enum_variant_call(
+                                enum_name,
+                                variant_name,
+                                ed,
+                                args,
                                 span,
-                            ));
-                            return None;
+                                scope,
+                                expected,
+                            );
                         }
                     }
                 }
                 // 2. struct constructor
-                if let Some(fields) = self.structs.get(name).cloned() {
-                    if let Some(sd) = self.program.structs.iter().find(|s| s.name == *name) {
-                        if !sd.type_params.is_empty() {
-                            self.diags.push(
-                                Diagnostic::new(
-                                    "E066",
-                                    format!(
-                                        "generic struct '{}' cannot be constructed: only functions support generics in this version",
-                                        name
-                                    ),
-                                    span,
-                                )
-                                .with_help("declare a concrete struct per element type, or pass values through generic functions"),
-                            );
-                            return None;
-                        }
+                if let Some(sd) = self.program.structs.iter().find(|s| s.name == *name) {
+                    if !sd.type_params.is_empty() {
+                        return self.check_struct_ctor(name, sd, args, span, scope);
                     }
+                    let fields = self.structs.get(name).cloned()?;
                     let params: Vec<Type> = fields.iter().map(|f| f.ty.clone()).collect();
                     self.check_args(name, &params, args, span, scope);
                     return Some(Type::Struct(name.to_string()));
@@ -1871,14 +2527,16 @@ impl<'a> Checker<'a> {
         let tp_names: Vec<&str> = f.type_params.iter().map(|tp| tp.name.as_str()).collect();
         let mut subst: HashMap<String, Type> = HashMap::new();
         let mut ok = true;
+        let outer_params = self.type_params.clone();
+        self.enter_type_params(&f.type_params);
         for (i, (p, a)) in f.params.iter().zip(args.iter()).enumerate() {
             let Some(aty) = self.infer(a, scope, None) else {
                 ok = false;
                 continue;
             };
             let aty = self.normalize_type(&aty);
-            let pty = self.normalize_type(&p.ty);
-            if !unify_ty(&pty, &aty, &tp_names, &mut subst) {
+            let pty = self.expand_generic_nominal(&self.normalize_type(&p.ty));
+            if !self.unify(&pty, &aty, &tp_names, &mut subst) {
                 self.diags.push(Diagnostic::new(
                     "E030",
                     format!(
@@ -1894,6 +2552,7 @@ impl<'a> Checker<'a> {
             }
         }
         if !ok {
+            self.exit_type_params();
             return None;
         }
         // every type parameter must be fixed by the arguments
@@ -1901,6 +2560,9 @@ impl<'a> Checker<'a> {
         for tp in &f.type_params {
             match subst.get(&tp.name) {
                 Some(t) => type_args.push(t.clone()),
+                None if outer_params.contains(&tp.name) => {
+                    type_args.push(Type::TypeVar(tp.name.clone()));
+                }
                 None => {
                     self.diags.push(
                         Diagnostic::new(
@@ -1915,6 +2577,7 @@ impl<'a> Checker<'a> {
                             "every type parameter must appear in at least one parameter type",
                         ),
                     );
+                    self.exit_type_params();
                     return None;
                 }
             }
@@ -1932,11 +2595,9 @@ impl<'a> Checker<'a> {
                             ),
                             span,
                         )
-                        .with_help(match b.as_str() {
-                            "Num" | "Ord" => "satisfied by: int, float",
-                            _ => "satisfied by: int, float, bool, str",
-                        }),
+                        .with_help(bound_help(b)),
                     );
+                    self.exit_type_params();
                     return None;
                 }
             }
@@ -1944,7 +2605,10 @@ impl<'a> Checker<'a> {
         self.instantiations
             .borrow_mut()
             .push((span, f.name.clone(), type_args));
-        Some(apply_subst(&self.normalize_type(&f.ret), &subst))
+        let expanded_ret = self.expand_generic_nominal(&self.normalize_type(&f.ret));
+        let ret = self.subst_type(&expanded_ret, &subst);
+        self.exit_type_params();
+        Some(ret)
     }
 
     fn check_builtin_sig(

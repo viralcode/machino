@@ -334,6 +334,78 @@ fn strmap_len(m: StrMap) -> int {
     return len(m.keys)
 }
 
+# ---- HashMap: generic open-addressing hash map (K: Eq + Hash) ----
+# Construct with empty typed arrays, e.g.:
+#   let ks: [str] = []
+#   let vs: [int] = []
+#   let m = HashMap(ks, vs, empty_buckets(8), 8)
+
+struct<K: Eq + Hash, V> HashMap {
+    keys: [K]
+    vals: [V]
+    buckets: [[int]]
+    nbuckets: int
+}
+
+fn<K: Eq + Hash, V> hashmap_index(m: HashMap, key: K) -> int {
+    let bucket = m.buckets[hash(key) % m.nbuckets]
+    for i in 0..len(bucket) {
+        if m.keys[bucket[i]] == key {
+            return bucket[i]
+        }
+    }
+    return -1
+}
+
+fn<K: Eq + Hash, V> hashmap_has(m: HashMap, key: K) -> bool {
+    return hashmap_index(m, key) >= 0
+}
+
+fn<K: Eq + Hash, V> hashmap_rehash(m: HashMap, n: int)
+    requires n > 0
+{
+    let bs = empty_buckets(n)
+    for i in 0..len(m.keys) {
+        let b = hash(m.keys[i]) % n
+        bs[b] = push(bs[b], i)
+    }
+    m.buckets = bs
+    m.nbuckets = n
+}
+
+fn<K: Eq + Hash, V> hashmap_set(m: HashMap, key: K, val: V) {
+    let i = hashmap_index(m, key)
+    if i >= 0 {
+        m.vals[i] = val
+        return
+    }
+    m.keys = push(m.keys, key)
+    m.vals = push(m.vals, val)
+    let b = hash(key) % m.nbuckets
+    m.buckets[b] = push(m.buckets[b], len(m.keys) - 1)
+    if len(m.keys) > m.nbuckets * 2 {
+        hashmap_rehash(m, m.nbuckets * 4)
+    }
+}
+
+fn<K: Eq + Hash, V> hashmap_get(m: HashMap, key: K) -> V
+    requires hashmap_has(m, key)
+{
+    return m.vals[hashmap_index(m, key)]
+}
+
+fn<K: Eq + Hash, V> hashmap_get_or(m: HashMap, key: K, default: V) -> V {
+    let i = hashmap_index(m, key)
+    if i < 0 {
+        return default
+    }
+    return m.vals[i]
+}
+
+fn<K: Eq + Hash, V> hashmap_len(m: HashMap) -> int {
+    return len(m.keys)
+}
+
 # ---- int helpers ----
 
 fn abs_int(n: int) -> int

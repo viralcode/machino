@@ -61,9 +61,8 @@ fn safe_div(a: int, b: int) -> int
     return a / b
 }
 
-# generics: constraints are Eq (== !=), Ord (< <= > >=), Num (+ - * /);
-# type arguments are inferred at each call site; combine bounds with +
-# or a where clause: fn<T> f(x: T) -> T where T: Ord + Num { ... }
+# generics: constraints Eq, Ord, Num, Hash; combine with + or where
+# generic structs/enums construct directly: struct<T> Box { val: T }; Box(1)
 fn<T: Ord> max2(a: T, b: T) -> T {
     if a > b {
         return a
@@ -156,11 +155,13 @@ test "output" expects "hello\n5" {
 ## Builtins (the only ones)
 
 `print(x)`, `len(x)`, `push(xs, v)`, `to_float(i)`, `to_int(f)`,
-`char_at(s, i)` (byte as int), `substr(s, a, b)`, `chr(byte)`,
-`spawn(f, args...)` -> task handle, `join_int(h)` / `join_float(h)` /
-`join_bool(h)` / `join_str(h)` (shared-nothing concurrency; works in the
-interpreter and in compiled WASM — compiled spawn targets must be named
-top-level functions)
+`char_at(s, i)` / `substr(s, a, b)` / `chr(byte)` (byte-indexed),
+`len_cp` / `char_at_cp` / `substr_cp` / `chr_cp` (Unicode codepoints),
+`hash(x)` (`int`/`bool`/`str` → `int`; requires `Hash`),
+`spawn(f, args...)` → task handle, `join_int`/`join_float`/`join_bool`/`join_str`,
+`chan_new()` / `chan_send_int|float|bool|str` / `chan_recv_*` / `chan_close`
+(typed channels; interpreter + linear WASM — compiled spawn targets must be
+named top-level functions)
 
 ## Standard prelude (always available, names reserved)
 
@@ -174,11 +175,11 @@ top-level functions)
 - strings: `find`, `find_from`, `contains`, `starts_with`, `ends_with`,
   `split(s, sep)`, `join(parts, sep)`, `trim`, `is_space`, `to_upper`,
   `to_lower`, `repeat`
-- maps: `StrMap` (str → str): `strmap_new()`, `strmap_set(m, k, v)`,
-  `strmap_get(m, k)` (requires key present), `strmap_get_or(m, k, default)`,
-  `strmap_has`, `strmap_len`; `IntMap` (int → int) with the same shape:
-  `intmap_new`, `intmap_set`, `intmap_get`, `intmap_get_or`, `intmap_has`,
-  `intmap_len`
+- maps: `StrMap` / `IntMap` (concrete hash maps); generic
+  `struct<K: Eq + Hash, V> HashMap` — construct with empty typed arrays:
+  `let ks: [str] = []` / `let vs: [int] = []` /
+  `let m = HashMap(ks, vs, empty_buckets(8), 8)`, then `hashmap_set` /
+  `hashmap_get` / `hashmap_get_or` / `hashmap_has` / `hashmap_len`
 - JSON: enum `Json` (`JNull | JBool(bool) | JNum(float) | JStr(str) |
   JArr([Json]) | JObj(JsonObj)`); `json_parse(s) -> JsonParsed`
   (`JVal(Json) | JError(str)`), `json_serialize(v) -> str`,
