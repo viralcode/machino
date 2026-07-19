@@ -1,0 +1,57 @@
+# uuid — deterministic UUID-like IDs from a seeded LCG (self-contained)
+
+struct UuidRng {
+    state: int
+}
+
+fn uuid_rng_new(seed: int) -> UuidRng {
+    let s = seed
+    if s <= 0 {
+        s = 1
+    }
+    return UuidRng(s)
+}
+
+fn uuid_rng_next(r: UuidRng) -> int {
+    r.state = (r.state * 1664525 + 1013904223) % 2147483647
+    if r.state < 0 {
+        r.state = 0 - r.state
+    }
+    return r.state
+}
+
+fn uuid_hex_nibble(n: int) -> str {
+    let digits = "0123456789abcdef"
+    return chr(char_at(digits, n % 16))
+}
+
+fn uuid_hex_byte(n: int) -> str {
+    return uuid_hex_nibble(n / 16) + uuid_hex_nibble(n)
+}
+
+fn uuid_v4(r: UuidRng) -> str {
+    let s = ""
+    for i in 0..16 {
+        let b = uuid_rng_next(r) % 256
+        if i == 6 {
+            b = (b % 16) + 64
+        }
+        if i == 8 {
+            b = (b % 64) + 128
+        }
+        s = s + uuid_hex_byte(b)
+        if i == 3 || i == 5 || i == 7 || i == 9 {
+            s = s + "-"
+        }
+    }
+    return s
+}
+
+test "uuid" {
+    let r = uuid_rng_new(7)
+    let a = uuid_v4(r)
+    let b = uuid_v4(r)
+    assert len(a) == 36
+    assert a != b
+    assert char_at(a, 14) == char_at("4", 0)
+}

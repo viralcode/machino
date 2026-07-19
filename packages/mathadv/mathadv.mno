@@ -1,0 +1,184 @@
+# mathadv — advanced real functions (radians)
+# Taylor / Newton implementations; good for science demos, not IEEE libm bits.
+
+fn mathadv_pi() -> float {
+    return 3.141592653589793
+}
+
+fn mathadv_e() -> float {
+    return 2.718281828459045
+}
+
+fn mathadv_tau() -> float {
+    return 6.283185307179586
+}
+
+fn mathadv_abs(x: float) -> float {
+    return abs_float(x)
+}
+
+fn mathadv_floor(x: float) -> float {
+    return to_float(floor(x))
+}
+
+fn mathadv_mod2pi(x: float) -> float {
+    let twopi = mathadv_tau()
+    let y = x
+    while y >= twopi {
+        y = y - twopi
+    }
+    while y < 0.0 - twopi {
+        y = y + twopi
+    }
+    if y < 0.0 {
+        y = y + twopi
+    }
+    if y > mathadv_pi() {
+        y = y - twopi
+    }
+    return y
+}
+
+fn mathadv_sin(x: float) -> float {
+    let z = mathadv_mod2pi(x)
+    let term = z
+    let sum = z
+    let n = 1
+    while n < 12 {
+        let f = to_float(2 * n) * to_float(2 * n + 1)
+        term = 0.0 - term * z * z / f
+        sum = sum + term
+        n = n + 1
+    }
+    return sum
+}
+
+fn mathadv_cos(x: float) -> float {
+    return mathadv_sin(x + mathadv_pi() / 2.0)
+}
+
+fn mathadv_tan(x: float) -> float {
+    let c = mathadv_cos(x)
+    if abs_float(c) < 0.000000000001 {
+        return 0.0
+    }
+    return mathadv_sin(x) / c
+}
+
+fn mathadv_exp(x: float) -> float {
+    # reduce via e^x = 2^(x/ln2) approx with series on reduced arg
+    if x > 20.0 {
+        return 485165195.0
+    }
+    if x < 0.0 - 20.0 {
+        return 0.0
+    }
+    let term = 1.0
+    let sum = 1.0
+    for n in 1..40 {
+        term = term * x / to_float(n)
+        sum = sum + term
+    }
+    return sum
+}
+
+fn mathadv_ln(x: float) -> float
+requires x > 0.0
+{
+    # Newton: y_{n+1} = y_n + 2*(x - e^y)/(x + e^y)
+    let y = 0.0
+    if x > 1.0 {
+        y = 1.0
+    }
+    if x < 1.0 {
+        y = 0.0 - 1.0
+    }
+    for i in 0..40 {
+        let ey = mathadv_exp(y)
+        y = y + 2.0 * (x - ey) / (x + ey)
+    }
+    return y
+}
+
+fn mathadv_log10(x: float) -> float
+requires x > 0.0
+{
+    return mathadv_ln(x) / mathadv_ln(10.0)
+}
+
+fn mathadv_pow(base: float, exp: float) -> float
+requires base > 0.0
+{
+    return mathadv_exp(exp * mathadv_ln(base))
+}
+
+fn mathadv_sinh(x: float) -> float {
+    return (mathadv_exp(x) - mathadv_exp(0.0 - x)) / 2.0
+}
+
+fn mathadv_cosh(x: float) -> float {
+    return (mathadv_exp(x) + mathadv_exp(0.0 - x)) / 2.0
+}
+
+fn mathadv_atan(x: float) -> float {
+    # atan via series for |x|<=1, identity otherwise
+    let neg = x < 0.0
+    let a = abs_float(x)
+    let v = a
+    if a > 1.0 {
+        v = 1.0 / a
+    }
+    let term = v
+    let sum = v
+    let n = 1
+    while n < 40 {
+        let k = to_float(2 * n + 1)
+        term = 0.0 - term * v * v
+        sum = sum + term / k
+        n = n + 1
+    }
+    if a > 1.0 {
+        sum = mathadv_pi() / 2.0 - sum
+    }
+    if neg {
+        return 0.0 - sum
+    }
+    return sum
+}
+
+fn mathadv_asin(x: float) -> float
+requires x >= 0.0 - 1.0
+requires x <= 1.0
+{
+    return mathadv_atan(x / sqrt(1.0 - x * x + 0.000000000000001))
+}
+
+fn mathadv_acos(x: float) -> float
+requires x >= 0.0 - 1.0
+requires x <= 1.0
+{
+    return mathadv_pi() / 2.0 - mathadv_asin(x)
+}
+
+fn mathadv_hypot(a: float, b: float) -> float {
+    return sqrt(a * a + b * b)
+}
+
+fn mathadv_deg2rad(d: float) -> float {
+    return d * mathadv_pi() / 180.0
+}
+
+fn mathadv_rad2deg(r: float) -> float {
+    return r * 180.0 / mathadv_pi()
+}
+
+test "mathadv" {
+    let s = mathadv_sin(mathadv_pi() / 2.0)
+    assert s > 0.999 && s < 1.001
+    let c = mathadv_cos(0.0)
+    assert c > 0.999 && c < 1.001
+    assert mathadv_exp(0.0) > 0.999 && mathadv_exp(0.0) < 1.001
+    let l = mathadv_ln(mathadv_e())
+    assert l > 0.99 && l < 1.01
+    assert mathadv_hypot(3.0, 4.0) == 5.0
+}

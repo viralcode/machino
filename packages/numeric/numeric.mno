@@ -1,0 +1,72 @@
+# numeric — root finding, integration, interpolation
+
+fn num_bisect(f: fn(float) -> float, lo: float, hi: float, iters: int) -> float
+requires lo < hi
+requires iters > 0
+{
+    let a = lo
+    let b = hi
+    for i in 0..iters {
+        let m = (a + b) / 2.0
+        let fm = f(m)
+        if abs_float(fm) < 0.0000000001 {
+            return m
+        }
+        if f(a) * fm < 0.0 {
+            b = m
+        } else {
+            a = m
+        }
+    }
+    return (a + b) / 2.0
+}
+
+fn num_trapz(f: fn(float) -> float, a: float, b: float, n: int) -> float
+requires n > 0
+requires b > a
+{
+    let h = (b - a) / to_float(n)
+    let s = (f(a) + f(b)) / 2.0
+    for i in 1..n {
+        s = s + f(a + to_float(i) * h)
+    }
+    return s * h
+}
+
+fn num_lerp(a: float, b: float, t: float) -> float {
+    return a + (b - a) * t
+}
+
+fn num_clamp(x: float, lo: float, hi: float) -> float
+requires lo <= hi
+{
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn num_smoothstep(edge0: float, edge1: float, x: float) -> float
+requires edge1 > edge0
+{
+    let t = num_clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+}
+
+fn num_poly_eval(coeffs: [float], x: float) -> float {
+    # coeffs[0] + coeffs[1]*x + ...
+    let s = 0.0
+    let p = 1.0
+    for i in 0..len(coeffs) {
+        s = s + coeffs[i] * p
+        p = p * x
+    }
+    return s
+}
+
+test "numeric" {
+    let root = num_bisect(fn(x: float) -> float { return x * x - 2.0 }, 0.0, 2.0, 40)
+    assert abs_float(root - sqrt(2.0)) < 0.001
+    let area = num_trapz(fn(x: float) -> float { return x }, 0.0, 1.0, 100)
+    assert abs_float(area - 0.5) < 0.01
+    assert num_poly_eval([1.0, 2.0, 3.0], 2.0) == 17.0
+}

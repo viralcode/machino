@@ -1,0 +1,74 @@
+# statsadv — variance, stdev, pearson correlation, z-scores
+
+fn statsadv_mean(xs: [float]) -> float
+requires len(xs) > 0
+{
+    let s = 0.0
+    for i in 0..len(xs) {
+        s = s + xs[i]
+    }
+    return s / to_float(len(xs))
+}
+
+fn statsadv_variance(xs: [float]) -> float
+requires len(xs) > 1
+{
+    let m = statsadv_mean(xs)
+    let s = 0.0
+    for i in 0..len(xs) {
+        let d = xs[i] - m
+        s = s + d * d
+    }
+    return s / to_float(len(xs) - 1)
+}
+
+fn statsadv_stdev(xs: [float]) -> float
+requires len(xs) > 1
+{
+    return sqrt(statsadv_variance(xs))
+}
+
+fn statsadv_pearson(xs: [float], ys: [float]) -> float
+requires len(xs) == len(ys)
+requires len(xs) > 1
+{
+    let mx = statsadv_mean(xs)
+    let my = statsadv_mean(ys)
+    let num = 0.0
+    let dx2 = 0.0
+    let dy2 = 0.0
+    for i in 0..len(xs) {
+        let dx = xs[i] - mx
+        let dy = ys[i] - my
+        num = num + dx * dy
+        dx2 = dx2 + dx * dx
+        dy2 = dy2 + dy * dy
+    }
+    let den = sqrt(dx2 * dy2)
+    if den == 0.0 { return 0.0 }
+    return num / den
+}
+
+fn statsadv_zscore(xs: [float]) -> [float]
+requires len(xs) > 1
+{
+    let m = statsadv_mean(xs)
+    let sd = statsadv_stdev(xs)
+    let out: [float] = []
+    for i in 0..len(xs) {
+        if sd == 0.0 {
+            out = push(out, 0.0)
+        } else {
+            out = push(out, (xs[i] - m) / sd)
+        }
+    }
+    return out
+}
+
+test "statsadv" {
+    let xs = [1.0, 2.0, 3.0, 4.0]
+    assert abs_float(statsadv_mean(xs) - 2.5) < 0.0001
+    assert statsadv_variance(xs) > 0.0
+    let r = statsadv_pearson([1.0, 2.0, 3.0], [2.0, 4.0, 6.0])
+    assert abs_float(r - 1.0) < 0.0001
+}

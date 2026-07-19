@@ -1,0 +1,36 @@
+# template — {{key}} substitution via StrMap
+
+fn tmpl_render(tpl: str, vars: StrMap) -> str {
+    let out = ""
+    let i = 0
+    let n = len(tpl)
+    while i < n {
+        if i + 1 < n && char_at(tpl, i) == 123 && char_at(tpl, i + 1) == 123 {
+            let j = i + 2
+            while j + 1 < n && !(char_at(tpl, j) == 125 && char_at(tpl, j + 1) == 125) {
+                j = j + 1
+            }
+            if j + 1 < n {
+                let key = trim(substr(tpl, i + 2, j))
+                if strmap_has(vars, key) {
+                    out = out + strmap_get(vars, key)
+                }
+                i = j + 2
+            } else {
+                out = out + chr(char_at(tpl, i))
+                i = i + 1
+            }
+        } else {
+            out = out + chr(char_at(tpl, i))
+            i = i + 1
+        }
+    }
+    return out
+}
+
+test "template" {
+    let m = strmap_new()
+    strmap_set(m, "name", "machino")
+    strmap_set(m, "n", "3")
+    assert tmpl_render("hi {{name}} x{{n}}", m) == "hi machino x3"
+}

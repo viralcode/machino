@@ -1,0 +1,52 @@
+# color — RGB helpers (0..255)
+
+struct Rgb {
+    r: int
+    g: int
+    b: int
+}
+
+fn rgb(r: int, g: int, b: int) -> Rgb
+requires r >= 0 && r <= 255
+requires g >= 0 && g <= 255
+requires b >= 0 && b <= 255
+{
+    return Rgb(r, g, b)
+}
+
+fn color_clamp255(x: float) -> int {
+    if x < 0.0 {
+        return 0
+    }
+    if x > 255.0 {
+        return 255
+    }
+    return round(x)
+}
+
+fn color_hex2(n: int) -> str {
+    let digits = "0123456789abcdef"
+    return chr(char_at(digits, n / 16)) + chr(char_at(digits, n % 16))
+}
+
+fn color_to_hex(c: Rgb) -> str {
+    return "#" + color_hex2(c.r) + color_hex2(c.g) + color_hex2(c.b)
+}
+
+fn color_lerp(a: Rgb, b: Rgb, t: float) -> Rgb {
+    return Rgb(
+        color_clamp255(to_float(a.r) + (to_float(b.r) - to_float(a.r)) * t),
+        color_clamp255(to_float(a.g) + (to_float(b.g) - to_float(a.g)) * t),
+        color_clamp255(to_float(a.b) + (to_float(b.b) - to_float(a.b)) * t)
+    )
+}
+
+fn color_luma(c: Rgb) -> float {
+    return (0.2126 * to_float(c.r) + 0.7152 * to_float(c.g) + 0.0722 * to_float(c.b)) / 255.0
+}
+
+test "color" {
+    assert color_to_hex(rgb(255, 0, 128)) == "#ff0080"
+    let m = color_lerp(rgb(0, 0, 0), rgb(10, 0, 0), 0.5)
+    assert m.r == 5
+}

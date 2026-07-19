@@ -1,0 +1,91 @@
+# linalg — 2D/3D vectors and small matrices
+
+struct Vec2 {
+    x: float
+    y: float
+}
+struct Vec3 {
+    x: float
+    y: float
+    z: float
+}
+
+fn v2(x: float, y: float) -> Vec2 { return Vec2(x, y) }
+fn v3(x: float, y: float, z: float) -> Vec3 { return Vec3(x, y, z) }
+
+fn v2_add(a: Vec2, b: Vec2) -> Vec2 { return Vec2(a.x + b.x, a.y + b.y) }
+fn v2_sub(a: Vec2, b: Vec2) -> Vec2 { return Vec2(a.x - b.x, a.y - b.y) }
+fn v2_scale(a: Vec2, s: float) -> Vec2 { return Vec2(a.x * s, a.y * s) }
+fn v2_dot(a: Vec2, b: Vec2) -> float { return a.x * b.x + a.y * b.y }
+fn v2_len(a: Vec2) -> float { return sqrt(v2_dot(a, a)) }
+fn v2_norm(a: Vec2) -> Vec2 {
+    let L = v2_len(a)
+    if L == 0.0 { return a }
+    return v2_scale(a, 1.0 / L)
+}
+
+fn v3_add(a: Vec3, b: Vec3) -> Vec3 { return Vec3(a.x + b.x, a.y + b.y, a.z + b.z) }
+fn v3_dot(a: Vec3, b: Vec3) -> float { return a.x * b.x + a.y * b.y + a.z * b.z }
+fn v3_cross(a: Vec3, b: Vec3) -> Vec3 {
+    return Vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
+}
+fn v3_len(a: Vec3) -> float { return sqrt(v3_dot(a, a)) }
+
+# row-major 2x2 / 3x3 as flat [float]
+fn mat2_id() -> [float] { return [1.0, 0.0, 0.0, 1.0] }
+fn mat2_mul(a: [float], b: [float]) -> [float]
+requires len(a) == 4
+requires len(b) == 4
+{
+    return [
+        a[0] * b[0] + a[1] * b[2],
+        a[0] * b[1] + a[1] * b[3],
+        a[2] * b[0] + a[3] * b[2],
+        a[2] * b[1] + a[3] * b[3]
+    ]
+}
+fn mat2_det(a: [float]) -> float
+requires len(a) == 4
+{
+    return a[0] * a[3] - a[1] * a[2]
+}
+fn mat2_apply(m: [float], v: Vec2) -> Vec2
+requires len(m) == 4
+{
+    return Vec2(m[0] * v.x + m[1] * v.y, m[2] * v.x + m[3] * v.y)
+}
+
+fn mat3_id() -> [float] {
+    return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+}
+fn mat3_mul(a: [float], b: [float]) -> [float]
+requires len(a) == 9
+requires len(b) == 9
+{
+    let out: [float] = []
+    for r in 0..3 {
+        for c in 0..3 {
+            let s = 0.0
+            for k in 0..3 {
+                s = s + a[r * 3 + k] * b[k * 3 + c]
+            }
+            out = push(out, s)
+        }
+    }
+    return out
+}
+fn mat3_transpose(a: [float]) -> [float]
+requires len(a) == 9
+{
+    return [a[0], a[3], a[6], a[1], a[4], a[7], a[2], a[5], a[8]]
+}
+
+test "linalg" {
+    assert v2_dot(v2(1.0, 2.0), v2(3.0, 4.0)) == 11.0
+    assert v2_len(v2(3.0, 4.0)) == 5.0
+    let c = v3_cross(v3(1.0, 0.0, 0.0), v3(0.0, 1.0, 0.0))
+    assert c.z == 1.0
+    let m = mat2_mul([1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0])
+    assert m[0] == 19.0 && m[3] == 50.0
+    assert mat2_det([1.0, 2.0, 3.0, 4.0]) == 0.0 - 2.0
+}

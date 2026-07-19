@@ -1,0 +1,66 @@
+# geom2d — 2D geometry primitives
+
+struct Pt2 {
+    x: float
+    y: float
+}
+struct Circle {
+    c: Pt2
+    r: float
+}
+struct Seg2 {
+    a: Pt2
+    b: Pt2
+}
+
+fn pt2(x: float, y: float) -> Pt2 { return Pt2(x, y) }
+
+fn geom_dist(a: Pt2, b: Pt2) -> float {
+    let dx = a.x - b.x
+    let dy = a.y - b.y
+    return sqrt(dx * dx + dy * dy)
+}
+
+fn geom_lerp(a: Pt2, b: Pt2, t: float) -> Pt2 {
+    return Pt2(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+}
+
+fn geom_dot(ax: float, ay: float, bx: float, by: float) -> float {
+    return ax * bx + ay * by
+}
+
+fn geom_seg_len(s: Seg2) -> float {
+    return geom_dist(s.a, s.b)
+}
+
+fn geom_circle_contains(cir: Circle, p: Pt2) -> bool {
+    return geom_dist(cir.c, p) <= cir.r
+}
+
+fn geom_circles_overlap(a: Circle, b: Circle) -> bool {
+    return geom_dist(a.c, b.c) <= a.r + b.r
+}
+
+fn geom_bbox_overlap(ax0: float, ay0: float, ax1: float, ay1: float, bx0: float, by0: float, bx1: float, by1: float) -> bool {
+    return ax0 <= bx1 && ax1 >= bx0 && ay0 <= by1 && ay1 >= by0
+}
+
+fn geom_poly_area(xs: [float], ys: [float]) -> float
+requires len(xs) == len(ys)
+requires len(xs) >= 3
+{
+    let s = 0.0
+    let n = len(xs)
+    for i in 0..n {
+        let j = (i + 1) % n
+        s = s + xs[i] * ys[j] - xs[j] * ys[i]
+    }
+    return abs_float(s) / 2.0
+}
+
+test "geom2d" {
+    assert geom_dist(pt2(0.0, 0.0), pt2(3.0, 4.0)) == 5.0
+    let c = Circle(pt2(0.0, 0.0), 2.0)
+    assert geom_circle_contains(c, pt2(1.0, 1.0))
+    assert geom_poly_area([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]) == 0.5
+}

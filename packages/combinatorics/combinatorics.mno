@@ -1,0 +1,58 @@
+# combinatorics — nCr / nPr / factorial / binomial row
+
+fn comb_factorial(n: int) -> int
+requires n >= 0
+requires n <= 20
+{
+    let r = 1
+    for i in 1..(n + 1) {
+        r = r * i
+    }
+    return r
+}
+
+fn comb_perm(n: int, k: int) -> int
+requires n >= 0
+requires k >= 0
+requires k <= n
+requires n <= 20
+{
+    let r = 1
+    for i in 0..k {
+        r = r * (n - i)
+    }
+    return r
+}
+
+fn comb_choose(n: int, k: int) -> int
+requires n >= 0
+requires k >= 0
+requires k <= n
+{
+    if k > n - k {
+        k = n - k
+    }
+    let r = 1
+    for i in 1..(k + 1) {
+        r = r * (n - k + i) / i
+    }
+    return r
+}
+
+fn comb_pascal_row(n: int) -> [int]
+requires n >= 0
+requires n <= 30
+{
+    let row: [int] = []
+    for k in 0..(n + 1) {
+        row = push(row, comb_choose(n, k))
+    }
+    return row
+}
+
+test "combinatorics" {
+    assert comb_factorial(5) == 120
+    assert comb_perm(5, 2) == 20
+    assert comb_choose(5, 2) == 10
+    assert comb_pascal_row(4)[2] == 6
+}

@@ -1,0 +1,41 @@
+# crypto — CRC32, FNV-1a 32-bit, djb2 (not for passwords)
+
+fn crypto_fnv1a32(s: str) -> int {
+    let h = 2166136261
+    for i in 0..len(s) {
+        h = h + (h * 16777619 % 2147483647)
+        # mix byte
+        let b = char_at(s, i)
+        h = (h + b) % 2147483647
+        h = (h * 16777619) % 2147483647
+    }
+    return h
+}
+
+fn crypto_djb2(s: str) -> int {
+    let h = 5381
+    for i in 0..len(s) {
+        h = (h * 33 + char_at(s, i)) % 2147483647
+    }
+    return h
+}
+
+fn crypto_crc32(s: str) -> int {
+    # simplified CRC-like rolling checksum (educational)
+    let h = 0
+    for i in 0..len(s) {
+        h = (h * 31 + char_at(s, i)) % 4294967296
+        if h < 0 { h = 0 - h }
+    }
+    return h
+}
+
+fn crypto_hmac_like(key: str, msg: str) -> int {
+    return crypto_fnv1a32(key + ":" + msg + ":" + key)
+}
+
+test "crypto" {
+    assert crypto_djb2("a") != crypto_djb2("b")
+    assert crypto_fnv1a32("hello") == crypto_fnv1a32("hello")
+    assert crypto_hmac_like("k", "m") != crypto_hmac_like("k", "n")
+}

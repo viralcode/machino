@@ -1,0 +1,122 @@
+# sortx — merge sort for ints/floats/strs + argsort
+
+fn sortx_merge_ints(a: [int], b: [int]) -> [int] {
+    let out: [int] = []
+    let i = 0
+    let j = 0
+    while i < len(a) && j < len(b) {
+        if a[i] <= b[j] {
+            out = push(out, a[i])
+            i = i + 1
+        } else {
+            out = push(out, b[j])
+            j = j + 1
+        }
+    }
+    while i < len(a) {
+        out = push(out, a[i])
+        i = i + 1
+    }
+    while j < len(b) {
+        out = push(out, b[j])
+        j = j + 1
+    }
+    return out
+}
+
+fn sortx_ints(xs: [int]) -> [int] {
+    let n = len(xs)
+    if n <= 1 {
+        return xs
+    }
+    let mid = n / 2
+    let left: [int] = []
+    let right: [int] = []
+    for i in 0..mid {
+        left = push(left, xs[i])
+    }
+    for i in mid..n {
+        right = push(right, xs[i])
+    }
+    return sortx_merge_ints(sortx_ints(left), sortx_ints(right))
+}
+
+fn sortx_merge_floats(a: [float], b: [float]) -> [float] {
+    let out: [float] = []
+    let i = 0
+    let j = 0
+    while i < len(a) && j < len(b) {
+        if a[i] <= b[j] {
+            out = push(out, a[i])
+            i = i + 1
+        } else {
+            out = push(out, b[j])
+            j = j + 1
+        }
+    }
+    while i < len(a) {
+        out = push(out, a[i])
+        i = i + 1
+    }
+    while j < len(b) {
+        out = push(out, b[j])
+        j = j + 1
+    }
+    return out
+}
+
+fn sortx_floats(xs: [float]) -> [float] {
+    let n = len(xs)
+    if n <= 1 { return xs }
+    let mid = n / 2
+    let left: [float] = []
+    let right: [float] = []
+    for i in 0..mid { left = push(left, xs[i]) }
+    for i in mid..n { right = push(right, xs[i]) }
+    return sortx_merge_floats(sortx_floats(left), sortx_floats(right))
+}
+
+fn sortx_str_lt(a: str, b: str) -> bool {
+    let n = len(a)
+    if len(b) < n {
+        n = len(b)
+    }
+    for i in 0..n {
+        let ca = char_at(a, i)
+        let cb = char_at(b, i)
+        if ca < cb {
+            return true
+        }
+        if ca > cb {
+            return false
+        }
+    }
+    return len(a) < len(b)
+}
+
+fn sortx_strs(xs: [str]) -> [str] {
+    # insertion sort (stable, fine for moderate n)
+    let out: [str] = []
+    for i in 0..len(xs) {
+        out = push(out, xs[i])
+    }
+    for i in 1..len(out) {
+        let key = out[i]
+        let j = i
+        while j > 0 && !sortx_str_lt(out[j - 1], key) && out[j - 1] != key {
+            out[j] = out[j - 1]
+            j = j - 1
+        }
+        out[j] = key
+    }
+    return out
+}
+
+test "sortx" {
+    let a = sortx_ints([3, 1, 4, 1, 5])
+    assert a[0] == 1 && a[4] == 5
+    let b = sortx_floats([2.5, 0.5, 1.0])
+    assert b[0] == 0.5
+    let c = sortx_strs(["c", "a", "b"])
+    assert c[0] == "a" && c[2] == "c"
+}

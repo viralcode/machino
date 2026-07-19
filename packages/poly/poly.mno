@@ -1,0 +1,68 @@
+# poly — dense polynomials as coefficient arrays (low degree first)
+
+fn poly_add(a: [float], b: [float]) -> [float] {
+    let n = len(a)
+    if len(b) > n { n = len(b) }
+    let out: [float] = []
+    for i in 0..n {
+        let x = 0.0
+        if i < len(a) { x = x + a[i] }
+        if i < len(b) { x = x + b[i] }
+        out = push(out, x)
+    }
+    return out
+}
+
+fn poly_scale(a: [float], s: float) -> [float] {
+    let out: [float] = []
+    for i in 0..len(a) {
+        out = push(out, a[i] * s)
+    }
+    return out
+}
+
+fn poly_mul(a: [float], b: [float]) -> [float] {
+    let n = len(a) + len(b) - 1
+    if n < 0 { return [] }
+    let out: [float] = []
+    for i in 0..n {
+        out = push(out, 0.0)
+    }
+    for i in 0..len(a) {
+        for j in 0..len(b) {
+            out[i + j] = out[i + j] + a[i] * b[j]
+        }
+    }
+    return out
+}
+
+fn poly_eval(a: [float], x: float) -> float {
+    let s = 0.0
+    let p = 1.0
+    for i in 0..len(a) {
+        s = s + a[i] * p
+        p = p * x
+    }
+    return s
+}
+
+fn poly_deriv(a: [float]) -> [float] {
+    if len(a) <= 1 {
+        let z: [float] = []
+        return z
+    }
+    let out: [float] = []
+    for i in 1..len(a) {
+        out = push(out, a[i] * to_float(i))
+    }
+    return out
+}
+
+test "poly" {
+    let p = [1.0, 0.0, 1.0]
+    assert poly_eval(p, 2.0) == 5.0
+    let d = poly_deriv(p)
+    assert d[0] == 0.0 && d[1] == 2.0
+    let m = poly_mul([1.0, 1.0], [1.0, 1.0])
+    assert m[0] == 1.0 && m[1] == 2.0 && m[2] == 1.0
+}

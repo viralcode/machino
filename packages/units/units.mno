@@ -1,0 +1,23 @@
+# units — common unit conversions (SI-centric)
+
+fn units_c_to_f(c: float) -> float { return c * 9.0 / 5.0 + 32.0 }
+fn units_f_to_c(f: float) -> float { return (f - 32.0) * 5.0 / 9.0 }
+fn units_c_to_k(c: float) -> float { return c + 273.15 }
+fn units_k_to_c(k: float) -> float { return k - 273.15 }
+
+fn units_m_to_ft(m: float) -> float { return m * 3.280839895 }
+fn units_ft_to_m(ft: float) -> float { return ft / 3.280839895 }
+fn units_km_to_mi(km: float) -> float { return km * 0.621371192 }
+fn units_mi_to_km(mi: float) -> float { return mi / 0.621371192 }
+
+fn units_kg_to_lb(kg: float) -> float { return kg * 2.2046226218 }
+fn units_lb_to_kg(lb: float) -> float { return lb / 2.2046226218 }
+
+fn units_l_to_gal(l: float) -> float { return l * 0.264172052 }
+fn units_gal_to_l(g: float) -> float { return g / 0.264172052 }
+
+test "units" {
+    assert abs_float(units_c_to_f(0.0) - 32.0) < 0.0001
+    assert abs_float(units_f_to_c(32.0)) < 0.0001
+    assert abs_float(units_m_to_ft(1.0) - 3.280839895) < 0.0001
+}

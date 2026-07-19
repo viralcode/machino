@@ -1,0 +1,59 @@
+# fraction — exact rationals (reduced)
+
+struct Frac {
+    num: int
+    den: int
+}
+
+fn frac_gcd(a: int, b: int) -> int {
+    let x = abs_int(a)
+    let y = abs_int(b)
+    while y != 0 {
+        let t = y
+        y = x % y
+        x = t
+    }
+    return x
+}
+
+fn frac_new(n: int, d: int) -> Frac
+requires d != 0
+{
+    let g = frac_gcd(n, d)
+    let nn = n / g
+    let dd = d / g
+    if dd < 0 {
+        nn = 0 - nn
+        dd = 0 - dd
+    }
+    return Frac(nn, dd)
+}
+
+fn frac_add(a: Frac, b: Frac) -> Frac {
+    return frac_new(a.num * b.den + b.num * a.den, a.den * b.den)
+}
+
+fn frac_mul(a: Frac, b: Frac) -> Frac {
+    return frac_new(a.num * b.num, a.den * b.den)
+}
+
+fn frac_div(a: Frac, b: Frac) -> Frac
+requires b.num != 0
+{
+    return frac_new(a.num * b.den, a.den * b.num)
+}
+
+fn frac_eq(a: Frac, b: Frac) -> bool {
+    return a.num == b.num && a.den == b.den
+}
+
+fn frac_to_float(a: Frac) -> float {
+    return to_float(a.num) / to_float(a.den)
+}
+
+test "fraction" {
+    let a = frac_new(1, 2)
+    let b = frac_new(1, 3)
+    assert frac_eq(frac_add(a, b), frac_new(5, 6))
+    assert frac_eq(frac_mul(a, b), frac_new(1, 6))
+}

@@ -1,0 +1,49 @@
+# complex — complex numbers (a + bi)
+
+struct Complex {
+    re: float
+    im: float
+}
+
+fn c_new(re: float, im: float) -> Complex {
+    return Complex(re, im)
+}
+
+fn c_add(a: Complex, b: Complex) -> Complex {
+    return Complex(a.re + b.re, a.im + b.im)
+}
+
+fn c_sub(a: Complex, b: Complex) -> Complex {
+    return Complex(a.re - b.re, a.im - b.im)
+}
+
+fn c_mul(a: Complex, b: Complex) -> Complex {
+    return Complex(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re)
+}
+
+fn c_div(a: Complex, b: Complex) -> Complex
+requires b.re * b.re + b.im * b.im > 0.0
+{
+    let d = b.re * b.re + b.im * b.im
+    return Complex((a.re * b.re + a.im * b.im) / d, (a.im * b.re - a.re * b.im) / d)
+}
+
+fn c_conj(z: Complex) -> Complex {
+    return Complex(z.re, 0.0 - z.im)
+}
+
+fn c_abs(z: Complex) -> float {
+    return sqrt(z.re * z.re + z.im * z.im)
+}
+
+fn c_eq(a: Complex, b: Complex, eps: float) -> bool {
+    return abs_float(a.re - b.re) <= eps && abs_float(a.im - b.im) <= eps
+}
+
+test "complex" {
+    let a = c_new(1.0, 2.0)
+    let b = c_new(3.0, 4.0)
+    let p = c_mul(a, b)
+    assert c_eq(p, c_new(0.0 - 5.0, 10.0), 0.0001)
+    assert c_abs(c_new(3.0, 4.0)) == 5.0
+}

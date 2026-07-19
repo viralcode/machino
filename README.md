@@ -186,10 +186,11 @@ deploy, packages, and the agent toolchain loop.
 
 ## Packages
 
-Ready-to-import libraries (vec, mathx, httpkit, encoding, csv, …) live in
-**[`packages/`](packages/)** — install with `machino pkg add` and
-`import "pkg:mathx/mathx.mno"`. See [`packages/README.md`](packages/README.md)
-and try [`packages/demo`](packages/demo).
+Ready-to-import libraries live in **[`packages/`](packages/)** (~40 packages):
+collections, HTTP/CLI, encoding/csv, plus an **advanced math** tier
+(`mathadv`, `linalg`, `complex`, `numeric`, `signal`, `bigint`, …).
+Install with `machino pkg add` and `import "pkg:mathadv/mathadv.mno"`.
+See [`packages/README.md`](packages/README.md) and try [`packages/demo`](packages/demo).
 
 ## Examples
 

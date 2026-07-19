@@ -70,6 +70,34 @@ import "pkg:mathx/mathx.mno" as mx
 | [`datetime`](datetime/) | datetime deltas | add days, same-day, ISO |
 | [`bitset`](bitset/) | bit twiddling | set/clear/test/count |
 
+### Advanced / scientific
+
+| Package | Like… | What you get |
+|---|---|---|
+| [`mathadv`](mathadv/) | `libm` / Python `math` | sin/cos/tan/exp/ln/pow/atan/asin/acos/hypot (series) |
+| [`complex`](complex/) | `cmath` | complex +, −, ×, ÷, conj, abs |
+| [`linalg`](linalg/) | tiny NumPy | Vec2/Vec3, mat2/mat3 multiply, det, cross |
+| [`numeric`](numeric/) | SciPy lite | bisection, trapezoid integrate, poly eval, smoothstep |
+| [`fraction`](fraction/) | `fractions` | exact rationals |
+| [`poly`](poly/) | NumPy poly | add/mul/eval/derivative |
+| [`geom2d`](geom2d/) | computational geometry | distance, circles, polygon area |
+| [`combinatorics`](combinatorics/) | `math.comb` | nCr, nPr, factorial, Pascal row |
+| [`sortx`](sortx/) | advanced sorts | merge-sort ints/floats, string sort |
+| [`statsadv`](statsadv/) | statistics | variance, stdev, Pearson, z-scores |
+| [`signal`](signal/) | FFT lite | DFT magnitude spectrum (small n) |
+| [`bigint`](bigint/) | Python `int` big | base-10 big add / mul-small / to_str |
+| [`crypto`](crypto/) | checksums | FNV/djb2/CRC-like, hmac-like (not password crypto) |
+| [`uuid`](uuid/) | UUID v4-shaped | deterministic seeded IDs |
+| [`units`](units/) | pint lite | temp/length/mass/volume conversions |
+| [`template`](template/) | mustache lite | `{{key}}` via StrMap |
+| [`color`](color/) | CSS color | RGB hex, lerp, luma |
+
+That’s ~40 packages covering collections, text/wire formats, HTTP/CLI,
+geometry, and a serious pure-machino math stack. Still **not** the entire
+universe: no GPU/BLAS, no TLS, no full regex engine, no audited cryptography —
+those need host `extern`s or future packages. Everything here runs in
+`machino run` and compiles to WASM with the same APIs.
+
 ## Try the demo
 
 ```sh
