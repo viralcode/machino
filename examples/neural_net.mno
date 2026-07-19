@@ -1,0 +1,191 @@
+# A tiny 2-2-1 multilayer perceptron that learns XOR.
+# Pure machino: float arrays, sigmoid via series exp, SGD backprop.
+
+struct Net {
+    w1: [float]
+    b1: [float]
+    w2: [float]
+    b2: float
+}
+
+struct Sample {
+    x0: float
+    x1: float
+    y: float
+}
+
+fn exp_series(x: float) -> float {
+    # Taylor series; accurate for |x| <= 1.
+    let sum = 1.0
+    let term = 1.0
+    for n in 1..16 {
+        term = term * x / to_float(n)
+        sum = sum + term
+    }
+    return sum
+}
+
+fn exp_f(x: float) -> float {
+    # Range-reduce by halving so the series stays in [-1, 1].
+    let t = x
+    if t > 40.0 {
+        t = 40.0
+    }
+    if t < 0.0 - 40.0 {
+        t = 0.0 - 40.0
+    }
+    let halves = 0
+    let a = t
+    if a < 0.0 {
+        a = 0.0 - a
+    }
+    while a > 1.0 {
+        a = a / 2.0
+        halves = halves + 1
+    }
+    let e = exp_series(a)
+    for i in 0..halves {
+        e = e * e
+    }
+    if t < 0.0 {
+        return 1.0 / e
+    }
+    return e
+}
+
+fn sigmoid(x: float) -> float {
+    # Numerically stable: always evaluate exp on a non-positive argument.
+    if x >= 0.0 {
+        let z = exp_f(0.0 - x)
+        return 1.0 / (1.0 + z)
+    }
+    let z = exp_f(x)
+    return z / (1.0 + z)
+}
+
+fn sigmoid_deriv(y: float) -> float {
+    return y * (1.0 - y)
+}
+
+fn new_net() -> Net {
+    # Fixed init that converges under SGD for XOR.
+    return Net(
+        [2.0, -2.0, -2.0, 2.0],
+        [-1.0, 1.0],
+        [2.0, 2.0],
+        -1.0
+    )
+}
+
+fn xor_data() -> [Sample] {
+    return [
+        Sample(0.0, 0.0, 0.0),
+        Sample(0.0, 1.0, 1.0),
+        Sample(1.0, 0.0, 1.0),
+        Sample(1.0, 1.0, 0.0)
+    ]
+}
+
+fn forward(net: Net, x0: float, x1: float) -> [float] {
+    # returns [h0, h1, out]
+    let z0 = net.w1[0] * x0 + net.w1[1] * x1 + net.b1[0]
+    let z1 = net.w1[2] * x0 + net.w1[3] * x1 + net.b1[1]
+    let h0 = sigmoid(z0)
+    let h1 = sigmoid(z1)
+    let out = sigmoid(net.w2[0] * h0 + net.w2[1] * h1 + net.b2)
+    return [h0, h1, out]
+}
+
+fn predict(net: Net, x0: float, x1: float) -> float {
+    let acts = forward(net, x0, x1)
+    return acts[2]
+}
+
+fn train_step(net: Net, s: Sample, lr: float) {
+    let acts = forward(net, s.x0, s.x1)
+    let h0 = acts[0]
+    let h1 = acts[1]
+    let out = acts[2]
+
+    let d_out = (out - s.y) * sigmoid_deriv(out)
+    let d_h0 = d_out * net.w2[0] * sigmoid_deriv(h0)
+    let d_h1 = d_out * net.w2[1] * sigmoid_deriv(h1)
+
+    net.w2[0] = net.w2[0] - lr * d_out * h0
+    net.w2[1] = net.w2[1] - lr * d_out * h1
+    net.b2 = net.b2 - lr * d_out
+
+    net.w1[0] = net.w1[0] - lr * d_h0 * s.x0
+    net.w1[1] = net.w1[1] - lr * d_h0 * s.x1
+    net.b1[0] = net.b1[0] - lr * d_h0
+
+    net.w1[2] = net.w1[2] - lr * d_h1 * s.x0
+    net.w1[3] = net.w1[3] - lr * d_h1 * s.x1
+    net.b1[1] = net.b1[1] - lr * d_h1
+}
+
+fn mse(net: Net, data: [Sample]) -> float {
+    let err = 0.0
+    for i in 0..len(data) {
+        let s = data[i]
+        let p = predict(net, s.x0, s.x1)
+        let d = p - s.y
+        err = err + d * d
+    }
+    return err / to_float(len(data))
+}
+
+fn train(net: Net, data: [Sample], epochs: int, lr: float) {
+    for e in 0..epochs {
+        for i in 0..len(data) {
+            train_step(net, data[i], lr)
+        }
+    }
+}
+
+fn class_of(p: float) -> int {
+    if p >= 0.5 {
+        return 1
+    }
+    return 0
+}
+
+fn main() {
+    let net = new_net()
+    let data = xor_data()
+    print("before mse=" + str_of_float(mse(net, data), 4))
+    train(net, data, 5000, 1.0)
+    print("after mse=" + str_of_float(mse(net, data), 4))
+    for i in 0..len(data) {
+        let s = data[i]
+        let p = predict(net, s.x0, s.x1)
+        print(
+            str_of_float(s.x0, 0)
+            + " xor "
+            + str_of_float(s.x1, 0)
+            + " -> "
+            + str_of_float(p, 3)
+            + " (class "
+            + str_of_int(class_of(p))
+            + ")"
+        )
+    }
+}
+
+test "sigmoid bounds" {
+    assert sigmoid(0.0) > 0.49
+    assert sigmoid(0.0) < 0.51
+    assert sigmoid(10.0) > 0.99
+    assert sigmoid(0.0 - 10.0) < 0.01
+}
+
+test "xor network learns" {
+    let net = new_net()
+    let data = xor_data()
+    train(net, data, 5000, 1.0)
+    assert mse(net, data) < 0.05
+    assert class_of(predict(net, 0.0, 0.0)) == 0
+    assert class_of(predict(net, 0.0, 1.0)) == 1
+    assert class_of(predict(net, 1.0, 0.0)) == 1
+    assert class_of(predict(net, 1.0, 1.0)) == 0
+}
