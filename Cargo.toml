@@ -1,6 +1,6 @@
 [package]
 name = "machino"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 description = "An AI-first programming language that compiles to WebAssembly"
 license = "MIT"
@@ -12,11 +12,14 @@ sha2 = "0.10"
 ureq = "2.9"
 # Z3 SMT solver for contract verification
 z3 = { version = "0.12", optional = true }
+# Embedded SQLite for the native db runtime (optional; CLI fallback when off)
+rusqlite = { version = "0.32", optional = true, features = ["bundled"] }
 
 [features]
 default = []
 smt = ["z3"]
 registry = []
+sqlite = ["dep:rusqlite"]
 
 [profile.release]
 opt-level = 3

@@ -761,12 +761,15 @@ fn aot_native(wasm_path: &str) -> ExitCode {
     match status {
         Ok(s) if s.success() => {
             println!(
-                "wrote {} (wasmtime AOT); run with:  wasmtime run {}",
-                cwasm.display(),
-                wasm_path
+                "wrote {} (wasmtime AOT / Cranelift — not LLVM native codegen)",
+                cwasm.display()
             );
             println!(
-                "note: host imports (print_*, fail, channels, …) still come from the wasmtime runtime / a custom linker"
+                "run the module with:  wasmtime run {}  (or node runners/run.mjs {})",
+                wasm_path, wasm_path
+            );
+            println!(
+                "note: host imports (print_*, fail, channels, TCP, …) still come from the wasmtime runtime / a custom linker; prefer 'machino run' for OS capabilities"
             );
             ExitCode::SUCCESS
         }
@@ -795,7 +798,7 @@ fn validate_spawn_targets(program: &ast::Program) -> Option<Diagnostic> {
     fn in_expr(e: &ast::Expr, fns: &std::collections::HashSet<&str>) -> Option<Diagnostic> {
         use ast::ExprKind::*;
         match &e.kind {
-            Call(name, args) => {
+            Call(name, _, args) => {
                 if name == "spawn" {
                     let ok = matches!(&args[0].kind, Var(n) if fns.contains(n.as_str()));
                     if !ok {
@@ -842,7 +845,7 @@ fn validate_spawn_targets(program: &ast::Program) -> Option<Diagnostic> {
             } => in_expr(cond, fns)
                 .or_else(|| in_stmts(then_body, fns))
                 .or_else(|| in_stmts(else_body, fns)),
-            While { cond, body } => in_expr(cond, fns).or_else(|| in_stmts(body, fns)),
+            While { cond, body, invariant: _ } => in_expr(cond, fns).or_else(|| in_stmts(body, fns)),
             For {
                 start, end, body, ..
             } => in_expr(start, fns)
@@ -1028,13 +1031,23 @@ fn cmd_query(rest: &[String]) -> ExitCode {
         let variants: Vec<String> = e
             .variants
             .iter()
-            .map(|v| match &v.payload {
-                Some(t) => format!(
-                    "{{\"name\":\"{}\",\"payload\":{}}}",
-                    diag::json_escape(&v.name),
-                    type_json(t)
-                ),
-                None => format!("{{\"name\":\"{}\"}}", diag::json_escape(&v.name)),
+            .map(|v| {
+                if v.payloads.is_empty() {
+                    format!("{{\"name\":\"{}\"}}", diag::json_escape(&v.name))
+                } else if v.payloads.len() == 1 {
+                    format!(
+                        "{{\"name\":\"{}\",\"payload\":{}}}",
+                        diag::json_escape(&v.name),
+                        type_json(&v.payloads[0])
+                    )
+                } else {
+                    let ps: Vec<String> = v.payloads.iter().map(type_json).collect();
+                    format!(
+                        "{{\"name\":\"{}\",\"payloads\":[{}]}}",
+                        diag::json_escape(&v.name),
+                        ps.join(",")
+                    )
+                }
             })
             .collect();
         enums.push(format!(
@@ -1123,6 +1136,7 @@ fn fuzz_value(
     ty: &ast::Type,
     structs: &std::collections::HashMap<String, Vec<ast::Param>>,
     rng: &mut synth::Rng,
+    interp: &mut interp::Interp<'_>,
 ) -> Option<interp::Value> {
     use interp::Value;
     Some(match ty {
@@ -1155,35 +1169,39 @@ fn fuzz_value(
             let n = rng.range(6);
             let mut items = Vec::new();
             for _ in 0..n {
-                items.push(fuzz_value(elem, structs, rng)?);
+                items.push(fuzz_value(elem, structs, rng, interp)?);
             }
-            Value::Array(std::rc::Rc::new(std::cell::RefCell::new(items)))
+            interp.alloc_array_value(items)
         }
         ast::Type::Struct(name) => {
             let fields = structs.get(name)?;
             let mut map = std::collections::HashMap::new();
             for f in fields {
-                map.insert(f.name.clone(), fuzz_value(&f.ty, structs, rng)?);
+                map.insert(f.name.clone(), fuzz_value(&f.ty, structs, rng, interp)?);
             }
-            Value::Struct(std::rc::Rc::new(std::cell::RefCell::new(map)))
+            interp.alloc_struct_value(map)
         }
         _ => return None,
     })
 }
 
-fn fuzz_display(v: &interp::Value) -> String {
+fn fuzz_display(v: &interp::Value, interp: &interp::Interp<'_>) -> String {
     use interp::Value;
     match v {
         Value::Str(s) => format!("{:?}", String::from_utf8_lossy(s)),
-        Value::Array(items) => {
-            let inner: Vec<String> = items.borrow().iter().map(fuzz_display).collect();
+        Value::Array(id) => {
+            let inner: Vec<String> = interp
+                .array_elements(*id)
+                .iter()
+                .map(|x| fuzz_display(x, interp))
+                .collect();
             format!("[{}]", inner.join(", "))
         }
-        Value::Struct(fields) => {
-            let mut inner: Vec<String> = fields
-                .borrow()
+        Value::Struct(id) => {
+            let mut inner: Vec<String> = interp
+                .struct_fields(*id)
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, fuzz_display(v)))
+                .map(|(k, v)| format!("{}: {}", k, fuzz_display(v, interp)))
                 .collect();
             inner.sort();
             format!("{{{}}}", inner.join(", "))
@@ -1254,10 +1272,11 @@ fn cmd_fuzz(rest: &[String]) -> ExitCode {
     let mut failed = 0usize;
     let mut results: Vec<String> = Vec::new();
     for f in targets {
+        let mut probe = interp::Interp::new(&loaded.program);
         // functions with un-fuzzable parameter types are skipped explicitly
         if f.params
             .iter()
-            .any(|p| fuzz_value(&p.ty, &structs, &mut synth::Rng::new(1)).is_none())
+            .any(|p| fuzz_value(&p.ty, &structs, &mut synth::Rng::new(1), &mut probe).is_none())
         {
             if json {
                 results.push(format!(
@@ -1275,15 +1294,15 @@ fn cmd_fuzz(rest: &[String]) -> ExitCode {
         let mut attempts = 0usize;
         while tested < runs && attempts < runs * 50 {
             attempts += 1;
-            let args: Vec<interp::Value> = f
-                .params
-                .iter()
-                .map(|p| fuzz_value(&p.ty, &structs, &mut rng).unwrap())
-                .collect();
-            let shown: Vec<String> = args.iter().map(fuzz_display).collect();
             let mut interp = interp::Interp::new(&loaded.program);
             // suppress program output during fuzzing
             interp.output = Box::new(|_| {});
+            let args: Vec<interp::Value> = f
+                .params
+                .iter()
+                .map(|p| fuzz_value(&p.ty, &structs, &mut rng, &mut interp).unwrap())
+                .collect();
+            let shown: Vec<String> = args.iter().map(|v| fuzz_display(v, &interp)).collect();
             match interp.call_by_name(&f.name, args) {
                 Ok(_) => tested += 1,
                 Err(e) => {

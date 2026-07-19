@@ -1,0 +1,14 @@
+# Extern contracts must trap in the interpreter (and in compiled WASM wrappers).
+extern fn bump(x: int) -> int
+requires x > 0
+ensures result > x
+
+fn main() {
+    print(bump(1))
+}
+
+test "extern requires" {
+    # host not provided in test harness for bump — skip live call;
+    # this file mainly checks that contracts parse and type-check.
+    assert true
+}

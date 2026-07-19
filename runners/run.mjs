@@ -28,6 +28,7 @@ import {
 } from "node:worker_threads";
 import { createDomHost } from "./dom_host.mjs";
 import { createDbHost } from "./db_host.mjs";
+import { createTcpHost } from "./tcp_host.mjs";
 
 let memory; // set after instantiation
 let alloc; // exported allocator
@@ -300,6 +301,7 @@ function makeImports(programArgs) {
   domHost = createDomHost({ readStr, makeStr, mode: "virtual" });
   const dom = domHost;
   const db = createDbHost({ readStr, makeStr });
+  const tcp = createTcpHost({ readStr, makeStr, runtimeError });
   return {
     env: {
       // called just before the module traps on a contract/assert/bounds failure
@@ -464,9 +466,7 @@ function makeImports(programArgs) {
       exit(code) {
         process.exit(Number(code));
       },
-      // TCP sockets are provided by machino's native runtime (`machino run`).
-      // Node's socket API is asynchronous, so this synchronous WASM host does
-      // not implement them; provide your own host (or WASI sockets) if needed.
+      ...tcp,
       ...dom,
       ...db,
     },

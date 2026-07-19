@@ -6,7 +6,8 @@
 //
 // Host capabilities match runners/run.mjs (minus TCP). Strings use the
 // exported str_len / str_at / make_str / str_set accessors. Spawn args are
-// int/bool only, packed in an i64 array read via i64arr_len / i64arr_get.
+// int/bool/float/str: scalars in an i64 array (floats bitcast; strings via
+// spawn_pack_str handles resolved in the host before the worker starts).
 
 import { readFileSync, writeFileSync, existsSync, readSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -25,6 +26,8 @@ let nextTask = 1n;
 const tasks = new Map();
 let nextChan = 1n;
 const channels = new Map();
+/** Host-side string pool for GC spawn_pack_str → task_spawn. */
+let spawnStrPool = isMainThread ? [] : (workerData?.spawnStrPool ?? []);
 const programArgs = isMainThread ? process.argv.slice(3) : (workerData?.programArgs ?? []);
 
 function readStr(ref) {
@@ -164,17 +167,45 @@ function makeImports() {
         }
         return makeStr(v.text);
       },
+      spawn_pack_str(strRef) {
+        const id = spawnStrPool.length;
+        spawnStrPool.push(readStr(strRef));
+        return BigInt(id);
+      },
       task_spawn(nameRef, sigRef, argvRef) {
         const fnName = readStr(nameRef);
         const sig = readStr(sigRef);
+        const paramSig = (sig.split(":")[0] || "");
         const n = exports.i64arr_len(argvRef);
         const args = [];
-        for (let i = 0; i < n; i++) args.push(exports.i64arr_get(argvRef, i));
+        const poolSnapshot = spawnStrPool.slice();
+        spawnStrPool.length = 0;
+        for (let i = 0; i < n; i++) {
+          const raw = exports.i64arr_get(argvRef, i);
+          const c = paramSig[i] || "i";
+          if (c === "f") {
+            const buf = new ArrayBuffer(8);
+            new DataView(buf).setBigInt64(0, BigInt(raw), true);
+            args.push({ kind: "f", v: new DataView(buf).getFloat64(0, true) });
+          } else if (c === "s") {
+            args.push({ kind: "s", text: poolSnapshot[Number(raw)] ?? "" });
+          } else {
+            args.push({ kind: "i", v: BigInt(raw) });
+          }
+        }
         const h = nextTask++;
         const sab = new SharedArrayBuffer(8 + 65536);
         tasks.set(Number(h), sab);
         const worker = new Worker(new URL(import.meta.url), {
-          workerData: { module: wasmModule, fnName, sig, args, sab, programArgs },
+          workerData: {
+            module: wasmModule,
+            fnName,
+            sig,
+            args,
+            sab,
+            programArgs,
+            spawnStrPool: [],
+          },
         });
         worker.on("error", (e) => {
           console.error(String(e));
@@ -255,7 +286,15 @@ async function workerMain() {
     if (typeof fn !== "function") {
       throw new Error(`runtime error: spawn target '${fnName}' is not exported`);
     }
-    const result = fn(...args);
+    const conv = args.map((a) => {
+      if (a && typeof a === "object") {
+        if (a.kind === "f") return a.v;
+        if (a.kind === "s") return makeStr(a.text);
+        return a.v;
+      }
+      return a;
+    });
+    const result = fn(...conv);
     const ret = sig.split(":")[1] || "i";
     const dv = new DataView(sab);
     if (ret === "f") {

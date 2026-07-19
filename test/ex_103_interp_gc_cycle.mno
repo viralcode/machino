@@ -1,0 +1,35 @@
+# Interpreter cycle GC: arrays and structs can form reference cycles; the
+# mark-sweep collector reclaims them when roots are dropped.
+
+extern fn gc_collect()
+extern fn heap_live_count() -> int
+
+struct Node {
+    children: [Node]
+}
+
+fn make_cycle() {
+    let n = Node([])
+    n.children = [n]
+}
+
+fn main() {
+    for i in 0..500 {
+        make_cycle()
+    }
+    print(heap_live_count())
+}
+
+test "cycle does not crash" {
+    for i in 0..200 {
+        make_cycle()
+    }
+    assert true
+}
+
+test "cycle is reclaimed" {
+    let before = heap_live_count()
+    make_cycle()
+    gc_collect()
+    assert heap_live_count() == before
+}

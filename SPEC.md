@@ -1,4 +1,4 @@
-# The machino Language Specification (v1.2)
+# The machino Language Specification (v1.3)
 
 machino is an AI-first programming language. It is designed for code that is
 *written and verified by machines*: the syntax is small and canonical, the
@@ -31,7 +31,8 @@ formally specified machine language that runs everywhere.
   by adding parentheses.
 - Identifiers match `[A-Za-z_][A-Za-z0-9_]*`.
 - Keywords: `fn extern let if else while for in break continue return true
-  false requires ensures test assert struct import enum match`.
+  false requires ensures test assert struct import enum match where
+  invariant`.
 - Reserved names: `result` (bound in `ensures`), `memory`, `alloc`, the
   builtins, and every std-prelude function and struct (see below).
 
@@ -182,11 +183,12 @@ enum Result {
 
 Enums are sum types (tagged unions). Each variant may carry:
 - **nothing** (unit variant): `Option::None`
-- **a single payload** of any type: `Option::Some(42)`
+- **one or more payloads** of any type: `Option::Some(42)`, `Pair(int, str)`
 
 Variants are constructed by calling them like functions:
 - `Option::None` for unit variants
-- `Option::Some(42)` for variants with payloads
+- `Option::Some(42)` for single-payload variants
+- `Pair(1, "hi")` for multi-payload variants
 
 Enums are deconstructed using `match` expressions.
 
@@ -209,7 +211,7 @@ Patterns:
 - `var` — binds to a variable
 - `42`, `true`, `"hello"` — literal matches
 - `Enum::Variant` — matches a unit variant
-- `Enum::Variant(pattern)` — matches a variant with payload, binds nested pattern
+- `Enum::Variant(p1, p2, ...)` — matches a variant with payload(s), binds nested patterns
 
 Match expressions must be **exhaustive** — the type checker verifies that all
 possible values are covered. Match can be used as an expression (in `let` or
@@ -245,11 +247,11 @@ arrays of scalars/`str` (`E026` otherwise).
 | `tcp_write` | `(conn: int, data: str) -> int` |
 | `tcp_close` | `(handle: int)` |
 
-The Node host (`runners/run.mjs`) provides all of these except the `tcp_*`
-family (Node sockets are asynchronous; bring your own host or WASI sockets
-for compiled servers). The browser host provides the print family, `clock_ms`,
-`getenv`, and `read_line` only. Declaring an extern the host lacks fails at
-instantiation — capability denial, working as intended.
+The WASM import surface mirrors the table above. The Node host implements
+`tcp_*` with blocking `node:net` + `Atomics.wait`. The browser host provides
+the print family, `clock_ms`, `getenv`, `read_line`, and `dom_*` only — no raw
+TCP (see `packages/ws` for WebSocket extern declarations). Declaring an extern
+the host lacks fails at instantiation — capability denial, working as intended.
 
 ### Tests
 
@@ -390,8 +392,8 @@ closures up to 60 payload words the bitmap flags which payload words are
 pointers; larger objects use the *big struct* tag, and the second header
 word holds the address of a static multi-word bitmap in the data segment —
 so structs have no field limit. Enums are represented as struct-like
-objects with a tag field (variant index) and a payload field (variant data
-if present). Function values are closure objects
+objects with a tag field (variant index) and zero or more payload words
+(one per payload type). Function values are closure objects
 `[header][table_slot][captures...]`; calls through them use a `funcref`
 table and `call_indirect` with a hidden environment parameter (named
 functions used as values get a static singleton closure and a wrapper).
@@ -405,10 +407,14 @@ freed blocks are coalesced into a free list that the allocator searches
 before bumping. Memory is capped at 4 GiB (the wasm32 address-space
 maximum) — allocating past it (with nothing to collect) traps with
 `out of memory`. The shadow stack defaults to 16 MiB and is sized with
-`machino build --stack-mib N`. The interpreter uses
-reference counting; the only divergence is pathological reference cycles
-(e.g. an array pushed into a struct it contains), which the interpreter
-leaks and the compiled GC reclaims.
+`machino build --stack-mib N`.
+
+The interpreter uses an arena heap for arrays and structs with the same
+mark-sweep collector: `Value::Array` / `Value::Struct` hold heap indices,
+roots are the active environment frames, collection runs every 256
+allocations and at the end of each top-level call when the live heap grew.
+Strings stay immutable (`Rc<Vec<u8>>`). Test hooks: `extern fn gc_collect()`
+and `extern fn heap_live_count() -> int`.
 
 The module exports `memory`, `alloc`, and every non-prelude function. Hosts
 that create objects (strings, arrays) must write the 16-byte header — see
@@ -452,9 +458,11 @@ fn<T, U> pair_max(a: T, b: T, tag: U) -> T where T: Ord + Num, U: Eq {
   either inline (`fn<T: Ord + Num>`) or in a trailing `where` clause after
   the return type; a `where` clause naming an undeclared parameter is
   `E073`.
-- Type arguments are inferred at every call site by unification; there is
-  no explicit turbofish syntax. Ambiguous or conflicting inference is an
-  error with the conflicting types named.
+- Type arguments are inferred at every call site by unification. They may
+  also be written explicitly with turbofish: `id::<int>(7)`,
+  `fst::<int, str>(3, "x")`. Ambiguous or conflicting inference (or a
+  turbofish that disagrees with the arguments) is an error with the
+  conflicting types named.
 - The compiler **monomorphizes**: each distinct instantiation becomes a
   concrete function before codegen, so both backends see only concrete
   types. `machino query` still reports the generic template as written.
@@ -463,8 +471,7 @@ fn<T, U> pair_max(a: T, b: T, tag: U) -> T where T: Ord + Num, U: Eq {
   distinct instantiation (`HashMap$str$int`) before codegen, the same
   way it does for generic functions. Type arguments may also be written
   in annotations: `let m: HashMap<str, int> = …` (nested apps and `>>`
-  are supported). Call-site turbofish remains unsupported — inference
-  is still the default at calls.
+  are supported).
 
 ## Static verification (`machino check --verify`)
 
@@ -474,11 +481,14 @@ mathematical reals; array/`str` `len` and struct fields become
 uninterpreted symbols), where calls to other int/bool/float functions
 are **inlined** (up to depth 8; deeper recursion reports `unknown`),
 `for` loops with constant bounds are **unrolled** (up to 128
-iterations), and `while i < N` / `while i <= N` loops that start from a
-constant and step by one are unrolled the same way — and reports, per
-function: contracts **proved**, a **counterexample**, or **vacuous
-requires**. String lite: `len(s)` and `s == t` on string parameters.
-Everything else stays runtime-checked.
+iterations), `while i < N` / `while i <= N` loops that start from a
+constant and step by one are unrolled the same way, and
+`while cond invariant inv { … }` loops are verified by induction
+(invariant on entry, preserved by the body, assumed after exit) — and
+reports, per function: contracts **proved**, a **counterexample**, or
+**vacuous requires**. String lite: `len(s)`, `s == t`, and
+`len(a + b) == len(a) + len(b)` on string values. Everything else stays
+runtime-checked.
 
 ## Tooling
 
@@ -503,13 +513,13 @@ Everything else stays runtime-checked.
   package and uploads it to a registry over HTTP (client side; running a
   registry server is out of scope).
 
-## Known limits (v1.2)
+## Known limits (v1.3)
 
 - Compiled `spawn` targets must be named top-level functions (`E074`);
   lambdas and function-typed variables spawn in the interpreter only.
   Spawned functions must return a scalar (`E071`). Under `--gc`, spawn
-  arguments are currently int/bool only (float/str/struct args need the
-  linear backend or `machino run`).
+  arguments may be `int`/`bool`/`float`/`str`; struct/array graphs still
+  need the linear backend or `machino run`.
 - Channels are host-mediated; the linear and GC Node runners share
   channel state across workers via SharedArrayBuffer queues.
 - Strings are UTF-8 byte strings: `len`/`char_at`/`substr`/`chr` are
@@ -519,25 +529,39 @@ Everything else stays runtime-checked.
   browsers). Externs (Node subset), channels, and spawn/join are
   supported; `args()` returning `[str]` is native-runtime only.
   Integer overflow traps on both backends with matching messages.
-- SMT verification covers int/bool/float and string-lite contracts with
-  bounded inlining and loop unrolling; richer string ops and unbounded
-  `while` stay runtime-checked.
-- Enum variants carry at most one payload value; 255 variants max.
-- Contracts on `extern fn`s are enforced by the interpreter but not in
-  compiled WASM.
+- SMT verification covers int/bool/float and string-lite (`len`, `==`,
+  concat length) with bounded inlining, loop unrolling, and
+  `while cond invariant e { ... }` induction proofs. Full string/seq
+  theory and arbitrary unbounded loops without invariants stay
+  runtime-checked.
+- Enum variants carry zero or more payload values; 65535 variants max.
+- Contracts on `extern fn`s are enforced in the interpreter and in
+  compiled WASM (thin wrappers around host imports).
+- The interpreter uses an arena + mark-sweep collector for arrays/structs
+  (reference cycles are reclaimed). `gc_collect` / `heap_live_count` are
+  available as test hooks.
 - The interpreter's call depth defaults to 4096 (`MACHINO_MAX_DEPTH` env
   var overrides); the compiled shadow stack defaults to 16 MiB
   (`--stack-mib N` overrides). Compiled-module memory is capped at 4 GiB
   (the wasm32 maximum).
-- Reference cycles are reclaimed by the compiled GC but leak in the
-  interpreter (they require deliberately circular data).
+- Embedded SQLite (`cargo build --features sqlite`) uses bundled `rusqlite`
+  for the `sqlite` db driver; without the feature the native runtime shells
+  out to `sqlite3` on PATH. MySQL/Postgres/Mongo remain CLI-backed.
+- `machino build --native` is **wasmtime AOT** of the linear WASM module
+  (Cranelift), not an LLVM/native-ISA backend. Prefer `machino run` for
+  OS capabilities.
+- Browser hosts have no raw TCP; use WebSockets (`packages/ws`) or HTTP.
+  Node `runners/run.mjs` provides TCP via a worker-backed `node:net` host.
+- DOM events expose type/target plus x/y/key/button/value; virtual CSSOM
+  computed style is inline-based (browser hosts use `getComputedStyle`).
+- `packages/regex` is a practical subset (not PCRE); `packages/mathadv`
+  is educational series math (not libm/BLAS).
 
 ## Roadmap
 
 - Hosted public registry service (`pkg publish` already speaks the
   protocol; the server itself is out of scope for the toolchain)
-- GC spawn of float/str/struct arguments
-- Call-site turbofish (`foo::<int>(x)`)
-- User-written loop invariants for unbounded `while` proofs
+- GC spawn of struct/array argument graphs
+- Optional LLVM/native-ISA backend (not planned in-tree near-term)
 
 

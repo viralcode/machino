@@ -2,7 +2,8 @@
 //!
 //! Drivers:
 //! - `memory` — in-process document store (always available; for tests)
-//! - `sqlite` — shells out to `sqlite3` on PATH
+//! - `sqlite` — embedded via `rusqlite` when built with `--features sqlite`;
+//!   otherwise shells out to `sqlite3` on PATH
 //! - `mysql` — shells out to `mysql` on PATH
 //! - `postgres` / `pg` — shells out to `psql` on PATH
 //! - `mongo` / `mongodb` — shells out to `mongosh` on PATH
@@ -17,6 +18,11 @@ pub enum DbConn {
         /// collection/table -> list of JSON document strings
         docs: HashMap<String, Vec<String>>,
     },
+    #[cfg(feature = "sqlite")]
+    Sqlite {
+        conn: rusqlite::Connection,
+    },
+    #[cfg(not(feature = "sqlite"))]
     Sqlite {
         path: String,
     },
@@ -68,14 +74,23 @@ pub fn open(driver: &str, conn: &str) -> Result<DbConn, String> {
             docs: HashMap::new(),
         }),
         "sqlite" => {
-            if !which("sqlite3") {
-                return Err("sqlite3 CLI not found on PATH".into());
-            }
             let path = conn
                 .strip_prefix("sqlite://")
                 .unwrap_or(conn)
                 .to_string();
-            Ok(DbConn::Sqlite { path })
+            #[cfg(feature = "sqlite")]
+            {
+                let db = rusqlite::Connection::open(&path)
+                    .map_err(|e| format!("sqlite open '{}': {}", path, e))?;
+                Ok(DbConn::Sqlite { conn: db })
+            }
+            #[cfg(not(feature = "sqlite"))]
+            {
+                if !which("sqlite3") {
+                    return Err("sqlite3 CLI not found on PATH".into());
+                }
+                Ok(DbConn::Sqlite { path })
+            }
         }
         "mysql" => {
             if !which("mysql") {
@@ -111,6 +126,9 @@ pub fn open(driver: &str, conn: &str) -> Result<DbConn, String> {
 pub fn exec(conn: &mut DbConn, sql: &str) -> String {
     match conn {
         DbConn::Memory { docs } => memory_exec(docs, sql),
+        #[cfg(feature = "sqlite")]
+        DbConn::Sqlite { conn } => sqlite_embedded_exec(conn, sql),
+        #[cfg(not(feature = "sqlite"))]
         DbConn::Sqlite { path } => cli_capture(
             "sqlite3",
             &["-json", path, sql],
@@ -125,6 +143,9 @@ pub fn exec(conn: &mut DbConn, sql: &str) -> String {
 pub fn query(conn: &mut DbConn, sql: &str) -> String {
     match conn {
         DbConn::Memory { docs } => memory_query(docs, sql),
+        #[cfg(feature = "sqlite")]
+        DbConn::Sqlite { conn } => sqlite_embedded_query(conn, sql),
+        #[cfg(not(feature = "sqlite"))]
         DbConn::Sqlite { path } => {
             let out = Command::new("sqlite3")
                 .args(["-json", path, sql])
@@ -145,6 +166,65 @@ pub fn query(conn: &mut DbConn, sql: &str) -> String {
         DbConn::Mysql { url } => mysql_run(url, sql, true),
         DbConn::Postgres { url } => postgres_run(url, sql, true),
         DbConn::Mongo { url } => mongo_run(url, sql),
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_embedded_exec(conn: &rusqlite::Connection, sql: &str) -> String {
+    match conn.execute_batch(sql) {
+        Ok(()) => "{\"ok\":true,\"exec\":true}".into(),
+        Err(e) => json_err(&e.to_string()),
+    }
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_embedded_query(conn: &rusqlite::Connection, sql: &str) -> String {
+    use rusqlite::types::ValueRef;
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(e) => return json_err(&e.to_string()),
+    };
+    let col_count = stmt.column_count();
+    let col_names: Vec<String> = (0..col_count)
+        .map(|i| stmt.column_name(i).unwrap_or("").to_string())
+        .collect();
+    let rows = match stmt.query([]) {
+        Ok(rows) => rows,
+        Err(e) => return json_err(&e.to_string()),
+    };
+    let mut out_rows = Vec::new();
+    let mut rows = rows;
+    loop {
+        match rows.next() {
+            Ok(Some(row)) => {
+                let mut obj = String::from("{");
+                for i in 0..col_count {
+                    if i > 0 {
+                        obj.push(',');
+                    }
+                    obj.push_str(&serde_json_escape(&col_names[i]));
+                    obj.push(':');
+                    obj.push_str(&sqlite_value_json(row.get_ref(i).unwrap_or(ValueRef::Null)));
+                }
+                obj.push('}');
+                out_rows.push(obj);
+            }
+            Ok(None) => break,
+            Err(e) => return json_err(&e.to_string()),
+        }
+    }
+    format!("{{\"ok\":true,\"rows\":[{}]}}", out_rows.join(","))
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_value_json(v: rusqlite::types::ValueRef<'_>) -> String {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => "null".into(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Real(f) => f.to_string(),
+        ValueRef::Text(s) => serde_json_escape(std::str::from_utf8(s).unwrap_or("")),
+        ValueRef::Blob(b) => serde_json_escape(&String::from_utf8_lossy(b)),
     }
 }
 
@@ -297,5 +377,23 @@ fn memory_query(docs: &mut HashMap<String, Vec<String>>, sql: &str) -> String {
         return format!("{{\"ok\":true,\"count\":{}}}", n);
     }
     json_err("memory query expects: GET <coll> | COUNT <coll>")
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_sqlite_memory_roundtrip() {
+        let mut conn = open("sqlite", ":memory:").expect("open :memory:");
+        let exec_out = exec(&mut conn, "CREATE TABLE t (id INT, name TEXT)");
+        assert!(exec_out.contains("\"ok\":true"), "{}", exec_out);
+        let exec_out = exec(&mut conn, "INSERT INTO t VALUES (1, 'a')");
+        assert!(exec_out.contains("\"ok\":true"), "{}", exec_out);
+        let q = query(&mut conn, "SELECT id, name FROM t");
+        assert!(q.contains("\"ok\":true"), "{}", q);
+        assert!(q.contains("\"id\":1"));
+        assert!(q.contains("\"name\":\"a\""));
+    }
 }
 

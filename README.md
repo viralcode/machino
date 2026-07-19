@@ -271,17 +271,21 @@ for f in test/ex_*.mno; do ./target/release/machino test "$f" || exit 1; done
 
 ## Status and roadmap
 
-This is **v1.2**. Deploy paths are aligned: `machino run` is the official native OS runtime ([docs/native-runtime.md](docs/native-runtime.md)); linear and `--gc` WASM both support externs, channels, and spawn/join; annotations accept `HashMap<str, int>`; SMT covers floats and bounded `while`.
+This is **v1.3**. Capability closeout: turbofish, multi-payload enums, GC spawn of float/str, extern contracts in compiled WASM, interpreter cycle GC, SMT loop invariants, Node TCP, richer DOM events, optional embedded SQLite, stronger regex/math packages.
 
-What 1.2 closed out (on top of 1.1):
+What 1.3 adds (on top of 1.2):
 
-- **Generic type annotations** — `let m: HashMap<str, int> = …`
-- **WASM-GC parity** — extern imports, channels, spawn/join (int/bool spawn args); `runners/run-gc.mjs` host
-- **Cross-worker channels** — SharedArrayBuffer queues in `runners/run.mjs`
-- **Native story** — documented `machino run` capabilities; `machino build --native` AOT via `wasmtime compile`
-- **SMT expansion** — float (reals), string-lite (`len`/`==`), bounded `while i < N` unrolling
+- **Turbofish** — `foo::<int, str>(…)` at call sites
+- **Multi-payload enums** — `E::C(int, str)`; 65535 variants max
+- **GC spawn** — float/str args (struct graphs: linear / `machino run`)
+- **Extern contracts in WASM** — requires/ensures wrappers around host imports
+- **Interpreter cycle GC** — arena mark-sweep for arrays/structs
+- **SMT** — `while cond invariant e { … }`; concat length for strings
+- **Hosts** — Node TCP; DOM last-event x/y/key/button/value; `packages/ws`
+- **DB** — `--features sqlite` embeds rusqlite; CLI fallback otherwise
+- **`--native`** — documented as wasmtime AOT (not LLVM)
 
-**Remaining bounds:** GC spawn of float/str/struct args; call-site turbofish; unbounded `while` proofs (no invariant syntax yet); hosted package registry stays out of the toolchain.
+**Remaining bounds:** GC spawn of struct/array graphs; full PCRE/libm; hosted package registry; optional LLVM backend (not in-tree).
 
 ## License
 

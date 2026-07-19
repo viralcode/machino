@@ -3,8 +3,8 @@
 # Handles are opaque ints (0 = null).
 # Events: dom_add_listener(el, "click", "handler_fn_name") binds an exported
 # zero-arg function. In the browser the host calls it on the real event; in
-# machino run / tests use dom_dispatch(el, "click"). Handlers read
-# dom_last_event_type() / dom_last_event_target().
+# machino run / tests use dom_dispatch(el, "click") or dom_dispatch_event(...)
+# with explicit coords/key/button/value. Handlers read dom_last_event_*().
 
 extern fn dom_document() -> int
 extern fn dom_get_element_by_id(id: str) -> int
@@ -42,8 +42,14 @@ extern fn dom_scroll_to(el: int, x: int, y: int)
 extern fn dom_add_listener(el: int, event: str, handler: str)
 extern fn dom_remove_listener(el: int, event: str)
 extern fn dom_dispatch(el: int, event: str)
+extern fn dom_dispatch_event(el: int, event: str, x: int, y: int, key: str, button: int, value: str)
 extern fn dom_last_event_type() -> str
 extern fn dom_last_event_target() -> int
+extern fn dom_last_event_x() -> int
+extern fn dom_last_event_y() -> int
+extern fn dom_last_event_key() -> str
+extern fn dom_last_event_button() -> int
+extern fn dom_last_event_value() -> str
 
 fn dom_ok(el: int) -> bool {
     return el != 0
@@ -125,5 +131,44 @@ test "dom events" {
     dom_dispatch(btn, "click")
     assert dom_last_event_type() == "click"
     assert dom_last_event_target() == btn
+    assert dom_last_event_x() == 0
+    assert dom_last_event_y() == 0
+    assert dom_last_event_key() == ""
+    assert dom_last_event_button() == 0
+    assert dom_last_event_value() == ""
     assert dom_get_attr(btn, "data-clicked") == "1"
+}
+
+fn _dom_test_keydown() {
+    let t = dom_last_event_target()
+    dom_set_attr(t, "data-key", dom_last_event_key())
+}
+
+fn _dom_test_input() {
+    let t = dom_last_event_target()
+    dom_set_attr(t, "data-value", dom_last_event_value())
+}
+
+test "dom event fields" {
+    let root = dom_document()
+    let inp = dom_create_element("input")
+    dom_set_attr(inp, "id", "inp")
+    dom_append_child(root, inp)
+    dom_add_listener(inp, "keydown", "_dom_test_keydown")
+    dom_dispatch_event(inp, "keydown", 10, 20, "Enter", 0, "")
+    assert dom_last_event_x() == 10
+    assert dom_last_event_y() == 20
+    assert dom_last_event_key() == "Enter"
+    assert dom_get_attr(inp, "data-key") == "Enter"
+    dom_add_listener(inp, "input", "_dom_test_input")
+    dom_dispatch_event(inp, "input", 0, 0, "", 0, "hello")
+    assert dom_last_event_value() == "hello"
+    assert dom_get_attr(inp, "data-value") == "hello"
+    let btn = dom_create_element("button")
+    dom_append_child(root, btn)
+    dom_add_listener(btn, "mousedown", "_dom_test_clicked")
+    dom_dispatch_event(btn, "mousedown", 5, 7, "", 2, "")
+    assert dom_last_event_button() == 2
+    assert dom_last_event_x() == 5
+    assert dom_last_event_y() == 7
 }

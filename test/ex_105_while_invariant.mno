@@ -1,0 +1,22 @@
+# User-written while invariants (SMT with --features smt; runtime always OK).
+fn sum_to(n: int) -> int
+requires n >= 0
+ensures result == n * (n + 1) / 2
+{
+    let i = 0
+    let s = 0
+    while i < n invariant s == i * (i + 1) / 2 && i >= 0 && i <= n {
+        i = i + 1
+        s = s + i
+    }
+    return s
+}
+
+fn main() {
+    print(sum_to(5))
+}
+
+test "while invariant runtime" {
+    assert sum_to(0) == 0
+    assert sum_to(5) == 15
+}

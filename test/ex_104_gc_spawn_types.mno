@@ -1,0 +1,20 @@
+# GC spawn of float and str arguments (linear already supported graphs).
+fn add1(x: float) -> float {
+    return x + 1.0
+}
+
+fn greet(name: str) -> str {
+    return "hi:" + name
+}
+
+fn main() {
+    let t = spawn(add1, 2.5)
+    print(join_float(t))
+}
+
+test "gc spawn float str" {
+    let a = spawn(add1, 1.5)
+    assert join_float(a) == 2.5
+    let b = spawn(greet, "sam")
+    assert join_str(b) == "hi:sam"
+}

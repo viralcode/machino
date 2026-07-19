@@ -9,7 +9,6 @@
 
 use crate::ast::*;
 use crate::diag::Span;
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -24,10 +23,12 @@ pub enum Value {
     Bool(bool),
     /// Strings are byte strings (usually UTF-8), matching the WASM backend.
     Str(Rc<Vec<u8>>),
-    Array(Rc<RefCell<Vec<Value>>>),
-    Struct(Rc<RefCell<HashMap<String, Value>>>),
-    /// An enum variant: (enum_name, variant_name, optional_payload)
-    EnumVariant(String, String, Option<Box<Value>>),
+    /// Index into `Interp::heap` (reference type; mutable through the heap slot).
+    Array(u32),
+    /// Index into `Interp::heap` (reference type; mutable through the heap slot).
+    Struct(u32),
+    /// An enum variant: (enum_name, variant_name, payloads)
+    EnumVariant(String, String, Vec<Value>),
     /// A first-class named function value.
     Fn(String),
     /// A lambda with its by-value captured environment.
@@ -62,7 +63,7 @@ enum SendVal {
     Str(Vec<u8>),
     Array(Vec<SendVal>),
     Struct(Vec<(String, SendVal)>),
-    EnumVariant(String, String, Option<Box<SendVal>>),
+    EnumVariant(String, String, Vec<SendVal>),
     Fn(String),
     Closure(usize, Vec<(String, SendVal)>),
     Unit,
@@ -140,67 +141,6 @@ fn channel_recv(id: i64) -> Result<SendVal, String> {
     }
 }
 
-fn to_sendval(v: &Value) -> SendVal {
-    match v {
-        Value::Int(i) => SendVal::Int(*i),
-        Value::Float(f) => SendVal::Float(*f),
-        Value::Bool(b) => SendVal::Bool(*b),
-        Value::Str(s) => SendVal::Str(s.as_ref().clone()),
-        Value::Array(cells) => SendVal::Array(cells.borrow().iter().map(to_sendval).collect()),
-        Value::Struct(fields) => SendVal::Struct(
-            fields
-                .borrow()
-                .iter()
-                .map(|(k, v)| (k.clone(), to_sendval(v)))
-                .collect(),
-        ),
-        Value::EnumVariant(e, n, payload) => SendVal::EnumVariant(
-            e.clone(),
-            n.clone(),
-            payload.as_ref().map(|p| Box::new(to_sendval(p))),
-        ),
-        Value::Fn(name) => SendVal::Fn(name.clone()),
-        Value::Closure(c) => SendVal::Closure(
-            c.lambda_id,
-            c.captured
-                .iter()
-                .map(|(k, v)| (k.clone(), to_sendval(v)))
-                .collect(),
-        ),
-        Value::Unit => SendVal::Unit,
-    }
-}
-
-fn from_sendval(v: SendVal) -> Value {
-    match v {
-        SendVal::Int(i) => Value::Int(i),
-        SendVal::Float(f) => Value::Float(f),
-        SendVal::Bool(b) => Value::Bool(b),
-        SendVal::Str(s) => Value::Str(Rc::new(s)),
-        SendVal::Array(xs) => Value::Array(Rc::new(RefCell::new(
-            xs.into_iter().map(from_sendval).collect(),
-        ))),
-        SendVal::Struct(fields) => Value::Struct(Rc::new(RefCell::new(
-            fields
-                .into_iter()
-                .map(|(k, v)| (k, from_sendval(v)))
-                .collect(),
-        ))),
-        SendVal::EnumVariant(e, n, payload) => {
-            Value::EnumVariant(e, n, payload.map(|p| Box::new(from_sendval(*p))))
-        }
-        SendVal::Fn(name) => Value::Fn(name),
-        SendVal::Closure(id, captured) => Value::Closure(Rc::new(ClosureData {
-            lambda_id: id,
-            captured: captured
-                .into_iter()
-                .map(|(k, v)| (k, from_sendval(v)))
-                .collect(),
-        })),
-        SendVal::Unit => Value::Unit,
-    }
-}
-
 impl Value {
     pub fn display(&self) -> String {
         match self {
@@ -216,11 +156,11 @@ impl Value {
             Value::Str(s) => String::from_utf8_lossy(s).into_owned(),
             Value::Array(_) => "<array>".to_string(),
             Value::Struct(_) => "<struct>".to_string(),
-            Value::EnumVariant(enum_name, variant_name, payload) => {
-                if payload.is_some() {
-                    format!("{}::{}(...)", enum_name, variant_name)
-                } else {
+            Value::EnumVariant(enum_name, variant_name, payloads) => {
+                if payloads.is_empty() {
                     format!("{}::{}", enum_name, variant_name)
+                } else {
+                    format!("{}::{}(...)", enum_name, variant_name)
                 }
             }
             Value::Fn(name) => format!("<fn {}>", name),
@@ -263,6 +203,20 @@ fn max_call_depth() -> usize {
         .unwrap_or(4096)
 }
 
+/// Heap object stored by the interpreter arena (arrays and structs).
+enum HeapObj {
+    Array(Vec<Value>),
+    Struct(HashMap<String, Value>),
+}
+
+struct HeapSlot {
+    marked: bool,
+    obj: Option<HeapObj>,
+}
+
+/// Collect after this many heap allocations (when roots are known).
+const HEAP_GC_ALLOC_THRESHOLD: u32 = 256;
+
 pub struct Interp<'a> {
     functions: HashMap<&'a str, &'a Function>,
     struct_fields: HashMap<&'a str, &'a [Param]>,
@@ -288,8 +242,18 @@ pub struct Interp<'a> {
     dom_listeners: HashMap<(i64, String), String>,
     dom_last_event_type: String,
     dom_last_event_target: i64,
+    dom_last_event_x: i64,
+    dom_last_event_y: i64,
+    dom_last_event_key: String,
+    dom_last_event_button: i64,
+    dom_last_event_value: String,
     db_conns: HashMap<i64, crate::db_runtime::DbConn>,
     next_db: i64,
+    heap: Vec<HeapSlot>,
+    heap_allocs_since_gc: u32,
+    heap_high_water: usize,
+    /// Call-stack environments scanned as GC roots (caller + callee frames).
+    env_stack: Vec<*const Vec<HashMap<String, Value>>>,
 }
 
 #[derive(Clone)]
@@ -366,8 +330,286 @@ impl<'a> Interp<'a> {
             dom_listeners: HashMap::new(),
             dom_last_event_type: String::new(),
             dom_last_event_target: 0,
+            dom_last_event_x: 0,
+            dom_last_event_y: 0,
+            dom_last_event_key: String::new(),
+            dom_last_event_button: 0,
+            dom_last_event_value: String::new(),
             db_conns: HashMap::new(),
             next_db: 1,
+            heap: Vec::new(),
+            heap_allocs_since_gc: 0,
+            heap_high_water: 0,
+            env_stack: Vec::new(),
+        }
+    }
+
+    fn push_env(&mut self, env: &Vec<HashMap<String, Value>>) {
+        self.env_stack.push(env as *const _);
+    }
+
+    fn pop_env(&mut self) {
+        self.env_stack.pop();
+    }
+
+    fn alloc_array(
+        &mut self,
+        data: Vec<Value>,
+        _roots: Option<&[HashMap<String, Value>]>,
+    ) -> Value {
+        let id = self.alloc_heap(HeapObj::Array(data));
+        Value::Array(id)
+    }
+
+    fn alloc_struct(
+        &mut self,
+        fields: HashMap<String, Value>,
+        _roots: Option<&[HashMap<String, Value>]>,
+    ) -> Value {
+        let id = self.alloc_heap(HeapObj::Struct(fields));
+        Value::Struct(id)
+    }
+
+    fn alloc_heap(&mut self, obj: HeapObj) -> u32 {
+        let id = self.heap.len() as u32;
+        self.heap.push(HeapSlot {
+            marked: false,
+            obj: Some(obj),
+        });
+        self.heap_allocs_since_gc += 1;
+        id
+    }
+
+    fn maybe_collect_at_stmt(&mut self, _env: &[HashMap<String, Value>]) {
+        if self.heap_allocs_since_gc >= HEAP_GC_ALLOC_THRESHOLD {
+            self.gc_collect(&[]);
+        }
+    }
+
+    /// Mark-sweep cycle collector. Roots are bindings in `extra_roots` plus every
+    /// frames (typically the active call stack's lexical environment).
+    pub fn gc_collect(&mut self, extra_roots: &[HashMap<String, Value>]) {
+        for slot in &mut self.heap {
+            slot.marked = false;
+        }
+        for frame in extra_roots {
+            for v in frame.values() {
+                self.mark_value(v);
+            }
+        }
+        let stacks: Vec<*const Vec<HashMap<String, Value>>> = self.env_stack.clone();
+        for ptr in stacks {
+            // SAFETY: pushed for the duration of eval/calls on this thread.
+            let env = unsafe { &*ptr };
+            for frame in env {
+                for v in frame.values() {
+                    self.mark_value(v);
+                }
+            }
+        }
+        self.sweep_heap();
+        self.heap_allocs_since_gc = 0;
+    }
+
+    /// Live heap objects (array + struct slots that are allocated).
+    pub fn heap_live_count(&self) -> usize {
+        self.heap
+            .iter()
+            .filter(|s| s.obj.is_some())
+            .count()
+    }
+
+    fn mark_value(&mut self, v: &Value) {
+        match v {
+            Value::Array(id) => self.mark_array(*id),
+            Value::Struct(id) => self.mark_struct(*id),
+            Value::EnumVariant(_, _, payloads) => {
+                for p in payloads {
+                    self.mark_value(p);
+                }
+            }
+            Value::Closure(c) => {
+                for (_, cap) in &c.captured {
+                    self.mark_value(cap);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mark_array(&mut self, id: u32) {
+        let Some(slot) = self.heap.get_mut(id as usize) else {
+            return;
+        };
+        if slot.marked {
+            return;
+        }
+        slot.marked = true;
+        if let Some(HeapObj::Array(data)) = slot.obj.as_ref() {
+            let items: Vec<Value> = data.clone();
+            for v in items {
+                self.mark_value(&v);
+            }
+        }
+    }
+
+    fn mark_struct(&mut self, id: u32) {
+        let Some(slot) = self.heap.get_mut(id as usize) else {
+            return;
+        };
+        if slot.marked {
+            return;
+        }
+        slot.marked = true;
+        if let Some(HeapObj::Struct(fields)) = slot.obj.as_ref() {
+            let vals: Vec<Value> = fields.values().cloned().collect();
+            for v in vals {
+                self.mark_value(&v);
+            }
+        }
+    }
+
+    fn sweep_heap(&mut self) {
+        for slot in &mut self.heap {
+            if slot.obj.is_some() && !slot.marked {
+                slot.obj = None;
+            }
+        }
+    }
+
+    fn array_len(&self, id: u32) -> usize {
+        match self.heap.get(id as usize).and_then(|s| s.obj.as_ref()) {
+            Some(HeapObj::Array(data)) => data.len(),
+            _ => 0,
+        }
+    }
+
+    fn array_get(&self, id: u32, idx: usize) -> Option<Value> {
+        match self.heap.get(id as usize).and_then(|s| s.obj.as_ref()) {
+            Some(HeapObj::Array(data)) => data.get(idx).cloned(),
+            _ => None,
+        }
+    }
+
+    fn array_set(&mut self, id: u32, idx: usize, val: Value) -> bool {
+        match self.heap.get_mut(id as usize).and_then(|s| s.obj.as_mut()) {
+            Some(HeapObj::Array(data)) if idx < data.len() => {
+                data[idx] = val;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn array_clone_data(&self, id: u32) -> Vec<Value> {
+        match self.heap.get(id as usize).and_then(|s| s.obj.as_ref()) {
+            Some(HeapObj::Array(data)) => data.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn struct_get(&self, id: u32, field: &str) -> Option<Value> {
+        match self.heap.get(id as usize).and_then(|s| s.obj.as_ref()) {
+            Some(HeapObj::Struct(fields)) => fields.get(field).cloned(),
+            _ => None,
+        }
+    }
+
+    fn struct_set(&mut self, id: u32, field: &str, val: Value) -> bool {
+        match self.heap.get_mut(id as usize).and_then(|s| s.obj.as_mut()) {
+            Some(HeapObj::Struct(fields)) => {
+                fields.insert(field.to_string(), val);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Build an array value (used by fuzzing and tests outside eval).
+    pub fn alloc_array_value(&mut self, vals: Vec<Value>) -> Value {
+        self.alloc_array(vals, None)
+    }
+
+    /// Build a struct value (used by fuzzing and tests outside eval).
+    pub fn alloc_struct_value(&mut self, fields: HashMap<String, Value>) -> Value {
+        self.alloc_struct(fields, None)
+    }
+
+    pub fn array_elements(&self, id: u32) -> Vec<Value> {
+        self.array_clone_data(id)
+    }
+
+    pub fn struct_fields(&self, id: u32) -> Vec<(String, Value)> {
+        match self.heap.get(id as usize).and_then(|s| s.obj.as_ref()) {
+            Some(HeapObj::Struct(fields)) => fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn to_sendval(&self, v: &Value) -> SendVal {
+        match v {
+            Value::Int(i) => SendVal::Int(*i),
+            Value::Float(f) => SendVal::Float(*f),
+            Value::Bool(b) => SendVal::Bool(*b),
+            Value::Str(s) => SendVal::Str(s.as_ref().clone()),
+            Value::Array(id) => {
+                SendVal::Array(self.array_clone_data(*id).iter().map(|x| self.to_sendval(x)).collect())
+            }
+            Value::Struct(id) => SendVal::Struct(
+                match self.heap.get(*id as usize).and_then(|s| s.obj.as_ref()) {
+                    Some(HeapObj::Struct(fields)) => fields
+                        .iter()
+                        .map(|(k, v)| (k.clone(), self.to_sendval(v)))
+                        .collect(),
+                    _ => Vec::new(),
+                },
+            ),
+            Value::EnumVariant(e, n, payloads) => SendVal::EnumVariant(
+                e.clone(),
+                n.clone(),
+                payloads.iter().map(|p| self.to_sendval(p)).collect(),
+            ),
+            Value::Fn(name) => SendVal::Fn(name.clone()),
+            Value::Closure(c) => SendVal::Closure(
+                c.lambda_id,
+                c.captured
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.to_sendval(v)))
+                    .collect(),
+            ),
+            Value::Unit => SendVal::Unit,
+        }
+    }
+
+    fn from_sendval(&mut self, v: SendVal) -> Value {
+        match v {
+            SendVal::Int(i) => Value::Int(i),
+            SendVal::Float(f) => Value::Float(f),
+            SendVal::Bool(b) => Value::Bool(b),
+            SendVal::Str(s) => Value::Str(Rc::new(s)),
+            SendVal::Array(xs) => {
+                let vals: Vec<Value> = xs.into_iter().map(|x| self.from_sendval(x)).collect();
+                self.alloc_array(vals, None)
+            }
+            SendVal::Struct(fields) => {
+                let map: HashMap<String, Value> = fields
+                    .into_iter()
+                    .map(|(k, v)| (k, self.from_sendval(v)))
+                    .collect();
+                self.alloc_struct(map, None)
+            }
+            SendVal::EnumVariant(e, n, payloads) => {
+                Value::EnumVariant(e, n, payloads.into_iter().map(|p| self.from_sendval(p)).collect())
+            }
+            SendVal::Fn(name) => Value::Fn(name),
+            SendVal::Closure(id, captured) => Value::Closure(Rc::new(ClosureData {
+                lambda_id: id,
+                captured: captured
+                    .into_iter()
+                    .map(|(k, v)| (k, self.from_sendval(v)))
+                    .collect(),
+            })),
+            SendVal::Unit => Value::Unit,
         }
     }
 
@@ -395,6 +637,30 @@ impl<'a> Interp<'a> {
         s
     }
 
+    fn dom_fire_event(
+        &mut self,
+        h: i64,
+        event: &str,
+        x: i64,
+        y: i64,
+        key: &str,
+        button: i64,
+        value: &str,
+    ) -> RResult<()> {
+        self.dom_last_event_type = event.to_string();
+        self.dom_last_event_target = h;
+        self.dom_last_event_x = x;
+        self.dom_last_event_y = y;
+        self.dom_last_event_key = key.to_string();
+        self.dom_last_event_button = button;
+        self.dom_last_event_value = value.to_string();
+        let handler = self.dom_listeners.get(&(h, event.to_string())).cloned();
+        if let Some(name) = handler {
+            self.call_by_name(&name, Vec::new())?;
+        }
+        Ok(())
+    }
+
     pub fn run_main(&mut self) -> RResult<()> {
         let main = self.functions.get("main").copied().ok_or_else(|| {
             RuntimeError::new(
@@ -403,12 +669,16 @@ impl<'a> Interp<'a> {
             )
         })?;
         self.call_function(main, Vec::new(), Span::new(0, 0))?;
+        self.finish_top_level_call(&[]);
         Ok(())
     }
 
     pub fn run_stmts_as_test(&mut self, stmts: &[Stmt]) -> RResult<()> {
         let mut env: Vec<HashMap<String, Value>> = vec![HashMap::new()];
+        self.push_env(&env);
         self.exec_block(stmts, &mut env)?;
+        self.pop_env();
+        self.finish_top_level_call(&env);
         Ok(())
     }
 
@@ -490,7 +760,9 @@ impl<'a> Interp<'a> {
                 env[0].insert(p.name.clone(), v.clone());
             }
             self.depth += 1;
+            self.push_env(&env);
             let flow = self.exec_block(&f.body, &mut env);
+            self.pop_env();
             self.depth -= 1;
             match flow? {
                 Flow::Return(v) => v,
@@ -534,6 +806,14 @@ impl<'a> Interp<'a> {
         Ok(result)
     }
 
+    fn finish_top_level_call(&mut self, extra_roots: &[HashMap<String, Value>]) {
+        let live = self.heap_live_count();
+        if live > self.heap_high_water {
+            self.gc_collect(extra_roots);
+            self.heap_high_water = self.heap_live_count();
+        }
+    }
+
     fn call_closure(&mut self, c: &ClosureData, args: Vec<Value>, call_span: Span) -> RResult<Value> {
         if self.depth >= self.max_depth {
             return Err(RuntimeError::new(
@@ -554,12 +834,15 @@ impl<'a> Interp<'a> {
             env[0].insert(p.name.clone(), v);
         }
         self.depth += 1;
+        self.push_env(&env);
         let flow = self.exec_block(&lambda.body, &mut env);
+        self.pop_env();
         self.depth -= 1;
-        match flow? {
-            Flow::Return(v) => Ok(v),
-            _ => Ok(Value::Unit),
-        }
+        let result = match flow? {
+            Flow::Return(v) => v,
+            _ => Value::Unit,
+        };
+        Ok(result)
     }
 
     // ---- native externs (the machino native runtime) ----
@@ -674,7 +957,7 @@ impl<'a> Interp<'a> {
                     "extern fn args() -> [str]"
                 );
                 let vals: Vec<Value> = self.args.iter().map(|a| Value::str_value(a)).collect();
-                Ok(Value::Array(Rc::new(RefCell::new(vals))))
+                Ok(self.alloc_array(vals, None))
             }
             "exit" => {
                 check_sig!(vec![Type::Int], Type::Unit, "extern fn exit(code: int)");
@@ -1322,12 +1605,43 @@ impl<'a> Interp<'a> {
                     _ => 0,
                 };
                 let event = as_string(&args[1]);
-                self.dom_last_event_type = event.clone();
-                self.dom_last_event_target = h;
-                let handler = self.dom_listeners.get(&(h, event)).cloned();
-                if let Some(name) = handler {
-                    self.call_by_name(&name, Vec::new())?;
-                }
+                self.dom_fire_event(h, &event, 0, 0, "", 0, "")?;
+                Ok(Value::Unit)
+            }
+            "dom_dispatch_event" => {
+                check_sig!(
+                    vec![
+                        Type::Int,
+                        Type::Str,
+                        Type::Int,
+                        Type::Int,
+                        Type::Str,
+                        Type::Int,
+                        Type::Str,
+                    ],
+                    Type::Unit,
+                    "extern fn dom_dispatch_event(el: int, event: str, x: int, y: int, key: str, button: int, value: str)"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let event = as_string(&args[1]);
+                let x = match &args[2] {
+                    Value::Int(v) => *v,
+                    _ => 0,
+                };
+                let y = match &args[3] {
+                    Value::Int(v) => *v,
+                    _ => 0,
+                };
+                let key = as_string(&args[4]);
+                let button = match &args[5] {
+                    Value::Int(v) => *v,
+                    _ => 0,
+                };
+                let value = as_string(&args[6]);
+                self.dom_fire_event(h, &event, x, y, &key, button, &value)?;
                 Ok(Value::Unit)
             }
             "dom_last_event_type" => {
@@ -1345,6 +1659,46 @@ impl<'a> Interp<'a> {
                     "extern fn dom_last_event_target() -> int"
                 );
                 Ok(Value::Int(self.dom_last_event_target))
+            }
+            "dom_last_event_x" => {
+                check_sig!(
+                    Vec::<Type>::new(),
+                    Type::Int,
+                    "extern fn dom_last_event_x() -> int"
+                );
+                Ok(Value::Int(self.dom_last_event_x))
+            }
+            "dom_last_event_y" => {
+                check_sig!(
+                    Vec::<Type>::new(),
+                    Type::Int,
+                    "extern fn dom_last_event_y() -> int"
+                );
+                Ok(Value::Int(self.dom_last_event_y))
+            }
+            "dom_last_event_key" => {
+                check_sig!(
+                    Vec::<Type>::new(),
+                    Type::Str,
+                    "extern fn dom_last_event_key() -> str"
+                );
+                Ok(Value::str_value(&self.dom_last_event_key))
+            }
+            "dom_last_event_button" => {
+                check_sig!(
+                    Vec::<Type>::new(),
+                    Type::Int,
+                    "extern fn dom_last_event_button() -> int"
+                );
+                Ok(Value::Int(self.dom_last_event_button))
+            }
+            "dom_last_event_value" => {
+                check_sig!(
+                    Vec::<Type>::new(),
+                    Type::Str,
+                    "extern fn dom_last_event_value() -> str"
+                );
+                Ok(Value::str_value(&self.dom_last_event_value))
             }
             "db_open" => {
                 check_sig!(
@@ -1407,6 +1761,19 @@ impl<'a> Interp<'a> {
                 };
                 Ok(Value::str_value(&crate::db_runtime::query(conn, &sql)))
             }
+            "gc_collect" => {
+                check_sig!(Vec::<Type>::new(), Type::Unit, "extern fn gc_collect()");
+                self.gc_collect(&[]);
+                Ok(Value::Unit)
+            }
+            "heap_live_count" => {
+                check_sig!(
+                    Vec::<Type>::new(),
+                    Type::Int,
+                    "extern fn heap_live_count() -> int"
+                );
+                Ok(Value::Int(self.heap_live_count() as i64))
+            }
             other => Err(RuntimeError::new(
                 format!(
                     "extern '{}' is not provided by the machino native runtime. Available externs: \
@@ -1424,7 +1791,9 @@ impl<'a> Interp<'a> {
         env.push(HashMap::new());
         for s in stmts {
             match self.exec_stmt(s, env)? {
-                Flow::Normal => {}
+                Flow::Normal => {
+                    self.maybe_collect_at_stmt(env);
+                }
                 other => {
                     env.pop();
                     return Ok(other);
@@ -1463,19 +1832,23 @@ impl<'a> Interp<'a> {
                 };
                 let v = self.eval(value, env)?;
                 match b {
-                    Value::Array(cells) => {
-                        let mut vec = cells.borrow_mut();
-                        if idx < 0 || idx as usize >= vec.len() {
+                    Value::Array(id) => {
+                        let len = self.array_len(id);
+                        if idx < 0 || idx as usize >= len {
                             return Err(RuntimeError::new(
                                 format!(
                                     "index out of bounds: index {} but length is {}",
-                                    idx,
-                                    vec.len()
+                                    idx, len
                                 ),
                                 index.span,
                             ));
                         }
-                        vec[idx as usize] = v;
+                        if !self.array_set(id, idx as usize, v) {
+                            return Err(RuntimeError::new(
+                                "index assign on invalid array",
+                                index.span,
+                            ));
+                        }
                         Ok(Flow::Normal)
                     }
                     _ => unreachable!("type checker guarantees array"),
@@ -1485,8 +1858,13 @@ impl<'a> Interp<'a> {
                 let b = self.eval(base, env)?;
                 let v = self.eval(value, env)?;
                 match b {
-                    Value::Struct(fields) => {
-                        fields.borrow_mut().insert(field.clone(), v);
+                    Value::Struct(id) => {
+                        if !self.struct_set(id, field, v) {
+                            return Err(RuntimeError::new(
+                                "field assign on invalid struct",
+                                stmt.span,
+                            ));
+                        }
                         Ok(Flow::Normal)
                     }
                     _ => unreachable!("type checker guarantees struct"),
@@ -1504,7 +1882,7 @@ impl<'a> Interp<'a> {
                     self.exec_block(else_body, env)
                 }
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, invariant: _, body } => {
                 loop {
                     let c = self.eval(cond, env)?;
                     if !matches!(c, Value::Bool(true)) {
@@ -1597,11 +1975,11 @@ impl<'a> Interp<'a> {
             let variant_name = &name[colon_pos + 2..];
             if let Some(variants) = self.enum_variants.get(enum_name) {
                 if let Some(variant) = variants.iter().find(|v| v.name == variant_name) {
-                    if variant.payload.is_none() {
+                    if variant.payloads.is_empty() {
                         return Ok(Value::EnumVariant(
                             enum_name.to_string(),
                             variant_name.to_string(),
-                            None,
+                            Vec::new(),
                         ));
                     }
                 }
@@ -1614,6 +1992,13 @@ impl<'a> Interp<'a> {
     }
 
     fn eval(&mut self, expr: &Expr, env: &mut Vec<HashMap<String, Value>>) -> RResult<Value> {
+        self.push_env(env);
+        let result = self.eval_expr(expr, env);
+        self.pop_env();
+        result
+    }
+
+    fn eval_expr(&mut self, expr: &Expr, env: &mut Vec<HashMap<String, Value>>) -> RResult<Value> {
         match &expr.kind {
             ExprKind::Int(v) => Ok(Value::Int(*v)),
             ExprKind::Float(v) => Ok(Value::Float(*v)),
@@ -1625,7 +2010,7 @@ impl<'a> Interp<'a> {
                 for e in elems {
                     vals.push(self.eval(e, env)?);
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(vals))))
+                Ok(self.alloc_array(vals, Some(env)))
             }
             ExprKind::Index(base, index) => {
                 let b = self.eval(base, env)?;
@@ -1634,19 +2019,20 @@ impl<'a> Interp<'a> {
                     _ => unreachable!(),
                 };
                 match b {
-                    Value::Array(cells) => {
-                        let vec = cells.borrow();
-                        if idx < 0 || idx as usize >= vec.len() {
+                    Value::Array(id) => {
+                        let len = self.array_len(id);
+                        if idx < 0 || idx as usize >= len {
                             return Err(RuntimeError::new(
                                 format!(
                                     "index out of bounds: index {} but length is {}",
-                                    idx,
-                                    vec.len()
+                                    idx, len
                                 ),
                                 index.span,
                             ));
                         }
-                        Ok(vec[idx as usize].clone())
+                        Ok(self
+                            .array_get(id, idx as usize)
+                            .expect("type checker guarantees in-bounds index"))
                     }
                     _ => unreachable!(),
                 }
@@ -1654,10 +2040,8 @@ impl<'a> Interp<'a> {
             ExprKind::Field(base, field) => {
                 let b = self.eval(base, env)?;
                 match b {
-                    Value::Struct(fields) => Ok(fields
-                        .borrow()
-                        .get(field)
-                        .cloned()
+                    Value::Struct(id) => Ok(self
+                        .struct_get(id, field)
                         .expect("type checker guarantees field exists")),
                     _ => unreachable!(),
                 }
@@ -1714,7 +2098,7 @@ impl<'a> Interp<'a> {
                     captured,
                 })))
             }
-            ExprKind::Call(name, args) => {
+            ExprKind::Call(name, _type_args, args) => {
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     vals.push(self.eval(a, env)?);
@@ -1747,15 +2131,15 @@ impl<'a> Interp<'a> {
                         Ok(Value::Unit)
                     }
                     "len" => match &vals[0] {
-                        Value::Array(cells) => Ok(Value::Int(cells.borrow().len() as i64)),
+                        Value::Array(id) => Ok(Value::Int(self.array_len(*id) as i64)),
                         Value::Str(s) => Ok(Value::Int(s.len() as i64)),
                         _ => unreachable!(),
                     },
                     "push" => match &vals[0] {
-                        Value::Array(cells) => {
-                            let mut new_vec = cells.borrow().clone();
+                        Value::Array(id) => {
+                            let mut new_vec = self.array_clone_data(*id);
                             new_vec.push(vals[1].clone());
-                            Ok(Value::Array(Rc::new(RefCell::new(new_vec))))
+                            Ok(self.alloc_array(new_vec, Some(env)))
                         }
                         _ => unreachable!(),
                     },
@@ -1926,14 +2310,14 @@ impl<'a> Interp<'a> {
                     },
                     "chan_send_int" | "chan_send_float" | "chan_send_bool" | "chan_send_str" => {
                         let Value::Int(id) = vals[0] else { unreachable!() };
-                        channel_send(id, to_sendval(&vals[1]))
+                        channel_send(id, self.to_sendval(&vals[1]))
                             .map_err(|m| RuntimeError::new(m, expr.span))?;
                         Ok(Value::Unit)
                     }
                     "chan_recv_int" | "chan_recv_float" | "chan_recv_bool" | "chan_recv_str" => {
                         let Value::Int(id) = vals[0] else { unreachable!() };
                         let sv = channel_recv(id).map_err(|m| RuntimeError::new(m, expr.span))?;
-                        let val = from_sendval(sv);
+                        let val = self.from_sendval(sv);
                         let ok = matches!(
                             (name.as_str(), &val),
                             ("chan_recv_int", Value::Int(_))
@@ -1960,16 +2344,20 @@ impl<'a> Interp<'a> {
                                 expr.span,
                             ));
                         };
-                        let func = to_sendval(&vals[0]);
-                        let send_args: Vec<SendVal> = vals[1..].iter().map(to_sendval).collect();
+                        let func = self.to_sendval(&vals[0]);
+                        let send_args: Vec<SendVal> =
+                            vals[1..].iter().map(|v| self.to_sendval(v)).collect();
                         let handle = std::thread::spawn(move || {
                             let mut interp = Interp::new(program);
-                            let args: Vec<Value> = send_args.into_iter().map(from_sendval).collect();
-                            let callee = from_sendval(func);
+                            let args: Vec<Value> = send_args
+                                .into_iter()
+                                .map(|sv| interp.from_sendval(sv))
+                                .collect();
+                            let callee = interp.from_sendval(func);
                             let result = interp
                                 .call_value(&callee, args)
                                 .map_err(|e| e.message)?;
-                            Ok(to_sendval(&result))
+                            Ok(interp.to_sendval(&result))
                         });
                         let id = self.next_task;
                         self.next_task += 1;
@@ -1987,7 +2375,7 @@ impl<'a> Interp<'a> {
                         let joined = handle.join().map_err(|_| {
                             RuntimeError::new("spawned task panicked", expr.span)
                         })?;
-                        let val = from_sendval(joined.map_err(|msg| {
+                        let val = self.from_sendval(joined.map_err(|msg| {
                             RuntimeError::new(
                                 format!("spawned task failed: {}", msg),
                                 expr.span,
@@ -2020,27 +2408,20 @@ impl<'a> Interp<'a> {
                             if let Some(variants) = self.enum_variants.get(enum_name) {
                                 let variant = variants.iter().find(|v| v.name == variant_name);
                                 if let Some(v) = variant {
-                                    let payload = if v.payload.is_some() {
-                                        if vals.len() != 1 {
-                                            return Err(RuntimeError::new(
-                                                format!("{}::{} expects 1 argument, found {}", enum_name, variant_name, vals.len()),
-                                                expr.span,
-                                            ));
-                                        }
-                                        Some(Box::new(vals.into_iter().next().unwrap()))
-                                    } else {
-                                        if !vals.is_empty() {
-                                            return Err(RuntimeError::new(
-                                                format!("{}::{} expects 0 arguments, found {}", enum_name, variant_name, vals.len()),
-                                                expr.span,
-                                            ));
-                                        }
-                                        None
-                                    };
+                                    let n = v.payloads.len();
+                                    if vals.len() != n {
+                                        return Err(RuntimeError::new(
+                                            format!(
+                                                "{}::{} expects {} argument(s), found {}",
+                                                enum_name, variant_name, n, vals.len()
+                                            ),
+                                            expr.span,
+                                        ));
+                                    }
                                     return Ok(Value::EnumVariant(
                                         enum_name.to_string(),
                                         variant_name.to_string(),
-                                        payload,
+                                        vals,
                                     ));
                                 }
                             }
@@ -2051,7 +2432,7 @@ impl<'a> Interp<'a> {
                             for (fld, v) in fields.iter().zip(vals) {
                                 map.insert(fld.name.clone(), v);
                             }
-                            return Ok(Value::Struct(Rc::new(RefCell::new(map))));
+                            return Ok(self.alloc_struct(map, Some(env)));
                         }
                         let f = self.functions.get(other).copied().ok_or_else(|| {
                             RuntimeError::new(format!("unknown function '{}'", other), expr.span)
@@ -2092,20 +2473,23 @@ impl<'a> Interp<'a> {
             (Pattern::Int(p), Value::Int(v)) if p == v => Some(HashMap::new()),
             (Pattern::Bool(p), Value::Bool(v)) if p == v => Some(HashMap::new()),
             (Pattern::Str(p), Value::Str(v)) if p.as_bytes() == v.as_slice() => Some(HashMap::new()),
-            (Pattern::Variant(enum_name, variant_name), Value::EnumVariant(e, v, payload)) => {
-                if enum_name == e && variant_name == v && payload.is_none() {
+            (Pattern::Variant(enum_name, variant_name), Value::EnumVariant(e, v, payloads)) => {
+                if enum_name == e && variant_name == v && payloads.is_empty() {
                     Some(HashMap::new())
                 } else {
                     None
                 }
             }
-            (Pattern::VariantPayload(enum_name, variant_name, inner), Value::EnumVariant(e, v, payload)) => {
-                if enum_name == e && variant_name == v {
-                    if let Some(p) = payload {
-                        self.match_pattern(inner, p)
-                    } else {
-                        None
+            (Pattern::VariantPayload(enum_name, variant_name, inners), Value::EnumVariant(e, v, payloads)) => {
+                if enum_name == e && variant_name == v && inners.len() == payloads.len() {
+                    let mut bindings = HashMap::new();
+                    for (inner, pval) in inners.iter().zip(payloads.iter()) {
+                        match self.match_pattern(inner, pval) {
+                            Some(b) => bindings.extend(b),
+                            None => return None,
+                        }
                     }
+                    Some(bindings)
                 } else {
                     None
                 }
@@ -2196,7 +2580,7 @@ fn collect_lambdas_stmts<'a>(stmts: &'a [Stmt], out: &mut HashMap<usize, &'a Lam
                 collect_lambdas_stmts(then_body, out);
                 collect_lambdas_stmts(else_body, out);
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, invariant: _, body } => {
                 collect_lambdas_expr(cond, out);
                 collect_lambdas_stmts(body, out);
             }
@@ -2232,7 +2616,7 @@ fn collect_lambdas_expr<'a>(expr: &'a Expr, out: &mut HashMap<usize, &'a Lambda>
             collect_lambdas_expr(b, out);
         }
         ExprKind::Un(_, a) => collect_lambdas_expr(a, out),
-        ExprKind::Call(_, args) => {
+        ExprKind::Call(_, _, args) => {
             for a in args {
                 collect_lambdas_expr(a, out);
             }

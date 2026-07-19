@@ -73,6 +73,7 @@
   <pre id="out"><span class="meta">output will appear here</span></pre>
 </main>
 <script type="module">
+// Browser host: dom_* only — no raw TCP (see packages/ws for WebSocket externs).
 import { createDomHost } from "./dom_host.mjs";
 
 const out = document.getElementById("out");

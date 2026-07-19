@@ -132,7 +132,7 @@ test "output" expects "hello\n5" {
   `to_int(f)`. Float literals need digits on both sides: `2.0`, not `2.`.
 - `+` on strings concatenates. `%` is int-only. Comparisons don't chain.
 - `push(xs, v)` does NOT mutate; always rebind: `xs = push(xs, v)`.
-- **Enums:** construct with `Enum::Variant` (unit) or `Enum::Variant(payload)`.
+- **Enums:** construct with `Enum::Variant` (unit) or `Enum::Variant(a, b, ...)` (payloads).
   Deconstruct with `match`.
 - **Match expressions must be exhaustive.** The type checker ensures all cases
   are covered. Patterns: `_` (wildcard), `var` (binding), literals, 
@@ -228,8 +228,14 @@ extern fn dom_set_style(el: int, prop: str, value: str)
 extern fn dom_get_style(el: int, prop: str) -> str
 extern fn dom_add_listener(el: int, event: str, handler: str)
 extern fn dom_dispatch(el: int, event: str)
+extern fn dom_dispatch_event(el: int, event: str, x: int, y: int, key: str, button: int, value: str)
 extern fn dom_last_event_type() -> str
 extern fn dom_last_event_target() -> int
+extern fn dom_last_event_x() -> int
+extern fn dom_last_event_y() -> int
+extern fn dom_last_event_key() -> str
+extern fn dom_last_event_button() -> int
+extern fn dom_last_event_value() -> str
 extern fn db_open(driver: str, conn: str) -> int
 extern fn db_close(h: int)
 extern fn db_exec(h: int, sql: str) -> str
@@ -240,11 +246,14 @@ Servers: `tcp_listen` → loop `tcp_accept` → `tcp_read` → `tcp_write` →
 `tcp_close`. See `examples/http_server.mno`. Prefer packages:
 `packages/dom` (events: bind exported zero-arg `handler` name),
 `packages/vdom`, `packages/db` (`memory`|`sqlite`|`mysql`|`postgres`|`mongo`),
-`packages/regex`. Node WASM host provides DOM + DB; not `tcp_*`.
+`packages/regex`. Node WASM host (`runners/run.mjs`) provides DOM, DB, and
+`tcp_*` (blocking via `Atomics.wait`). Browser: no raw TCP — use
+`packages/ws` (WebSocket externs; host must implement them).
 
 DOM events: `dom_add_listener(btn, "click", "on_inc")` then define
-`fn on_inc() { ... }` (exported). Native/tests: `dom_dispatch(btn, "click")`.
-Browser: real listeners via `runners/dom_host.mjs` after `bindExports`.
+`fn on_inc() { ... }` (exported). Native/tests: `dom_dispatch(btn, "click")` or `dom_dispatch_event(...)` with
+explicit fields. Browser: real listeners via `runners/dom_host.mjs` after
+`bindExports` (coords/key/button/value from MouseEvent/KeyboardEvent/InputEvent).
 
 ## Packages
 

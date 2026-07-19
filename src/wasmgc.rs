@@ -103,6 +103,7 @@ const OP_I64_EXTEND_I32_S: u8 = 0xac;
 const OP_I64_EXTEND_I32_U: u8 = 0xad;
 const OP_I64_TRUNC_F64_S: u8 = 0xb0;
 const OP_F64_CONVERT_I64_S: u8 = 0xb9;
+const OP_I64_REINTERPRET_F64: u8 = 0xbd;
 const GC_PREFIX: u8 = 0xfb;
 const GC_STRUCT_NEW: u8 = 0x00;
 const GC_STRUCT_GET: u8 = 0x02;
@@ -373,6 +374,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
     let mut imp_chan_recv_i64 = 0u32;
     let mut imp_chan_recv_f64 = 0u32;
     let mut imp_chan_recv_str = 0u32;
+    let mut imp_spawn_pack_str = 0u32;
     let mut imp_spawn = 0u32;
     let mut imp_join_i64 = 0u32;
     let mut imp_join_f64 = 0u32;
@@ -389,11 +391,12 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
         n_imports += 8;
     }
     if uses_spawn {
-        imp_spawn = n_imports;
-        imp_join_i64 = n_imports + 1;
-        imp_join_f64 = n_imports + 2;
-        imp_join_str = n_imports + 3;
-        n_imports += 4;
+        imp_spawn_pack_str = n_imports;
+        imp_spawn = n_imports + 1;
+        imp_join_i64 = n_imports + 2;
+        imp_join_f64 = n_imports + 3;
+        imp_join_str = n_imports + 4;
+        n_imports += 5;
     }
     let extern_base = n_imports;
     n_imports += externs.len() as u32;
@@ -420,6 +423,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
         imp_chan_recv_i64,
         imp_chan_recv_f64,
         imp_chan_recv_str,
+        imp_spawn_pack_str,
         imp_spawn,
         imp_join_i64,
         imp_join_f64,
@@ -433,6 +437,11 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
     for e in &program.enums {
         c.enums.insert(e.name.clone(), e.variants.clone());
     }
+    let contracted_externs: Vec<&Function> = externs
+        .iter()
+        .copied()
+        .filter(|f| !f.requires.is_empty() || !f.ensures.is_empty())
+        .collect();
     for (i, f) in externs.iter().enumerate() {
         c.extern_index
             .insert(f.name.clone(), extern_base + i as u32);
@@ -444,9 +453,16 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
             ),
         );
     }
+    let n_ext_wrap = contracted_externs.len() as u32;
+    let ext_wrap_base = n_imports + N_HELPERS;
+    for (i, f) in contracted_externs.iter().enumerate() {
+        // wrappers sit in front of user functions so calls hit contracts first
+        c.func_index
+            .insert(f.name.clone(), ext_wrap_base + i as u32);
+    }
     for (i, f) in user_fns.iter().enumerate() {
         c.func_index
-            .insert(f.name.clone(), n_imports + N_HELPERS + i as u32);
+            .insert(f.name.clone(), ext_wrap_base + n_ext_wrap + i as u32);
         c.signatures.insert(
             f.name.clone(),
             (
@@ -478,8 +494,8 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
     fn_value_names.sort();
     fn_value_names.dedup();
 
-    // function indices: imports, helpers, user fns, wrappers, lambdas
-    let wrapper_base = n_imports + N_HELPERS + reachable.len() as u32;
+    // function indices: imports, helpers, extern wrappers, user fns, fn wrappers, lambdas
+    let wrapper_base = ext_wrap_base + n_ext_wrap + reachable.len() as u32;
     let lambda_base = wrapper_base + fn_value_names.len() as u32;
     let lambda_ids: Vec<usize> = c.lambdas.keys().copied().collect();
     // table slots: wrappers first, then lambdas
@@ -498,6 +514,12 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
     let helper_bodies = c.helper_bodies();
     let mut bodies: Vec<Vec<u8>> = Vec::new();
     let mut type_indices: Vec<u32> = Vec::new();
+    for f in &contracted_externs {
+        let host = c.extern_index[&f.name];
+        let (type_idx, body) = c.compile_extern_wrapper(f, host)?;
+        type_indices.push(type_idx);
+        bodies.push(body);
+    }
     for f in &reachable {
         let (type_idx, body) = c.compile_function(f)?;
         type_indices.push(type_idx);
@@ -603,6 +625,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
     if uses_spawn {
         let bytes = vec![REF_NULL, TY_BYTES as u8];
         let i64arr = vec![REF_NULL, TY_ARR_I64 as u8];
+        import_descs.push(("spawn_pack_str".into(), bytes.clone(), vec![I64]));
         let mut spawn_params = bytes.clone();
         spawn_params.extend_from_slice(&bytes);
         spawn_params.extend_from_slice(&i64arr);
@@ -685,7 +708,11 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
     section(&mut module, 2, &isec);
 
     // function section: helpers, user functions, wrappers, lambdas
-    let n_funcs = N_HELPERS as usize + reachable.len() + wrapper_bodies.len() + lambda_bodies.len();
+    let n_funcs = N_HELPERS as usize
+        + contracted_externs.len()
+        + reachable.len()
+        + wrapper_bodies.len()
+        + lambda_bodies.len();
     let mut fsec = Vec::new();
     uleb(&mut fsec, n_funcs as u64);
     for i in 0..N_HELPERS {
@@ -827,7 +854,7 @@ fn collect_calls_stmts(stmts: &[Stmt], out: &mut Vec<String>) {
                 collect_calls_stmts(then_body, out);
                 collect_calls_stmts(else_body, out);
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, invariant: _, body } => {
                 collect_calls_expr(cond, out);
                 collect_calls_stmts(body, out);
             }
@@ -845,7 +872,7 @@ fn collect_calls_stmts(stmts: &[Stmt], out: &mut Vec<String>) {
 
 fn collect_calls_expr(e: &Expr, out: &mut Vec<String>) {
     match &e.kind {
-        ExprKind::Call(name, args) => {
+        ExprKind::Call(name, _type_args, args) => {
             out.push(name.clone());
             for a in args {
                 collect_calls_expr(a, out);
@@ -896,7 +923,7 @@ fn collect_lambdas_stmts(stmts: &[Stmt], out: &mut BTreeMap<usize, Lambda>) {
                 collect_lambdas_stmts(then_body, out);
                 collect_lambdas_stmts(else_body, out);
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, invariant: _, body } => {
                 collect_lambdas_expr(cond, out);
                 collect_lambdas_stmts(body, out);
             }
@@ -924,7 +951,7 @@ fn collect_lambdas_expr(e: &Expr, out: &mut BTreeMap<usize, Lambda>) {
             collect_lambdas_expr(b, out);
         }
         ExprKind::Field(a, _) | ExprKind::Un(_, a) => collect_lambdas_expr(a, out),
-        ExprKind::Call(_, args) => args.iter().for_each(|a| collect_lambdas_expr(a, out)),
+        ExprKind::Call(_, _, args) => args.iter().for_each(|a| collect_lambdas_expr(a, out)),
         ExprKind::Match(m) => {
             collect_lambdas_expr(&m.scrutinee, out);
             for arm in &m.arms {
@@ -947,7 +974,7 @@ fn collect_fn_value_names_stmts(stmts: &[Stmt], out: &mut Vec<String>) {
                 in_expr(b, out);
             }
             ExprKind::Field(a, _) | ExprKind::Un(_, a) => in_expr(a, out),
-            ExprKind::Call(_, args) => args.iter().for_each(|a| in_expr(a, out)),
+            ExprKind::Call(_, _, args) => args.iter().for_each(|a| in_expr(a, out)),
             ExprKind::Lambda(l) => collect_fn_value_names_stmts(&l.body, out),
             ExprKind::Match(m) => {
                 in_expr(&m.scrutinee, out);
@@ -983,7 +1010,7 @@ fn collect_fn_value_names_stmts(stmts: &[Stmt], out: &mut Vec<String>) {
                 collect_fn_value_names_stmts(then_body, out);
                 collect_fn_value_names_stmts(else_body, out);
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, invariant: _, body } => {
                 in_expr(cond, out);
                 collect_fn_value_names_stmts(body, out);
             }
@@ -1026,6 +1053,7 @@ struct Compiler {
     imp_chan_recv_i64: u32,
     imp_chan_recv_f64: u32,
     imp_chan_recv_str: u32,
+    imp_spawn_pack_str: u32,
     imp_spawn: u32,
     imp_join_i64: u32,
     imp_join_f64: u32,
@@ -1205,6 +1233,85 @@ impl Compiler {
         let falls_through = self.compile_block(&mut code, &l.body, &mut ctx)?;
         if l.ret != Type::Unit && falls_through {
             code.push(OP_UNREACHABLE);
+        }
+        code.push(OP_END);
+        Ok((type_idx, assemble_body(&ctx, &code)))
+    }
+
+    /// Wrapper around a host import that enforces requires/ensures.
+    fn compile_extern_wrapper(
+        &mut self,
+        f: &Function,
+        host_idx: u32,
+    ) -> Result<(u32, Vec<u8>), Diagnostic> {
+        let mut param_enc = Vec::new();
+        for p in &f.params {
+            let Some(vt) = valtype(&p.ty, p.span)? else {
+                return Err(e070("extern wrapper parameter type", p.span));
+            };
+            param_enc.extend_from_slice(&vt);
+        }
+        let ret_enc = valtype(&f.ret, f.span)?.unwrap_or_default();
+        let type_idx = self.func_type_index(param_enc, ret_enc);
+
+        let mut ctx = Ctx {
+            scopes: vec![HashMap::new()],
+            locals: Vec::new(),
+            n_params: f.params.len() as u32,
+            frames: Vec::new(),
+            ret: f.ret.clone(),
+            result_local: None,
+        };
+        for p in &f.params {
+            let enc = valtype(&p.ty, p.span)?.unwrap();
+            ctx.add_local(&p.name, p.ty.clone(), enc);
+        }
+
+        let mut code = Vec::new();
+        for c in &f.requires {
+            self.compile_expr(&mut code, &c.expr, &mut ctx, None)?;
+            code.push(OP_I32_EQZ);
+            code.push(OP_IF);
+            code.push(0x40);
+            code.push(OP_UNREACHABLE);
+            code.push(OP_END);
+        }
+
+        for i in 0..f.params.len() as u32 {
+            code.push(OP_LOCAL_GET);
+            uleb(&mut code, i as u64);
+        }
+        code.push(OP_CALL);
+        uleb(&mut code, host_idx as u64);
+
+        if f.ret != Type::Unit {
+            let enc = valtype(&f.ret, f.span)?.unwrap();
+            let result_local = ctx.add_temp(enc);
+            code.push(OP_LOCAL_SET);
+            uleb(&mut code, result_local as u64);
+            ctx.scopes
+                .last_mut()
+                .unwrap()
+                .insert("result".to_string(), (result_local, f.ret.clone()));
+            for c in &f.ensures {
+                self.compile_expr(&mut code, &c.expr, &mut ctx, None)?;
+                code.push(OP_I32_EQZ);
+                code.push(OP_IF);
+                code.push(0x40);
+                code.push(OP_UNREACHABLE);
+                code.push(OP_END);
+            }
+            code.push(OP_LOCAL_GET);
+            uleb(&mut code, result_local as u64);
+        } else {
+            for c in &f.ensures {
+                self.compile_expr(&mut code, &c.expr, &mut ctx, None)?;
+                code.push(OP_I32_EQZ);
+                code.push(OP_IF);
+                code.push(0x40);
+                code.push(OP_UNREACHABLE);
+                code.push(OP_END);
+            }
         }
         code.push(OP_END);
         Ok((type_idx, assemble_body(&ctx, &code)))
@@ -1406,7 +1513,7 @@ impl Compiler {
                 code.push(OP_END);
                 Ok(then_live || else_live)
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, invariant: _, body } => {
                 // block $exit { loop $top { !cond -> br $exit; body; br $top } }
                 code.push(OP_BLOCK);
                 code.push(0x40);
@@ -1626,7 +1733,7 @@ impl Compiler {
                 UnOp::Neg => self.expr_type(inner, ctx)?,
                 UnOp::Not => Type::Bool,
             },
-            ExprKind::Call(name, args) => match name.as_str() {
+            ExprKind::Call(name, _type_args, args) => match name.as_str() {
                 "print" | "chan_close"
                 | "chan_send_int" | "chan_send_float" | "chan_send_bool" | "chan_send_str" => {
                     Type::Unit
@@ -1691,10 +1798,10 @@ impl Compiler {
             Pattern::Var(name) => {
                 frame.insert(name.clone(), (u32::MAX, scrut_ty.clone()));
             }
-            Pattern::VariantPayload(enum_name, variant_name, inner) => {
+            Pattern::VariantPayload(enum_name, variant_name, inners) => {
                 if let Some(variants) = self.enums.get(enum_name) {
                     if let Some(v) = variants.iter().find(|v| v.name == *variant_name) {
-                        if let Some(payload_ty) = &v.payload {
+                        for (inner, payload_ty) in inners.iter().zip(v.payloads.iter()) {
                             self.pattern_type_frame(inner, payload_ty, frame);
                         }
                     }
@@ -1740,7 +1847,7 @@ impl Compiler {
                     code.push(OP_LOCAL_GET);
                     uleb(code, idx as u64);
                 } else if let Some(colon) = name.rfind("::") {
-                    // payload-less enum variant value: [box(tag), null]
+                    // payload-less enum variant value: [box(tag)]
                     let enum_name = &name[..colon];
                     let variant_name = &name[colon + 2..];
                     let variants = self
@@ -1756,12 +1863,10 @@ impl Compiler {
                     code.push(GC_PREFIX);
                     code.push(GC_STRUCT_NEW);
                     uleb(code, TY_BOXI64 as u64);
-                    code.push(OP_REF_NULL);
-                    code.push(ANYREF);
                     code.push(GC_PREFIX);
                     code.push(GC_ARRAY_NEW_FIXED);
                     uleb(code, TY_ANYARR as u64);
-                    uleb(code, 2);
+                    uleb(code, 1);
                 } else if let Some(&slot) = self.wrapper_slot.get(name) {
                     // named function as a value: singleton closure [box(slot)]
                     code.push(OP_I64_CONST);
@@ -1943,7 +2048,7 @@ impl Compiler {
                 };
                 code.push(opcode);
             }
-            ExprKind::Call(name, args) => match name.as_str() {
+            ExprKind::Call(name, _type_args, args) => match name.as_str() {
                 // a variable holding a function value: indirect call
                 _ if matches!(ctx.lookup(name), Some((_, Type::Fn(_, _)))) => {
                     let Some((idx, Type::Fn(params, ret))) = ctx.lookup(name) else {
@@ -2134,18 +2239,26 @@ impl Compiler {
                         e070(&format!("unknown spawn target '{}'", target), expr.span)
                     })?;
                     for p in &params {
-                        if !matches!(p, Type::Int | Type::Bool) {
+                        if !matches!(p, Type::Int | Type::Bool | Type::Float | Type::Str) {
                             return Err(e070(
-                                "GC spawn arguments other than int/bool",
+                                "GC spawn arguments other than int/bool/float/str",
                                 expr.span,
                             )
                             .with_help(
-                                "under --gc, spawn args must be int or bool; use the linear backend for float/str/struct args",
+                                "under --gc, spawn args must be int, bool, float, or str; use the linear backend for struct/array graphs",
                             ));
                         }
                     }
                     self.spawn_targets.insert(target.clone());
-                    let mut sig: String = params.iter().map(|_| 'i').collect();
+                    let mut sig: String = params
+                        .iter()
+                        .map(|p| match p {
+                            Type::Int | Type::Bool => 'i',
+                            Type::Float => 'f',
+                            Type::Str => 's',
+                            _ => 'i',
+                        })
+                        .collect();
                     sig.push(':');
                     sig.push(match &ret {
                         Type::Int | Type::Bool => 'i',
@@ -2175,9 +2288,17 @@ impl Compiler {
                     code.push(GC_ARRAY_NEW_DATA);
                     uleb(code, TY_BYTES as u64);
                     uleb(code, sig_seg as u64);
-                    // argv: i64 array of argument values
+                    // argv i64 words: int/bool as-is, float bitcast, str via spawn_pack_str
                     for (a, p) in args[1..].iter().zip(params.iter()) {
                         self.compile_expr(code, a, ctx, Some(p))?;
+                        match p {
+                            Type::Float => code.push(OP_I64_REINTERPRET_F64),
+                            Type::Str => {
+                                code.push(OP_CALL);
+                                uleb(code, self.imp_spawn_pack_str as u64);
+                            }
+                            _ => {}
+                        }
                     }
                     code.push(GC_PREFIX);
                     code.push(GC_ARRAY_NEW_FIXED);
@@ -2202,7 +2323,7 @@ impl Compiler {
                     uleb(code, self.imp_join_str as u64);
                 }
                 _ => {
-                    // enum variant constructor with payload: [box(tag), payload]
+                    // enum variant constructor with payload(s): [box(tag), ...payloads]
                     if let Some(colon) = name.rfind("::") {
                         let enum_name = &name[..colon];
                         let variant_name = &name[colon + 2..];
@@ -2211,21 +2332,20 @@ impl Compiler {
                                 .iter()
                                 .position(|v| v.name == variant_name)
                                 .expect("checked variant");
-                            let payload_ty = variants[tag]
-                                .payload
-                                .clone()
-                                .expect("payload constructor is a call");
+                            let payload_tys = variants[tag].payloads.clone();
                             code.push(OP_I64_CONST);
                             sleb(code, tag as i64);
                             code.push(GC_PREFIX);
                             code.push(GC_STRUCT_NEW);
                             uleb(code, TY_BOXI64 as u64);
-                            self.compile_expr(code, &args[0], ctx, Some(&payload_ty))?;
-                            box_value(code, &payload_ty);
+                            for (arg, payload_ty) in args.iter().zip(payload_tys.iter()) {
+                                self.compile_expr(code, arg, ctx, Some(payload_ty))?;
+                                box_value(code, payload_ty);
+                            }
                             code.push(GC_PREFIX);
                             code.push(GC_ARRAY_NEW_FIXED);
                             uleb(code, TY_ANYARR as u64);
-                            uleb(code, 2);
+                            uleb(code, 1 + payload_tys.len() as u64);
                             return Ok(());
                         }
                     }
@@ -2428,19 +2548,20 @@ impl Compiler {
                 code.push(OP_LOCAL_SET);
                 uleb(code, idx as u64);
             }
-            Pattern::VariantPayload(enum_name, variant_name, inner) => {
+            Pattern::VariantPayload(enum_name, variant_name, inners) => {
                 let variants = self.enums[enum_name].clone();
                 let variant = variants
                     .iter()
                     .find(|v| v.name == *variant_name)
                     .expect("checked variant");
-                if let Some(payload_ty) = &variant.payload {
+                for (i, (inner, payload_ty)) in inners.iter().zip(variant.payloads.iter()).enumerate()
+                {
                     let enc = valtype(payload_ty, Span::new(0, 0))?.unwrap();
                     let payload_local = ctx.add_temp(enc);
                     code.push(OP_LOCAL_GET);
                     uleb(code, scrut_local as u64);
                     code.push(OP_I32_CONST);
-                    sleb(code, 1);
+                    sleb(code, (i + 1) as i64);
                     code.push(GC_PREFIX);
                     code.push(GC_ARRAY_GET);
                     uleb(code, TY_ANYARR as u64);

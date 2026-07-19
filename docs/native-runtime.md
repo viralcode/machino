@@ -26,7 +26,7 @@ Declare what you need with `extern fn`; undeclared host powers are unreachable.
 | `exit(code: int)` | Terminate the process |
 | `http_get(url: str) -> str` | Blocking HTTP GET body |
 | `tcp_listen` / `tcp_accept` / `tcp_read` / `tcp_write` / `tcp_close` | TCP sockets |
-| `dom_*` | Virtual DOM + events (`dom_add_listener` / `dom_dispatch`, layout/dataset helpers). Browser: `runners/run.html` + `dom_host.mjs` |
+| `dom_*` | Virtual DOM + events (`dom_add_listener` / `dom_dispatch` / `dom_dispatch_event`, `dom_last_event_*`, layout/dataset helpers). Browser: `runners/run.html` + `dom_host.mjs` |
 | `db_open` / `db_close` / `db_exec` / `db_query` | DB drivers: `memory`, `sqlite`, `mysql`, `postgres`, `mongo` (CLI-backed). See `packages/db` |
 
 Contracts, asserts, bounds checks, and overflow traps are enforced the same way
@@ -37,9 +37,14 @@ as in compiled WASM.
 | Path | Use when |
 |------|----------|
 | `machino run` | Native OS access (TCP, files, env) — **this runtime** |
-| `machino build` + `runners/run.mjs` | Portable linear WASM (Node); no TCP |
-| `machino build --gc` + `runners/run-gc.mjs` | WASM-GC host (Node 22+); spawn args int/bool |
-| `machino build --native` | AOT the linear `.wasm` with `wasmtime compile` (requires wasmtime on PATH) |
+| `machino build` + `runners/run.mjs` | Portable linear WASM (Node); TCP via `tcp_host.mjs` |
+| `machino build --gc` + `runners/run-gc.mjs` | WASM-GC host (Node 22+); spawn args int/bool/float/str |
+| `machino build --native` | **wasmtime AOT** of the linear `.wasm` (Cranelift `.cwasm`) — not LLVM / native ISA codegen |
 
-The WASM import surface mirrors the table above except TCP (async in Node). A
-custom host can implement any subset of those import names.
+`--native` still needs a WebAssembly runtime (or custom linker) for host imports
+(`print_*`, `fail`, TCP, …). Prefer `machino run` when you want real OS sockets
+and files without glue. There is no in-tree LLVM backend.
+
+The WASM import surface mirrors the table above (Node TCP via `tcp_host.mjs`).
+Browsers have no raw TCP — use HTTP or `packages/ws`. A custom host can
+implement any subset of those import names.

@@ -8,7 +8,9 @@
 //! - `for` loops whose bounds simplify to constants are unrolled (up to 128
 //!   iterations), and
 //! - `while i < N` / `while i <= N` loops that increment `i` by 1 each
-//!   iteration are unrolled the same way.
+//!   iteration are unrolled the same way, and
+//! - `while cond invariant inv { ... }` loops are verified by induction
+//!   (invariant on entry, preserved by the body, assumed after exit).
 //! The verifier runs the body symbolically, collecting a (path condition,
 //! result) pair per return path, then asks Z3 to prove every `ensures`
 //! clause on every path under the `requires` assumptions. It also flags
@@ -53,8 +55,8 @@ mod z3impl {
         Int(Int<'ctx>),
         Bool(Bool<'ctx>),
         Real(Real<'ctx>),
-        /// Opaque string value; only `len` and `==`/`!=` are modeled.
-        Str(String),
+        /// Opaque string identity plus a symbolic length (`len(a+b) = len(a)+len(b)`).
+        Str { id: String, len: Int<'ctx> },
     }
 
     impl<'ctx> Val<'ctx> {
@@ -81,7 +83,38 @@ mod z3impl {
                 (Val::Int(a), Val::Int(b)) => Ok(Val::Int(cond.ite(a, b))),
                 (Val::Bool(a), Val::Bool(b)) => Ok(Val::Bool(cond.ite(a, b))),
                 (Val::Real(a), Val::Real(b)) => Ok(Val::Real(cond.ite(a, b))),
+                (
+                    Val::Str { id: ta, len: la },
+                    Val::Str { id: ea, len: lb },
+                ) => Ok(Val::Str {
+                    id: format!("ite({},{},{})", cond, ta, ea),
+                    len: cond.ite(la, lb),
+                }),
                 _ => Err("branches have different types".to_string()),
+            }
+        }
+    }
+
+    fn collect_assigned(stmts: &[Stmt], out: &mut Vec<String>) {
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Assign { name, .. } | StmtKind::Let { name, .. } => {
+                    if !out.iter().any(|n| n == name) {
+                        out.push(name.clone());
+                    }
+                }
+                StmtKind::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    collect_assigned(then_body, out);
+                    collect_assigned(else_body, out);
+                }
+                StmtKind::While { body, .. } | StmtKind::For { body, .. } => {
+                    collect_assigned(body, out);
+                }
+                _ => {}
             }
         }
     }
@@ -102,6 +135,8 @@ mod z3impl {
         /// current call-inlining depth
         depth: usize,
         fresh: usize,
+        /// requires (+ array len >= 0) assumed during body execution / invariants
+        assumptions: Vec<Bool<'ctx>>,
     }
 
     /// A completed return path: (conjunction of branch conditions, result).
@@ -198,16 +233,21 @@ mod z3impl {
                     .get(name)
                     .cloned()
                     .ok_or_else(|| format!("unknown variable '{}'", name)),
-                ExprKind::Call(name, args) => {
+                ExprKind::Call(name, _type_args, args) => {
                     if name == "len" && args.len() == 1 {
                         if let ExprKind::Var(arr) = &args[0].kind {
                             if let Some(l) = self.lens.get(arr) {
                                 return Ok(Val::Int(l.clone()));
                             }
                         }
-                        return Err(
-                            "len() is only symbolic for array/str parameters".to_string(),
-                        );
+                        match self.translate(&args[0])? {
+                            Val::Str { len, .. } => return Ok(Val::Int(len)),
+                            _ => {
+                                return Err(
+                                    "len() is only symbolic for array/str values".to_string(),
+                                );
+                            }
+                        }
                     }
                     if name == "to_float" && args.len() == 1 {
                         let v = self.translate(&args[0])?;
@@ -263,6 +303,14 @@ mod z3impl {
                     let r = self.translate(rhs)?;
                     match op {
                         Add | Sub | Mul | Div => match (&l, &r) {
+                            (Val::Str { id: a, len: la }, Val::Str { id: b, len: lb })
+                                if matches!(op, Add) =>
+                            {
+                                Ok(Val::Str {
+                                    id: format!("({}+{})", a, b),
+                                    len: la + lb,
+                                })
+                            }
                             (Val::Int(_), Val::Int(_)) => {
                                 let a = l.as_int()?;
                                 let b = r.as_int()?;
@@ -319,20 +367,18 @@ mod z3impl {
                             (Val::Int(a), Val::Int(b)) => Ok(Val::Bool(a._eq(b))),
                             (Val::Bool(a), Val::Bool(b)) => Ok(Val::Bool(a._eq(b))),
                             (Val::Real(a), Val::Real(b)) => Ok(Val::Bool(a._eq(b))),
-                            (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(Bool::from_bool(
-                                self.ctx,
-                                a == b,
-                            ))),
+                            (Val::Str { id: a, .. }, Val::Str { id: b, .. }) => {
+                                Ok(Val::Bool(Bool::from_bool(self.ctx, a == b)))
+                            }
                             _ => Err("'==' operands have different types".to_string()),
                         },
                         Ne => match (&l, &r) {
                             (Val::Int(a), Val::Int(b)) => Ok(Val::Bool(a._eq(b).not())),
                             (Val::Bool(a), Val::Bool(b)) => Ok(Val::Bool(a._eq(b).not())),
                             (Val::Real(a), Val::Real(b)) => Ok(Val::Bool(a._eq(b).not())),
-                            (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(Bool::from_bool(
-                                self.ctx,
-                                a != b,
-                            ))),
+                            (Val::Str { id: a, .. }, Val::Str { id: b, .. }) => {
+                                Ok(Val::Bool(Bool::from_bool(self.ctx, a != b)))
+                            }
                             _ => Err("'!=' operands have different types".to_string()),
                         },
                         And => Ok(Val::Bool(Bool::and(
@@ -467,77 +513,166 @@ mod z3impl {
                     StmtKind::Expr(_) => {
                         // pure expression statements can't affect the result
                     }
-                    StmtKind::While { cond: wcond, body } => {
-                        // Unroll `while i < N` / `while i <= N` when N is a
-                        // constant and the body assigns `i = i + 1`.
-                        let (var, exclusive_end) = match &wcond.kind {
-                            ExprKind::Bin(BinOp::Lt, l, r) => {
-                                let ExprKind::Var(v) = &l.kind else {
+                    StmtKind::While {
+                        cond: wcond,
+                        invariant,
+                        body,
+                    } => {
+                        if let Some(inv_expr) = invariant {
+                            // Induction: inv on entry, preserved by body, assumed on exit.
+                            let inv0 = self.translate(inv_expr)?.as_bool()?.clone();
+                            {
+                                let solver = Solver::new(self.ctx);
+                                for a in &self.assumptions {
+                                    solver.assert(a);
+                                }
+                                solver.assert(&cur);
+                                solver.assert(&inv0.not());
+                                if solver.check() != SatResult::Unsat {
                                     return Err(
-                                        "while loops need a form like 'while i < N' to unroll"
-                                            .to_string(),
+                                        "loop invariant does not hold on entry".to_string(),
                                     );
-                                };
-                                let end = self.translate(r)?.as_int()?.clone();
-                                let Some(ec) = end.simplify().as_i64() else {
-                                    return Err(
-                                        "while bound must simplify to a constant".to_string(),
-                                    );
-                                };
-                                (v.clone(), ec)
-                            }
-                            ExprKind::Bin(BinOp::Le, l, r) => {
-                                let ExprKind::Var(v) = &l.kind else {
-                                    return Err(
-                                        "while loops need a form like 'while i <= N' to unroll"
-                                            .to_string(),
-                                    );
-                                };
-                                let end = self.translate(r)?.as_int()?.clone();
-                                let Some(ec) = end.simplify().as_i64() else {
-                                    return Err(
-                                        "while bound must simplify to a constant".to_string(),
-                                    );
-                                };
-                                (v.clone(), ec + 1)
-                            }
-                            _ => {
-                                return Err(
-                                    "while loops are outside the decidable subset unless they look like 'while i < N' with i += 1"
-                                        .to_string(),
-                                );
-                            }
-                        };
-                        let start = match self.env.get(&var).and_then(|v| v.as_int().ok()) {
-                            Some(i) => i.simplify().as_i64(),
-                            None => None,
-                        };
-                        let Some(sc) = start else {
-                            return Err(
-                                "while loop variable must have a constant starting value"
-                                    .to_string(),
-                            );
-                        };
-                        if exclusive_end.saturating_sub(sc) > MAX_UNROLL {
-                            return Err(format!(
-                                "while loop runs {} iterations; the unrolling limit is {}",
-                                exclusive_end - sc,
-                                MAX_UNROLL
-                            ));
-                        }
-                        for k in sc..exclusive_end {
-                            self.env
-                                .insert(var.clone(), Val::Int(Int::from_i64(self.ctx, k)));
-                            match self.exec_block(body, &cur, paths)? {
-                                Some(c) => cur = c,
-                                None => {
-                                    self.env.remove(&var);
-                                    return Ok(None);
                                 }
                             }
+                            let mut assigned = Vec::new();
+                            collect_assigned(body, &mut assigned);
+                            let mut havoc_env = self.env.clone();
+                            for name in &assigned {
+                                if let Some(old) = self.env.get(name) {
+                                    let fresh = match old {
+                                        Val::Int(_) => Val::Int(self.fresh_int(name)),
+                                        Val::Bool(_) => {
+                                            self.fresh += 1;
+                                            Val::Bool(Bool::new_const(
+                                                self.ctx,
+                                                format!("{}!{}", name, self.fresh),
+                                            ))
+                                        }
+                                        Val::Real(_) => {
+                                            self.fresh += 1;
+                                            Val::Real(Real::new_const(
+                                                self.ctx,
+                                                format!("{}!{}", name, self.fresh),
+                                            ))
+                                        }
+                                        Val::Str { .. } => {
+                                            self.fresh += 1;
+                                            let len = Int::new_const(
+                                                self.ctx,
+                                                format!("len_{}!{}", name, self.fresh),
+                                            );
+                                            Val::Str {
+                                                id: format!("{}!{}", name, self.fresh),
+                                                len,
+                                            }
+                                        }
+                                    };
+                                    havoc_env.insert(name.clone(), fresh);
+                                }
+                            }
+                            self.env = havoc_env.clone();
+                            let inv = self.translate(inv_expr)?.as_bool()?.clone();
+                            let cv = self.translate(wcond)?.as_bool()?.clone();
+                            let entry = Bool::and(self.ctx, &[&cur, &inv, &cv]);
+                            let saved = self.env.clone();
+                            match self.exec_block(body, &entry, paths)? {
+                                None => {
+                                    // body always returns — loop never exits on this path
+                                    self.env = saved;
+                                    return Ok(None);
+                                }
+                                Some(post_pc) => {
+                                    let inv1 = self.translate(inv_expr)?.as_bool()?.clone();
+                                    let solver = Solver::new(self.ctx);
+                                    for a in &self.assumptions {
+                                        solver.assert(a);
+                                    }
+                                    solver.assert(&post_pc);
+                                    solver.assert(&inv1.not());
+                                    if solver.check() != SatResult::Unsat {
+                                        return Err(
+                                            "loop invariant is not preserved by the body"
+                                                .to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                            self.env = havoc_env;
+                            let inv_exit = self.translate(inv_expr)?.as_bool()?.clone();
+                            let cv_exit = self.translate(wcond)?.as_bool()?.clone();
+                            cur = Bool::and(self.ctx, &[&cur, &inv_exit, &cv_exit.not()]);
+                        } else {
+                            // Unroll `while i < N` / `while i <= N` when N is a
+                            // constant and the body assigns `i = i + 1`.
+                            let (var, exclusive_end) = match &wcond.kind {
+                                ExprKind::Bin(BinOp::Lt, l, r) => {
+                                    let ExprKind::Var(v) = &l.kind else {
+                                        return Err(
+                                            "while loops need a form like 'while i < N' to unroll, or an 'invariant' clause"
+                                                .to_string(),
+                                        );
+                                    };
+                                    let end = self.translate(r)?.as_int()?.clone();
+                                    let Some(ec) = end.simplify().as_i64() else {
+                                        return Err(
+                                            "while bound must simplify to a constant".to_string(),
+                                        );
+                                    };
+                                    (v.clone(), ec)
+                                }
+                                ExprKind::Bin(BinOp::Le, l, r) => {
+                                    let ExprKind::Var(v) = &l.kind else {
+                                        return Err(
+                                            "while loops need a form like 'while i <= N' to unroll, or an 'invariant' clause"
+                                                .to_string(),
+                                        );
+                                    };
+                                    let end = self.translate(r)?.as_int()?.clone();
+                                    let Some(ec) = end.simplify().as_i64() else {
+                                        return Err(
+                                            "while bound must simplify to a constant".to_string(),
+                                        );
+                                    };
+                                    (v.clone(), ec + 1)
+                                }
+                                _ => {
+                                    return Err(
+                                        "while loops need an 'invariant' clause or the form 'while i < N' with i += 1"
+                                            .to_string(),
+                                    );
+                                }
+                            };
+                            let start = match self.env.get(&var).and_then(|v| v.as_int().ok()) {
+                                Some(i) => i.simplify().as_i64(),
+                                None => None,
+                            };
+                            let Some(sc) = start else {
+                                return Err(
+                                    "while loop variable must have a constant starting value"
+                                        .to_string(),
+                                );
+                            };
+                            if exclusive_end.saturating_sub(sc) > MAX_UNROLL {
+                                return Err(format!(
+                                    "while loop runs {} iterations; the unrolling limit is {}",
+                                    exclusive_end - sc,
+                                    MAX_UNROLL
+                                ));
+                            }
+                            for k in sc..exclusive_end {
+                                self.env
+                                    .insert(var.clone(), Val::Int(Int::from_i64(self.ctx, k)));
+                                match self.exec_block(body, &cur, paths)? {
+                                    Some(c) => cur = c,
+                                    None => {
+                                        self.env.remove(&var);
+                                        return Ok(None);
+                                    }
+                                }
+                            }
+                            self.env
+                                .insert(var, Val::Int(Int::from_i64(self.ctx, exclusive_end)));
                         }
-                        self.env
-                            .insert(var, Val::Int(Int::from_i64(self.ctx, exclusive_end)));
                     }
                     _ => {
                         return Err("statement is outside the decidable subset".to_string());
@@ -578,6 +713,7 @@ mod z3impl {
             fns,
             depth: 0,
             fresh: 0,
+            assumptions: Vec::new(),
         };
 
         // parameters become symbolic constants
@@ -608,9 +744,14 @@ mod z3impl {
                 Type::Str => {
                     // length is symbolic (>= 0); the value is an opaque name
                     let l = Int::new_const(&ctx, format!("len_{}", p.name));
-                    st.lens.insert(p.name.clone(), l);
-                    st.env
-                        .insert(p.name.clone(), Val::Str(p.name.clone()));
+                    st.lens.insert(p.name.clone(), l.clone());
+                    st.env.insert(
+                        p.name.clone(),
+                        Val::Str {
+                            id: p.name.clone(),
+                            len: l,
+                        },
+                    );
                 }
                 Type::Struct(_) => {
                     // fields materialize lazily as uninterpreted ints
@@ -678,6 +819,8 @@ mod z3impl {
         if f.ensures.is_empty() {
             return report;
         }
+
+        st.assumptions = assumptions.clone();
 
         // symbolically execute the body to get result per return path
         let true_cond = Bool::from_bool(&ctx, true);

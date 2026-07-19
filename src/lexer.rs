@@ -34,6 +34,7 @@ pub enum Tok {
     Enum,
     Match,
     Where,
+    Invariant,
     // punctuation
     LParen,
     RParen,
@@ -382,6 +383,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
                     "enum" => Tok::Enum,
                     "match" => Tok::Match,
                     "where" => Tok::Where,
+                    "invariant" => Tok::Invariant,
                     _ => Tok::Ident(word.to_string()),
                 };
                 push!(tok, i, end);

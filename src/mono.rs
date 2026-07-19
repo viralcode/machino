@@ -292,8 +292,8 @@ pub fn monomorphize_with(
             inst.name = mangled;
             inst.type_params = Vec::new();
             for v in &mut inst.variants {
-                if let Some(p) = &v.payload {
-                    v.payload = Some(mono.subst_ty(p, &subst));
+                for p in &mut v.payloads {
+                    *p = mono.subst_ty(p, &subst);
                 }
             }
             out.enums.push(inst);
@@ -337,8 +337,15 @@ fn max_lambda_id(program: &Program) -> usize {
                     walk_stmts(then_body, max);
                     walk_stmts(else_body, max);
                 }
-                StmtKind::While { cond, body } => {
+                StmtKind::While {
+                    cond,
+                    invariant,
+                    body,
+                } => {
                     walk_expr(cond, max);
+                    if let Some(inv) = invariant {
+                        walk_expr(inv, max);
+                    }
                     walk_stmts(body, max);
                 }
                 StmtKind::For {
@@ -360,7 +367,7 @@ fn max_lambda_id(program: &Program) -> usize {
                 walk_expr(b, max);
             }
             ExprKind::Field(a, _) | ExprKind::Un(_, a) => walk_expr(a, max),
-            ExprKind::Call(_, args) => args.iter().for_each(|a| walk_expr(a, max)),
+            ExprKind::Call(_, _, args) => args.iter().for_each(|a| walk_expr(a, max)),
             ExprKind::Lambda(l) => {
                 *max = (*max).max(l.id);
                 walk_stmts(&l.body, max);
@@ -460,8 +467,15 @@ impl<'a> Mono<'a> {
                     self.rewrite_stmt(s, subst);
                 }
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While {
+                cond,
+                invariant,
+                body,
+            } => {
                 self.rewrite_expr(cond, subst);
+                if let Some(inv) = invariant {
+                    self.rewrite_expr(inv, subst);
+                }
                 for s in body {
                     self.rewrite_stmt(s, subst);
                 }
@@ -507,8 +521,10 @@ impl<'a> Mono<'a> {
                         }
                     }
                 }
-                if let Pattern::VariantPayload(_, _, inner) = pat {
-                    self.rewrite_pattern(inner, subst);
+                if let Pattern::VariantPayload(_, _, inners) = pat {
+                    for inner in inners {
+                        self.rewrite_pattern(inner, subst);
+                    }
                 }
             }
             _ => {}
@@ -528,7 +544,7 @@ impl<'a> Mono<'a> {
                 self.rewrite_expr(b, subst);
             }
             ExprKind::Field(a, _) | ExprKind::Un(_, a) => self.rewrite_expr(a, subst),
-            ExprKind::Call(_, args) => {
+            ExprKind::Call(_, _, args) => {
                 for a in args {
                     self.rewrite_expr(a, subst);
                 }
@@ -580,7 +596,7 @@ impl<'a> Mono<'a> {
             }
             _ => {}
         }
-        if let ExprKind::Call(name, _) = &mut expr.kind {
+        if let ExprKind::Call(name, type_args, _) = &mut expr.kind {
             if let Some((callee, recorded_args)) =
                 self.call_map.get(&(expr.span.start, expr.span.end)).cloned()
             {
@@ -593,11 +609,13 @@ impl<'a> Mono<'a> {
                     // instantiation of this enclosing template
                 } else if name == &callee {
                     *name = mangle(&callee, &concrete);
+                    type_args.clear();
                     self.queue.push((callee, concrete));
                 } else if let Some(variant) = name.strip_prefix(&format!("{}::", callee)) {
                     // Enum::Variant call recorded under the enum name
                     let mangled = mangle(&callee, &concrete);
                     *name = format!("{}::{}", mangled, variant);
+                    type_args.clear();
                     self.queue.push((callee, concrete));
                 }
             }

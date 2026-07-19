@@ -457,10 +457,11 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|v| EnumVariant {
                 name: v.name.clone(),
-                payload: v
-                    .payload
-                    .as_ref()
-                    .map(|p| apply_subst(p, &subst)),
+                payloads: v
+                    .payloads
+                    .iter()
+                    .map(|p| apply_subst(p, &subst))
+                    .collect(),
                 span: v.span,
             })
             .collect();
@@ -650,36 +651,27 @@ impl<'a> Checker<'a> {
             return None;
         };
         if ed.type_params.is_empty() {
-            if let Some(ref payload_ty) = variant.payload {
-                if args.len() != 1 {
-                    self.diags.push(Diagnostic::new(
-                        "E045",
-                        format!(
-                            "{}::{} takes exactly 1 argument, found {}",
-                            enum_name,
-                            variant_name,
-                            args.len()
-                        ),
-                        span,
-                    ));
-                } else {
-                    self.check_args(
-                        &format!("{}::{}", enum_name, variant_name),
-                        &[payload_ty.clone()],
-                        args,
-                        span,
-                        scope,
-                    );
-                }
-            } else if !args.is_empty() {
+            let n = variant.payloads.len();
+            if args.len() != n {
                 self.diags.push(Diagnostic::new(
                     "E045",
                     format!(
-                        "{}::{} takes no arguments, found {}",
-                        enum_name, variant_name, args.len()
+                        "{}::{} takes exactly {} argument(s), found {}",
+                        enum_name,
+                        variant_name,
+                        n,
+                        args.len()
                     ),
                     span,
                 ));
+            } else if n > 0 {
+                self.check_args(
+                    &format!("{}::{}", enum_name, variant_name),
+                    &variant.payloads,
+                    args,
+                    span,
+                    scope,
+                );
             }
             return Some(Type::Enum(enum_name.to_string()));
         }
@@ -689,22 +681,24 @@ impl<'a> Checker<'a> {
         let mut subst: HashMap<String, Type> = HashMap::new();
         let mut ok = true;
 
-        if let Some(ref payload_ty) = variant.payload {
-            if args.len() != 1 {
-                self.diags.push(Diagnostic::new(
-                    "E045",
-                    format!(
-                        "{}::{} takes exactly 1 argument, found {}",
-                        enum_name,
-                        variant_name,
-                        args.len()
-                    ),
-                    span,
-                ));
-                self.exit_type_params();
-                return None;
-            }
-            let Some(aty) = self.infer(&args[0], scope, None) else {
+        let n = variant.payloads.len();
+        if args.len() != n {
+            self.diags.push(Diagnostic::new(
+                "E045",
+                format!(
+                    "{}::{} takes exactly {} argument(s), found {}",
+                    enum_name,
+                    variant_name,
+                    n,
+                    args.len()
+                ),
+                span,
+            ));
+            self.exit_type_params();
+            return None;
+        }
+        for (payload_ty, arg) in variant.payloads.iter().zip(args) {
+            let Some(aty) = self.infer(arg, scope, None) else {
                 self.exit_type_params();
                 return None;
             };
@@ -720,24 +714,17 @@ impl<'a> Checker<'a> {
                         apply_subst(&pty, &subst),
                         aty
                     ),
-                    args[0].span,
+                    arg.span,
                 ));
                 ok = false;
             }
-        } else if !args.is_empty() {
-            self.diags.push(Diagnostic::new(
-                "E045",
-                format!(
-                    "{}::{} takes no arguments, found {}",
-                    enum_name, variant_name, args.len()
-                ),
-                span,
-            ));
-            ok = false;
-        } else if let Some(exp) = expected {
-            if let Some(args_from_exp) = self.type_args_from_expected(enum_name, exp) {
-                for (tp, ta) in ed.type_params.iter().zip(args_from_exp.iter()) {
-                    subst.insert(tp.name.clone(), ta.clone());
+        }
+        if n == 0 {
+            if let Some(exp) = expected {
+                if let Some(args_from_exp) = self.type_args_from_expected(enum_name, exp) {
+                    for (tp, ta) in ed.type_params.iter().zip(args_from_exp.iter()) {
+                        subst.insert(tp.name.clone(), ta.clone());
+                    }
                 }
             }
         }
@@ -885,12 +872,12 @@ impl<'a> Checker<'a> {
                 ));
                 continue;
             }
-            if e.variants.len() > 255 {
+            if e.variants.len() > 65535 {
                 self.diags.push(
                     Diagnostic::new(
                         "E054",
                         format!(
-                            "enum '{}' has {} variants; the maximum is 255",
+                            "enum '{}' has {} variants; the maximum is 65535",
                             e.name,
                             e.variants.len()
                         ),
@@ -924,7 +911,7 @@ impl<'a> Checker<'a> {
         for e in &self.program.enums {
             self.enter_type_params(&e.type_params);
             for v in &e.variants {
-                if let Some(ref ty) = v.payload {
+                for ty in &v.payloads {
                     self.validate_type(ty, v.span);
                 }
             }
@@ -1538,9 +1525,17 @@ impl<'a> Checker<'a> {
                 self.check_stmts(then_body, scope, ret, in_test);
                 self.check_stmts(else_body, scope, ret, in_test);
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While {
+                cond,
+                invariant,
+                body,
+            } => {
                 let cty = self.infer(cond, scope, Some(&Type::Bool));
                 self.expect_bool(cty, cond.span, "while condition");
+                if let Some(inv) = invariant {
+                    let ity = self.infer(inv, scope, Some(&Type::Bool));
+                    self.expect_bool(ity, inv.span, "while invariant");
+                }
                 self.loop_depth += 1;
                 self.check_stmts(body, scope, ret, in_test);
                 self.loop_depth -= 1;
@@ -1722,15 +1717,15 @@ impl<'a> Checker<'a> {
                     let variant_name = &name[colon_pos + 2..];
                     if let Some(ed) = self.program.enums.iter().find(|e| e.name == enum_name) {
                         if let Some(variant) = ed.variants.iter().find(|v| v.name == variant_name) {
-                            if variant.payload.is_some() {
+                            if !variant.payloads.is_empty() {
                                 self.diags.push(Diagnostic::new(
                                     "E063",
                                     format!(
-                                        "variant '{}::{}' has a payload and must be called as a function",
+                                        "variant '{}::{}' has payload(s) and must be called as a function",
                                         enum_name, variant_name
                                     ),
                                     expr.span,
-                                ).with_help(format!("use {}::{}(value)", enum_name, variant_name)));
+                                ).with_help(format!("use {}::{}(...)", enum_name, variant_name)));
                                 return None;
                             }
                             if !ed.type_params.is_empty() {
@@ -2004,7 +1999,9 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            ExprKind::Call(name, args) => self.check_call(name, args, expr.span, scope, expected),
+            ExprKind::Call(name, type_args, args) => {
+                self.check_call(name, type_args, args, expr.span, scope, expected)
+            }
             ExprKind::Lambda(lambda) => {
                 for p in &lambda.params {
                     self.validate_type(&p.ty, p.span);
@@ -2198,28 +2195,43 @@ impl<'a> Checker<'a> {
                 // check payload
                 match pattern {
                     Pattern::Variant(_, _) => {
-                        if var_def.payload.is_some() {
+                        if !var_def.payloads.is_empty() {
                             self.diags.push(Diagnostic::new(
                                 "E061",
-                                format!("variant '{}::{}' has a payload but pattern does not bind it", enum_name, variant_name),
+                                format!("variant '{}::{}' has payload(s) but pattern does not bind them", enum_name, variant_name),
                                 span,
-                            ).with_help(format!("use {}::{}(x) to bind the payload", enum_name, variant_name)));
+                            ).with_help(format!("use {}::{}(...)", enum_name, variant_name)));
                             None
                         } else {
                             Some(expected_ty)
                         }
                     }
-                    Pattern::VariantPayload(_, _, inner) => {
-                        if let Some(ref payload_ty) = var_def.payload {
-                            self.check_pattern(inner, payload_ty, span, scope)?;
-                            Some(expected_ty)
-                        } else {
+                    Pattern::VariantPayload(_, _, inners) => {
+                        if var_def.payloads.is_empty() {
                             self.diags.push(Diagnostic::new(
                                 "E062",
                                 format!("variant '{}::{}' has no payload but pattern expects one", enum_name, variant_name),
                                 span,
                             ).with_help(format!("use {}::{} without parentheses", enum_name, variant_name)));
                             None
+                        } else if inners.len() != var_def.payloads.len() {
+                            self.diags.push(Diagnostic::new(
+                                "E061",
+                                format!(
+                                    "variant '{}::{}' has {} payload(s) but pattern binds {}",
+                                    enum_name,
+                                    variant_name,
+                                    var_def.payloads.len(),
+                                    inners.len()
+                                ),
+                                span,
+                            ));
+                            None
+                        } else {
+                            for (inner, payload_ty) in inners.iter().zip(var_def.payloads.iter()) {
+                                self.check_pattern(inner, payload_ty, span, scope)?;
+                            }
+                            Some(expected_ty)
                         }
                     }
                     _ => unreachable!(),
@@ -2239,11 +2251,14 @@ impl<'a> Checker<'a> {
             Pattern::Var(name) => Some(vec![(name.clone(), ty.clone())]),
             Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => Some(vec![]),
             Pattern::Variant(_, _) => Some(vec![]),
-            Pattern::VariantPayload(enum_name, variant_name, inner) => {
+            Pattern::VariantPayload(enum_name, variant_name, inners) => {
                 let variants = self.enums.get(enum_name)?;
                 let var_def = variants.iter().find(|v| v.name == *variant_name)?;
-                let payload_ty = var_def.payload.as_ref()?;
-                self.extract_pattern_bindings(inner, payload_ty, span)
+                let mut bindings = Vec::new();
+                for (inner, payload_ty) in inners.iter().zip(var_def.payloads.iter()) {
+                    bindings.extend(self.extract_pattern_bindings(inner, payload_ty, span)?);
+                }
+                Some(bindings)
             }
         }
     }
@@ -2287,6 +2302,7 @@ impl<'a> Checker<'a> {
     fn check_call(
         &mut self,
         name: &str,
+        type_args: &[Type],
         args: &[Expr],
         span: Span,
         scope: &mut Scope,
@@ -2618,10 +2634,20 @@ impl<'a> Checker<'a> {
                     self.check_args(name, &params, args, span, scope);
                     return Some(Type::Struct(name.to_string()));
                 }
-                // 3a. generic function: infer type arguments by unification
+                // 3a. generic function: turbofish or infer type arguments
                 if let Some(&idx) = self.generic_fns.get(name) {
                     let f = &self.program.functions[idx];
-                    return self.check_generic_call(f, args, span, scope);
+                    return self.check_generic_call(f, type_args, args, span, scope);
+                }
+                if !type_args.is_empty() {
+                    self.diags.push(Diagnostic::new(
+                        "E064",
+                        format!(
+                            "turbofish type arguments are only valid on generic functions; '{}' is not generic",
+                            name
+                        ),
+                        span,
+                    ));
                 }
                 // 3. named function or extern
                 let (params, ret) = match self.signatures.get(name) {
@@ -2668,6 +2694,7 @@ impl<'a> Checker<'a> {
     fn check_generic_call(
         &mut self,
         f: &'a Function,
+        explicit_type_args: &[Type],
         args: &[Expr],
         span: Span,
         scope: &mut Scope,
@@ -2685,11 +2712,32 @@ impl<'a> Checker<'a> {
             ));
             return None;
         }
+        if !explicit_type_args.is_empty() && explicit_type_args.len() != f.type_params.len() {
+            self.diags.push(Diagnostic::new(
+                "E064",
+                format!(
+                    "'{}' expects {} type argument(s), found {}",
+                    f.name,
+                    f.type_params.len(),
+                    explicit_type_args.len()
+                ),
+                span,
+            ));
+            return None;
+        }
         let tp_names: Vec<&str> = f.type_params.iter().map(|tp| tp.name.as_str()).collect();
         let mut subst: HashMap<String, Type> = HashMap::new();
         let mut ok = true;
         let outer_params = self.type_params.clone();
         self.enter_type_params(&f.type_params);
+        // turbofish seeds the substitution before argument unification
+        if !explicit_type_args.is_empty() {
+            for (tp, ta) in f.type_params.iter().zip(explicit_type_args.iter()) {
+                self.validate_type(ta, span);
+                let ta = self.normalize_type(ta);
+                subst.insert(tp.name.clone(), ta);
+            }
+        }
         for (i, (p, a)) in f.params.iter().zip(args.iter()).enumerate() {
             let Some(aty) = self.infer(a, scope, None) else {
                 ok = false;
@@ -2716,7 +2764,7 @@ impl<'a> Checker<'a> {
             self.exit_type_params();
             return None;
         }
-        // every type parameter must be fixed by the arguments
+        // every type parameter must be fixed by turbofish and/or the arguments
         let mut type_args = Vec::new();
         for tp in &f.type_params {
             match subst.get(&tp.name) {
@@ -2735,7 +2783,7 @@ impl<'a> Checker<'a> {
                             span,
                         )
                         .with_help(
-                            "every type parameter must appear in at least one parameter type",
+                            "provide an explicit turbofish (e.g. foo::<int>(...)) or ensure every type parameter appears in a parameter type",
                         ),
                     );
                     self.exit_type_params();

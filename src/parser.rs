@@ -300,16 +300,24 @@ impl<'a> Parser<'a> {
             }
             let vspan = self.peek_span();
             let vname = self.parse_ident("variant name")?;
-            let payload = if self.eat(&Tok::LParen) {
-                let ty = self.parse_type()?;
-                self.expect(Tok::RParen, "')' after variant payload type")?;
-                Some(ty)
+            let payloads = if self.eat(&Tok::LParen) {
+                let mut types = Vec::new();
+                if !matches!(self.peek(), Tok::RParen) {
+                    loop {
+                        types.push(self.parse_type()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(Tok::RParen, "')' after variant payload type(s)")?;
+                types
             } else {
-                None
+                Vec::new()
             };
             variants.push(EnumVariant {
                 name: vname,
-                payload,
+                payloads,
                 span: vspan,
             });
             self.expect_stmt_end()?;
@@ -551,10 +559,19 @@ impl<'a> Parser<'a> {
             Tok::While => {
                 self.advance();
                 let cond = self.parse_expr()?;
+                let invariant = if self.eat(&Tok::Invariant) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
                 let body = self.parse_block()?;
                 let end = self.tokens[self.pos.saturating_sub(1)].span;
                 Ok(Stmt {
-                    kind: StmtKind::While { cond, body },
+                    kind: StmtKind::While {
+                        cond,
+                        invariant,
+                        body,
+                    },
                     span: start.merge(end),
                 })
             }
@@ -710,9 +727,17 @@ impl<'a> Parser<'a> {
                 let variant = segments.pop().unwrap();
                 let enum_name = segments.join("::");
                 if self.eat(&Tok::LParen) {
-                    let inner = Box::new(self.parse_pattern()?);
-                    self.expect(Tok::RParen, "')' after variant payload pattern")?;
-                    Ok(Pattern::VariantPayload(enum_name, variant, inner))
+                    let mut inners = Vec::new();
+                    if !matches!(self.peek(), Tok::RParen) {
+                        loop {
+                            inners.push(self.parse_pattern()?);
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(Tok::RParen, "')' after variant payload pattern(s)")?;
+                    Ok(Pattern::VariantPayload(enum_name, variant, inners))
                 } else {
                     Ok(Pattern::Variant(enum_name, variant))
                 }
@@ -995,8 +1020,33 @@ impl<'a> Parser<'a> {
                 span,
             }),
             Tok::Ident(mut name) => {
-                // check for qualified names like Enum::Variant
-                while self.eat(&Tok::Colon) && self.eat(&Tok::Colon) {
+                let mut type_args: Vec<Type> = Vec::new();
+                // `::` starts either Enum::Variant or turbofish ::<T>
+                while matches!(self.peek(), Tok::Colon) {
+                    let save = self.pos;
+                    if !(self.eat(&Tok::Colon) && self.eat(&Tok::Colon)) {
+                        self.pos = save;
+                        break;
+                    }
+                    if self.eat(&Tok::Lt) {
+                        // turbofish: name::<T, U>
+                        if !matches!(self.peek(), Tok::Gt) {
+                            loop {
+                                type_args.push(self.parse_type()?);
+                                if !self.eat(&Tok::Comma) {
+                                    break;
+                                }
+                            }
+                        }
+                        if !self.eat(&Tok::Gt) {
+                            return Err(Diagnostic::new(
+                                "E011",
+                                "expected '>' to close turbofish type arguments",
+                                self.peek_span(),
+                            ));
+                        }
+                        break;
+                    }
                     let variant = self.parse_ident("variant name after '::'")?;
                     name = format!("{}::{}", name, variant);
                 }
@@ -1013,9 +1063,15 @@ impl<'a> Parser<'a> {
                     }
                     let rp = self.expect(Tok::RParen, "')' to close call")?;
                     Ok(Expr {
-                        kind: ExprKind::Call(name, args),
+                        kind: ExprKind::Call(name, type_args, args),
                         span: span.merge(rp.span),
                     })
+                } else if !type_args.is_empty() {
+                    Err(Diagnostic::new(
+                        "E011",
+                        "turbofish '::<>' must be followed by a call '(...)'",
+                        self.peek_span(),
+                    ))
                 } else {
                     Ok(Expr {
                         kind: ExprKind::Var(name),
@@ -1166,6 +1222,7 @@ fn describe(tok: &Tok) -> String {
         Tok::Enum => "'enum'".to_string(),
         Tok::Match => "'match'".to_string(),
         Tok::Where => "'where'".to_string(),
+        Tok::Invariant => "'invariant'".to_string(),
         Tok::LParen => "'('".to_string(),
         Tok::RParen => "')'".to_string(),
         Tok::LBrace => "'{'".to_string(),

@@ -29,7 +29,7 @@ struct-def     = "struct" [ type-params ] ident "{" { field } "}" ;
 field          = ident ":" type NEWLINE ;
 
 enum-def       = "enum" [ type-params ] ident "{" { variant } "}" ;
-variant        = ident [ "(" type ")" ] NEWLINE ;
+variant        = ident [ "(" { type ( "," type )* } ")" ] NEWLINE ;
 
 test-block     = "test" string [ "expects" string ] block ;
                  (* with 'expects', the test passes only if its print output,
@@ -59,7 +59,7 @@ assign-stmt    = ident "=" expr NEWLINE ;
 index-assign   = postfix-expr "[" expr "]" "=" expr NEWLINE ;
 field-assign   = postfix-expr "." ident "=" expr NEWLINE ;
 if-stmt        = "if" expr block [ "else" ( block | if-stmt ) ] ;
-while-stmt     = "while" expr block ;
+while-stmt     = "while" expr [ "invariant" expr ] block ;
 for-stmt       = "for" ident "in" expr ".." expr block ;
 return-stmt    = "return" [ expr ] NEWLINE ;
 assert-stmt    = "assert" expr NEWLINE ;
@@ -77,11 +77,12 @@ unary-expr     = ( "-" | "!" ) unary-expr | postfix-expr ;
 postfix-expr   = primary { "[" expr "]" | "." ident } ;
 
 primary        = int-lit | float-lit | string | "true" | "false"
-               | qualified-ident [ call-args ]      (* var, call, ctor, variant *)
+               | qualified-ident [ turbofish ] [ call-args ]  (* var / call / ctor *)
                | "[" [ expr { "," expr } ] "]"      (* array literal *)
                | "(" expr ")"
                | lambda
                | match-expr ;
+turbofish      = "::" "<" [ type { "," type } ] ">" ;
 call-args      = "(" [ expr { "," expr } ] ")" ;
 
 lambda         = "fn" "(" [ params ] ")" [ "->" type ] block ;
@@ -89,7 +90,7 @@ lambda         = "fn" "(" [ params ] ")" [ "->" type ] block ;
 match-expr     = "match" expr "{" { match-arm } "}" ;
 match-arm      = pattern "=>" expr NEWLINE ;
 pattern        = "_" | ident | int-lit | "true" | "false" | string
-               | qualified-ident "::" ident [ "(" pattern ")" ] ;
+               | qualified-ident "::" ident [ "(" pattern { "," pattern }* ")" ] ;
 
 (* ---- lexical ---- *)
 

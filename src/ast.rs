@@ -106,7 +106,7 @@ pub enum ExprKind {
     Field(Box<Expr>, String),
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Un(UnOp, Box<Expr>),
-    Call(String, Vec<Expr>),
+    Call(String, Vec<Type>, Vec<Expr>),
     /// A lambda expression: fn(x: int) -> int { ... }
     /// Captures enclosing variables by value at creation.
     Lambda(Box<Lambda>),
@@ -141,8 +141,8 @@ pub enum Pattern {
     Str(String),
     /// Enum variant without payload: Option::None
     Variant(String, String),
-    /// Enum variant with payload: Option::Some(x)
-    VariantPayload(String, String, Box<Pattern>),
+    /// Enum variant with payload(s): Option::Some(x) or Pair(int, str)
+    VariantPayload(String, String, Vec<Pattern>),
 }
 
 #[derive(Debug, Clone)]
@@ -207,8 +207,15 @@ fn free_in_stmts(stmts: &[Stmt], bound: &mut Vec<Vec<String>>, free: &mut Vec<St
                 free_in_stmts(then_body, bound, free);
                 free_in_stmts(else_body, bound, free);
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While {
+                cond,
+                invariant,
+                body,
+            } => {
                 free_in_expr(cond, bound, free);
+                if let Some(inv) = invariant {
+                    free_in_expr(inv, bound, free);
+                }
                 free_in_stmts(body, bound, free);
             }
             StmtKind::For {
@@ -254,7 +261,7 @@ fn free_in_expr(expr: &Expr, bound: &mut Vec<Vec<String>>, free: &mut Vec<String
             free_in_expr(b, bound, free);
         }
         ExprKind::Un(_, a) => free_in_expr(a, bound, free),
-        ExprKind::Call(name, args) => {
+        ExprKind::Call(name, _targs, args) => {
             if !is_bound(bound, name) {
                 free.push(name.clone());
             }
@@ -286,7 +293,10 @@ fn free_in_expr(expr: &Expr, bound: &mut Vec<Vec<String>>, free: &mut Vec<String
 fn pattern_bindings(pat: &Pattern) -> Vec<String> {
     match pat {
         Pattern::Var(name) => vec![name.clone()],
-        Pattern::VariantPayload(_, _, inner) => pattern_bindings(inner),
+        Pattern::VariantPayload(_, _, inners) => inners
+            .iter()
+            .flat_map(pattern_bindings)
+            .collect(),
         _ => vec![],
     }
 }
@@ -325,6 +335,8 @@ pub enum StmtKind {
     },
     While {
         cond: Expr,
+        /// Optional loop invariant for SMT / documentation (`while c invariant e { ... }`).
+        invariant: Option<Expr>,
         body: Vec<Stmt>,
     },
     For {
@@ -405,7 +417,7 @@ pub struct EnumDef {
 #[derive(Debug, Clone)]
 pub struct EnumVariant {
     pub name: String,
-    pub payload: Option<Type>,
+    pub payloads: Vec<Type>,
     pub span: Span,
 }
 

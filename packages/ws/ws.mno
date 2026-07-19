@@ -1,0 +1,13 @@
+# ws — WebSocket client (browser / custom hosts only)
+#
+# Raw TCP (`tcp_*`) is unavailable in the browser sandbox. Use this package
+# when targeting runners/run.html or another host that implements the imports
+# below (typically via the browser WebSocket API).
+#
+# The Node WASM host (`runners/run.mjs`) provides `tcp_*` instead; it does not
+# implement these WebSocket externs unless you add them to your host.
+
+extern fn ws_connect(url: str) -> int
+extern fn ws_send(conn: int, data: str) -> int
+extern fn ws_recv(conn: int) -> str
+extern fn ws_close(conn: int)

@@ -529,6 +529,9 @@ pub struct WasmCompiler<'a> {
     /// Functions passed to spawn(); exported so worker instances can call
     /// them by name.
     spawn_targets: std::collections::BTreeSet<String>,
+    /// Externs with contracts: user-facing name -> raw host import index.
+    /// `func_index` points at the wrapper that checks requires/ensures.
+    extern_host: HashMap<String, u32>,
 }
 
 type Scope = Vec<HashMap<String, (u32, Type)>>;
@@ -581,7 +584,7 @@ pub fn compile_with_stack(program: &Program, source: &str, shadow_bytes: u32) ->
 /// creation, so they are not descended into.
 fn can_gc(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::Call(_, _) => true,
+        ExprKind::Call(_, _, _) => true,
         ExprKind::Array(elems) => elems.iter().any(can_gc),
         ExprKind::Index(a, b) => can_gc(a) || can_gc(b),
         ExprKind::Field(a, _) => can_gc(a),
@@ -713,7 +716,7 @@ fn collect_fn_names_stmts<'e>(stmts: &'e [Stmt], out: &mut Vec<&'e str>) {
                 collect_fn_names_stmts(then_body, out);
                 collect_fn_names_stmts(else_body, out);
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, invariant: _, body } => {
                 collect_fn_names(cond, out);
                 collect_fn_names_stmts(body, out);
             }
@@ -750,7 +753,7 @@ fn collect_fn_names<'e>(expr: &'e Expr, out: &mut Vec<&'e str>) {
             collect_fn_names(b, out);
         }
         ExprKind::Un(_, a) => collect_fn_names(a, out),
-        ExprKind::Call(name, args) => {
+        ExprKind::Call(name, _type_args, args) => {
             out.push(name);
             for a in args {
                 collect_fn_names(a, out);
@@ -791,7 +794,7 @@ fn collect_lambdas_stmts<'e>(stmts: &'e [Stmt], out: &mut BTreeMap<usize, &'e La
                 collect_lambdas_stmts(then_body, out);
                 collect_lambdas_stmts(else_body, out);
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, invariant: _, body } => {
                 collect_lambdas(cond, out);
                 collect_lambdas_stmts(body, out);
             }
@@ -827,7 +830,7 @@ fn collect_lambdas<'e>(expr: &'e Expr, out: &mut BTreeMap<usize, &'e Lambda>) {
             collect_lambdas(b, out);
         }
         ExprKind::Un(_, a) => collect_lambdas(a, out),
-        ExprKind::Call(_, args) => {
+        ExprKind::Call(_, _, args) => {
             for a in args {
                 collect_lambdas(a, out);
             }
@@ -907,6 +910,7 @@ impl<'a> WasmCompiler<'a> {
             imp_chan_recv_f64: 0,
             imp_chan_recv_str: 0,
             spawn_targets: std::collections::BTreeSet::new(),
+            extern_host: HashMap::new(),
         }
     }
 
@@ -1077,8 +1081,18 @@ impl<'a> WasmCompiler<'a> {
             imports.push((f.name.clone(), tidx));
         }
         self.n_imports = imports.len() as u32;
+        let contracted_externs: Vec<&Function> = externs
+            .iter()
+            .copied()
+            .filter(|f| !f.requires.is_empty() || !f.ensures.is_empty())
+            .collect();
         for (i, f) in externs.iter().enumerate() {
-            self.func_index.insert(f.name.as_str(), extern_base + i as u32);
+            let import_idx = extern_base + i as u32;
+            if f.requires.is_empty() && f.ensures.is_empty() {
+                self.func_index.insert(f.name.as_str(), import_idx);
+            } else {
+                self.extern_host.insert(f.name.clone(), import_idx);
+            }
         }
 
         // -- lambdas and named-function values in reachable code --
@@ -1140,11 +1154,17 @@ impl<'a> WasmCompiler<'a> {
             .iter()
             .filter(|f| !f.is_extern && reachable.contains(&f.name))
             .collect();
+        let n_ext_wrap = contracted_externs.len() as u32;
+        let ext_wrap_base = base + N_HELPERS;
+        for (i, f) in contracted_externs.iter().enumerate() {
+            self.func_index
+                .insert(f.name.as_str(), ext_wrap_base + i as u32);
+        }
         for (i, f) in user_fns.iter().enumerate() {
             self.func_index
-                .insert(f.name.as_str(), base + N_HELPERS + i as u32);
+                .insert(f.name.as_str(), ext_wrap_base + n_ext_wrap + i as u32);
         }
-        let wrapper_base = base + N_HELPERS + user_fns.len() as u32;
+        let wrapper_base = ext_wrap_base + n_ext_wrap + user_fns.len() as u32;
         let lambda_base = wrapper_base + fn_value_names.len() as u32;
         for (i, l) in self.lambdas.values().enumerate() {
             self.lambda_index.insert(l.id, lambda_base + i as u32);
@@ -1239,6 +1259,29 @@ impl<'a> WasmCompiler<'a> {
             self.emit_gc_maybe(),
         ];
 
+        // extern contract wrappers (call host import after requires / before ensures)
+        for f in &contracted_externs {
+            let params: Vec<(String, Type)> = f
+                .params
+                .iter()
+                .map(|p| (p.name.clone(), p.ty.clone()))
+                .collect();
+            let host = self.extern_host[&f.name];
+            func_types.push(self.sig_type(
+                &params.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>(),
+                &f.ret,
+            ));
+            bodies.push(self.emit_body(
+                &params,
+                f.ret.clone(),
+                &f.requires,
+                &f.ensures,
+                &[],
+                &f.name,
+                None,
+                Some(host),
+            ));
+        }
         // user functions
         for f in &user_fns {
             let params: Vec<Type> = f.params.iter().map(|p| p.ty.clone()).collect();
@@ -3194,6 +3237,7 @@ impl<'a> WasmCompiler<'a> {
             &f.body,
             &f.name,
             None,
+            None,
         )
     }
 
@@ -3216,6 +3260,7 @@ impl<'a> WasmCompiler<'a> {
             &l.body,
             "<lambda>",
             Some(captures),
+            None,
         )
     }
 
@@ -3229,6 +3274,7 @@ impl<'a> WasmCompiler<'a> {
         body: &[Stmt],
         fn_name: &str,
         captures: Option<Vec<(String, Type)>>,
+        host_import: Option<u32>,
     ) -> Vec<u8> {
         let is_lambda = captures.is_some();
         let n_params = params.len() as u32 + if is_lambda { 1 } else { 0 };
@@ -3338,10 +3384,21 @@ impl<'a> WasmCompiler<'a> {
             ctx.result_local = Some(ctx.b.new_local(valtype(&ret)));
         }
 
-        ctx.b.block_void();
-        ctx.nesting = 0;
-        self.stmts(&mut ctx, &mut scope, body);
-        ctx.b.end();
+        if let Some(host) = host_import {
+            // contracted extern: forward to the host import
+            for i in 0..params.len() as u32 {
+                ctx.b.local_get(i);
+            }
+            ctx.b.call(host);
+            if let Some(r) = ctx.result_local {
+                ctx.b.local_set(r);
+            }
+        } else {
+            ctx.b.block_void();
+            ctx.nesting = 0;
+            self.stmts(&mut ctx, &mut scope, body);
+            ctx.b.end();
+        }
 
         if !ensures.is_empty() {
             let mut ens_scope: Scope = vec![HashMap::new()];
@@ -3492,7 +3549,7 @@ impl<'a> WasmCompiler<'a> {
                 ctx.nesting -= 1;
                 ctx.b.end();
             }
-            StmtKind::While { cond, body } => {
+            StmtKind::While { cond, invariant: _, body } => {
                 ctx.b.block_void();
                 ctx.nesting += 1;
                 let t_break = ctx.nesting;
@@ -3717,8 +3774,9 @@ impl<'a> WasmCompiler<'a> {
                             .position(|v| v.name == variant_name)
                             .expect("variant exists (checked)");
                         
-                        // allocate enum object: header + tag + unused payload
-                        ctx.b.i64_const(HDR + 16);
+                        // allocate enum object: header + tag (+ payloads)
+                        let n_words = 1usize;
+                        ctx.b.i64_const(HDR as i64 + 8 * n_words as i64);
                         ctx.b.call(self.h_alloc);
                         let tmp = ctx.b.new_local(VT_I64);
                         ctx.b.local_tee(tmp);
@@ -3729,7 +3787,7 @@ impl<'a> WasmCompiler<'a> {
                         // write header
                         ctx.b.local_get(tmp);
                         ctx.b.i32_wrap_i64();
-                        ctx.b.i64_const(2 << 4 | TAG_STRUCT);
+                        ctx.b.i64_const((n_words as i64) << 4 | TAG_STRUCT);
                         ctx.b.i64_store(0);
                         ctx.b.local_get(tmp);
                         ctx.b.i32_wrap_i64();
@@ -3839,7 +3897,7 @@ impl<'a> WasmCompiler<'a> {
                 }
             },
             ExprKind::Bin(op, lhs, rhs) => self.binop(ctx, scope, *op, lhs, rhs),
-            ExprKind::Call(name, args) => self.call(ctx, scope, name, args, expected),
+            ExprKind::Call(name, _type_args, args) => self.call(ctx, scope, name, args, expected),
             ExprKind::Lambda(l) => {
                 // resolve captures against the current scope, record their
                 // types for the lifted function, and build the closure object
@@ -4016,10 +4074,10 @@ impl<'a> WasmCompiler<'a> {
             Pattern::Var(name) => {
                 frame.insert(name.clone(), (u32::MAX, scrut_ty.clone()));
             }
-            Pattern::VariantPayload(enum_name, variant_name, inner) => {
+            Pattern::VariantPayload(enum_name, variant_name, inners) => {
                 if let Some(variants) = self.enum_variants.get(enum_name.as_str()) {
                     if let Some(v) = variants.iter().find(|v| v.name == *variant_name) {
-                        if let Some(ref payload_ty) = v.payload {
+                        for (inner, payload_ty) in inners.iter().zip(v.payloads.iter()) {
                             self.pattern_types(inner, payload_ty, frame);
                         }
                     }
@@ -4054,26 +4112,25 @@ impl<'a> WasmCompiler<'a> {
             Pattern::Variant(_, _) => {
                 // Unit variant, no bindings
             }
-            Pattern::VariantPayload(enum_name, variant_name, inner) => {
+            Pattern::VariantPayload(enum_name, variant_name, inners) => {
                 let variants = self.enum_variants[enum_name.as_str()];
                 let variant = variants
                     .iter()
                     .find(|v| v.name == *variant_name)
                     .expect("variant exists");
                 
-                if let Some(ref payload_ty) = variant.payload {
-                    // Extract payload from enum object
+                for (i, (inner, payload_ty)) in inners.iter().zip(variant.payloads.iter()).enumerate()
+                {
                     let payload_local = ctx.b.new_local(valtype(payload_ty));
                     ctx.b.local_get(scrut_local);
                     ctx.b.i32_wrap_i64();
+                    let off = HDR as u32 + 8 * (i as u32 + 1);
                     if *payload_ty == Type::Float {
-                        ctx.b.f64_load(HDR as u32 + 8);
+                        ctx.b.f64_load(off);
                     } else {
-                        ctx.b.i64_load(HDR as u32 + 8);
+                        ctx.b.i64_load(off);
                     }
                     ctx.b.local_set(payload_local);
-                    
-                    // Recursively bind inner pattern
                     self.bind_pattern_vars(ctx, scope, inner, payload_local, payload_ty);
                 }
             }
@@ -4466,25 +4523,26 @@ impl<'a> WasmCompiler<'a> {
                             .position(|v| v.name == variant_name)
                             .expect("variant exists (checked)");
                         let variant = &variants[variant_idx];
+                        let n_payloads = variant.payloads.len();
+                        let n_words = 1 + n_payloads;
                         
-                        // allocate enum object: header + tag + payload
-                        ctx.b.i64_const(HDR + 16);
+                        // allocate enum object: header + tag + payload words
+                        ctx.b.i64_const(HDR as i64 + 8 * n_words as i64);
                         ctx.b.call(self.h_alloc);
                         let tmp = ctx.b.new_local(VT_I64);
                         ctx.b.local_tee(tmp);
                         let root = ctx.alloc_temp();
                         self.frame_store(ctx, root);
                         
-                        // write header: count=2 (tag+payload), tag=STRUCT
-                        // bitmap: bit 0 = 1 if payload is pointer
-                        let bitmap = if variant.payload.as_ref().map(is_ptr).unwrap_or(false) {
-                            1i64
-                        } else {
-                            0i64
-                        };
+                        let mut bitmap = 0i64;
+                        for (i, pty) in variant.payloads.iter().enumerate() {
+                            if is_ptr(pty) {
+                                bitmap |= 1 << i;
+                            }
+                        }
                         ctx.b.local_get(tmp);
                         ctx.b.i32_wrap_i64();
-                        ctx.b.i64_const(2 << 4 | TAG_STRUCT);
+                        ctx.b.i64_const((n_words as i64) << 4 | TAG_STRUCT);
                         ctx.b.i64_store(0);
                         ctx.b.local_get(tmp);
                         ctx.b.i32_wrap_i64();
@@ -4497,15 +4555,17 @@ impl<'a> WasmCompiler<'a> {
                         ctx.b.i64_const(variant_idx as i64);
                         ctx.b.i64_store(HDR as u32);
                         
-                        // write payload
-                        if let Some(ref payload_ty) = variant.payload {
+                        // write payloads
+                        for (i, (arg, payload_ty)) in args.iter().zip(variant.payloads.iter()).enumerate()
+                        {
                             ctx.b.local_get(tmp);
                             ctx.b.i32_wrap_i64();
-                            self.expr(ctx, scope, &args[0], Some(payload_ty));
+                            self.expr(ctx, scope, arg, Some(payload_ty));
+                            let off = HDR as u32 + 8 * (i as u32 + 1);
                             if *payload_ty == Type::Float {
-                                ctx.b.f64_store(HDR as u32 + 8);
+                                ctx.b.f64_store(off);
                             } else {
-                                ctx.b.i64_store(HDR as u32 + 8);
+                                ctx.b.i64_store(off);
                             }
                         }
                         
@@ -4612,7 +4672,7 @@ impl<'a> WasmCompiler<'a> {
                 l.params.iter().map(|p| p.ty.clone()).collect(),
                 Box::new(l.ret.clone()),
             ),
-            ExprKind::Call(name, args) => {
+            ExprKind::Call(name, _type_args, args) => {
                 if let Some((_, Type::Fn(_, ret))) = lookup(scope, name) {
                     return *ret;
                 }

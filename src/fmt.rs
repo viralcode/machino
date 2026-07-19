@@ -125,6 +125,7 @@ fn is_stmt_keyword(w: &str) -> bool {
             | "struct"
             | "import"
             | "enum"
+            | "invariant"
             | "match"
     )
 }
@@ -283,8 +284,14 @@ pub fn format_source(source: &str) -> String {
                         line = line.trim_end().to_string();
                         line.push_str(p);
                     }
-                    "<" if matches!(prev_sig, Some(FTok::Word(w)) if matches!(w.as_str(), "fn" | "struct" | "enum")) =>
+                    "<"
+                        if matches!(
+                            prev_sig,
+                            Some(FTok::Word(w))
+                                if matches!(w.as_str(), "fn" | "struct" | "enum")
+                        ) || matches!(prev_sig, Some(FTok::Punct(p)) if p == "::") =>
                     {
+                        // generic params / turbofish: no spaces inside `<...>`
                         generic_depth += 1;
                         line.push('<');
                     }

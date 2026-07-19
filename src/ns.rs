@@ -85,7 +85,7 @@ pub fn apply(program: &mut Program, segments: &[AliasedSegment]) {
     for e in &mut program.enums {
         let Some(i) = ns.segment_of(e.span) else { continue };
         for v in &mut e.variants {
-            if let Some(ty) = &mut v.payload {
+            for ty in &mut v.payloads {
                 ns.rewrite_type(ty, i);
             }
         }
@@ -165,8 +165,10 @@ impl<'a> Ns<'a> {
                 if let Some(new) = self.renames[seg].get(enum_name.as_str()) {
                     *enum_name = new.clone();
                 }
-                if let Pattern::VariantPayload(_, _, inner) = pat {
-                    self.rewrite_pattern(inner, seg);
+                if let Pattern::VariantPayload(_, _, inners) = pat {
+                    for inner in inners {
+                        self.rewrite_pattern(inner, seg);
+                    }
                 }
             }
             Pattern::Var(name) => self.bind(&name.clone()),
@@ -208,8 +210,15 @@ impl<'a> Ns<'a> {
                     self.rewrite_stmts(else_body, seg);
                     self.locals.pop();
                 }
-                StmtKind::While { cond, body } => {
+                StmtKind::While {
+                    cond,
+                    invariant,
+                    body,
+                } => {
                     self.rewrite_expr(cond, seg);
+                    if let Some(inv) = invariant {
+                        self.rewrite_expr(inv, seg);
+                    }
                     self.locals.push(Vec::new());
                     self.rewrite_stmts(body, seg);
                     self.locals.pop();
@@ -241,7 +250,7 @@ impl<'a> Ns<'a> {
                     *name = new;
                 }
             }
-            ExprKind::Call(name, args) => {
+            ExprKind::Call(name, _type_args, args) => {
                 if let Some(new) = self.rename_ref(name, seg) {
                     *name = new;
                 }

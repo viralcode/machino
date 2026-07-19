@@ -9,13 +9,13 @@ import "../packages/csv/csv.mno"
 
 fn main() {
     let logline = "user=alice id=42 status=ok"
-    print(regex_capture("\\d+", logline))
+    print(regex_capture("\\d+", logline, 0))
     print(regex_replace_all(" +", "a  b   c", "_"))
     print(enc_base64_encode("machino"))
     print(enc_hex_encode("OK"))
     let vars = strmap_new()
     strmap_set(vars, "name", "machino")
-    strmap_set(vars, "ver", "1.2")
+    strmap_set(vars, "ver", "1.3")
     print(tmpl_render("hello {{name}} v{{ver}}", vars))
     print(text_pad_left("7", 3, "0"))
     let rows = csv_parse("a,b\n1,2")
@@ -24,7 +24,7 @@ fn main() {
 
 test "text pipeline" {
     assert regex_is_match("\\d+", "ab12cd")
-    assert regex_capture("[0-9]+", "x99y") == "99"
+    assert regex_capture("[0-9]+", "x99y", 0) == "99"
     assert enc_hex_encode("A") == "41"
     assert text_replace("a_b", "_", "/") == "a/b"
 }

@@ -1,0 +1,18 @@
+# Explicit type arguments at call sites (turbofish).
+fn<T> id(x: T) -> T {
+    return x
+}
+
+fn<T, U> fst(a: T, b: U) -> T {
+    return a
+}
+
+fn main() {
+    print(id::<int>(7))
+}
+
+test "turbofish" {
+    assert id::<int>(7) == 7
+    assert id::<bool>(true)
+    assert fst::<int, str>(3, "x") == 3
+}

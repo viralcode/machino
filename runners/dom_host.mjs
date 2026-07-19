@@ -9,6 +9,11 @@ export function createDomHost({ readStr, makeStr, mode = "virtual" }) {
   let exports = null;
   let lastEventType = "";
   let lastEventTarget = 0;
+  let lastEventX = 0;
+  let lastEventY = 0;
+  let lastEventKey = "";
+  let lastEventButton = 0;
+  let lastEventValue = "";
   // key: `${elHandle}:${event}` -> handler name
   const listeners = new Map();
 
@@ -49,9 +54,29 @@ export function createDomHost({ readStr, makeStr, mode = "virtual" }) {
     if (n.el) n.el.className = n.attrs.class;
   }
 
-  function fire(elH, event) {
+  function eventFields(ev) {
+    if (!ev || typeof ev !== "object") {
+      return { x: 0, y: 0, key: "", button: 0, value: "" };
+    }
+    const x = Number(ev.clientX ?? ev.pageX ?? 0);
+    const y = Number(ev.clientY ?? ev.pageY ?? 0);
+    const key = typeof ev.key === "string" ? ev.key : "";
+    const button = Number(ev.button ?? 0);
+    let value = "";
+    if (typeof ev.data === "string") value = ev.data;
+    else if (ev.target && typeof ev.target.value === "string") value = ev.target.value;
+    return { x, y, key, button, value };
+  }
+
+  function fire(elH, event, ev = null, overrides = null) {
     lastEventType = event;
     lastEventTarget = Number(elH);
+    const f = overrides ?? eventFields(ev);
+    lastEventX = f.x;
+    lastEventY = f.y;
+    lastEventKey = f.key;
+    lastEventButton = f.button;
+    lastEventValue = f.value;
     const key = `${Number(elH)}:${event}`;
     const handler = listeners.get(key);
     if (!handler || !exports) return;
@@ -68,7 +93,7 @@ export function createDomHost({ readStr, makeStr, mode = "virtual" }) {
     if (n._bound && n._bound.has(event)) return;
     if (!n._bound) n._bound = new Set();
     n._bound.add(event);
-    n.el.addEventListener(event, () => fire(elH, event));
+    n.el.addEventListener(event, (ev) => fire(elH, event, ev));
   }
 
   const api = {
@@ -376,11 +401,35 @@ export function createDomHost({ readStr, makeStr, mode = "virtual" }) {
     dom_dispatch(h, eventAddr) {
       fire(h, readStr(eventAddr));
     },
+    dom_dispatch_event(h, eventAddr, x, y, keyAddr, button, valueAddr) {
+      fire(h, readStr(eventAddr), null, {
+        x: Number(x),
+        y: Number(y),
+        key: readStr(keyAddr),
+        button: Number(button),
+        value: readStr(valueAddr),
+      });
+    },
     dom_last_event_type() {
       return makeStr(lastEventType);
     },
     dom_last_event_target() {
       return BigInt(lastEventTarget);
+    },
+    dom_last_event_x() {
+      return BigInt(lastEventX);
+    },
+    dom_last_event_y() {
+      return BigInt(lastEventY);
+    },
+    dom_last_event_key() {
+      return makeStr(lastEventKey);
+    },
+    dom_last_event_button() {
+      return BigInt(lastEventButton);
+    },
+    dom_last_event_value() {
+      return makeStr(lastEventValue);
     },
   };
 
