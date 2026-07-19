@@ -1,0 +1,54 @@
+# Connect to a local MongoDB and fetch documents.
+#
+# Prerequisites:
+#   - MongoDB listening on mongodb://127.0.0.1:27017
+#   - `mongosh` on PATH
+#
+# Seed (once):
+#   mongosh mongodb://127.0.0.1:27017/machino --eval '
+#     db.users.deleteMany({});
+#     db.users.insertMany([
+#       { name: "ada", role: "engineer", score: 98 },
+#       { name: "grace", role: "engineer", score: 95 },
+#       { name: "alan", role: "researcher", score: 91 }
+#     ])'
+#
+# Run:
+#   machino run examples/pkg_mongo_local.mno
+
+import "../packages/db/db.mno"
+
+fn main() {
+    let h = db_connect_mongo("mongodb://127.0.0.1:27017/machino")
+    print("connected handle=" + str_of_int(h))
+
+    # mongosh JS — result comes back as JSON wrapper from the host
+    let all = db_mongo_eval(
+        h,
+        "JSON.stringify(db.users.find({}, { _id: 0 }).toArray())"
+    )
+    print(all)
+
+    let engineers = db_mongo_eval(
+        h,
+        "JSON.stringify(db.users.find({ role: 'engineer' }, { _id: 0 }).toArray())"
+    )
+    print(engineers)
+
+    let count = db_mongo_eval(h, "JSON.stringify({ count: db.users.countDocuments({}) })")
+    print(count)
+
+    db_close(h)
+}
+
+test "mongo local fetch" {
+    let h = db_connect_mongo("mongodb://127.0.0.1:27017/machino")
+    let all = db_mongo_eval(
+        h,
+        "JSON.stringify(db.users.find({}, { _id: 0 }).toArray())"
+    )
+    assert db_ok(all)
+    assert contains(all, "ada")
+    assert contains(all, "grace")
+    db_close(h)
+}

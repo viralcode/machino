@@ -111,6 +111,7 @@ a practical subset (not full PCRE). DOM is capability-based via `extern fn`.
 | [`examples/pkg_dom_ui.mno`](../examples/pkg_dom_ui.mno) | dom (browser + virtual) |
 | [`examples/pkg_dom_events.mno`](../examples/pkg_dom_events.mno) | dom events + vdom |
 | [`examples/pkg_db_demo.mno`](../examples/pkg_db_demo.mno) | db memory / SQL / mongo drivers |
+| [`examples/pkg_mongo_local.mno`](../examples/pkg_mongo_local.mno) | **live** local MongoDB `find` / count |
 | [`examples/pkg_science.mno`](../examples/pkg_science.mno) | statsadv, signal, sortx, bigint, geom2d, … |
 
 ## Try the demo

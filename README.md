@@ -240,6 +240,7 @@ Curated demos live in [`examples/`](examples/). A 100-file language corpus (each
 | [`examples/pkg_dom_ui.mno`](examples/pkg_dom_ui.mno) | Packages: DOM (virtual + browser WASM) |
 | [`examples/pkg_dom_events.mno`](examples/pkg_dom_events.mno) | Packages: DOM events + vdom |
 | [`examples/pkg_db_demo.mno`](examples/pkg_db_demo.mno) | Packages: db drivers (memory / SQL / mongo) |
+| [`examples/pkg_mongo_local.mno`](examples/pkg_mongo_local.mno) | Live local MongoDB fetch via `mongosh` |
 | [`examples/pkg_science.mno`](examples/pkg_science.mno) | Packages: statsadv / signal / bigint / geom2d |
 
 ### `test/` — 100 language examples + services
