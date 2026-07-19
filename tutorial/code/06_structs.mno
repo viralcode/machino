@@ -1,0 +1,25 @@
+# Lesson 06 — Structs (nominal records, reference semantics)
+
+struct Point {
+    x: float
+    y: float
+}
+
+fn dist2(a: Point, b: Point) -> float {
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    return dx * dx + dy * dy
+}
+
+fn main() {
+    let p = Point(0.0, 0.0)
+    let q = Point(3.0, 4.0)
+    p.x = 1.0
+    print(dist2(p, q))
+}
+
+test "point distance" {
+    let a = Point(0.0, 0.0)
+    let b = Point(3.0, 4.0)
+    assert dist2(a, b) == 25.0
+}

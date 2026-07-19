@@ -1,0 +1,32 @@
+# Lesson 09 — Generics with constraint bounds
+# Bounds: Eq, Ord, Num, Hash. Combine with + or where.
+
+fn<T: Ord> max2(a: T, b: T) -> T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn<T: Num> twice(x: T) -> T {
+    return x + x
+}
+
+struct<T> Box {
+    val: T
+}
+
+fn main() {
+    print(max2(3, 7))
+    print(max2(2.5, 1.0))
+    print(twice(21))
+    let b = Box(99)
+    print(b.val)
+}
+
+test "generics" {
+    assert max2(1, 2) == 2
+    assert twice(5) == 10
+    let b = Box("hi")
+    assert b.val == "hi"
+}

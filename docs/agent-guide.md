@@ -247,8 +247,12 @@ imported names stay global (collisions are errors).
 - `machino check file.mno --verify` — static contract proofs with Z3 for
   int/bool functions; calls are inlined and constant `for` loops unrolled
   (build with `--features smt`)
-- `machino build file.mno --gc` — WASM-GC backend, full language support;
-  run with `node runners/run-gc.mjs` (Node 22+)
+- `machino build file.mno --gc` — WASM-GC backend (externs, channels,
+  spawn with int/bool args); run with `node runners/run-gc.mjs` (Node 22+)
+- `machino build file.mno --native` — AOT the linear `.wasm` with
+  `wasmtime compile` (wasmtime on PATH). Prefer `machino run` for OS
+  capabilities (TCP, files); see `docs/native-runtime.md`
+- Type annotations may name generic apps: `let m: HashMap<str, int> = …`
 
 ## Error codes you will see most
 

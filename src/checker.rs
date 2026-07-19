@@ -64,6 +64,10 @@ pub fn apply_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             ps.iter().map(|p| apply_subst(p, subst)).collect(),
             Box::new(apply_subst(r, subst)),
         ),
+        Type::App(name, args) => Type::App(
+            name.clone(),
+            args.iter().map(|a| apply_subst(a, subst)).collect(),
+        ),
         _ => ty.clone(),
     }
 }
@@ -335,6 +339,21 @@ impl<'a> Checker<'a> {
 
     fn expand_generic_nominal(&mut self, ty: &Type) -> Type {
         match ty {
+            Type::App(name, args) => {
+                let args: Vec<Type> = args
+                    .iter()
+                    .map(|a| self.expand_generic_nominal(a))
+                    .collect();
+                if self.program.structs.iter().any(|s| s.name == *name) {
+                    self.ensure_struct_instance(name, &args);
+                    Type::Struct(mangle(name, &args))
+                } else if self.program.enums.iter().any(|e| e.name == *name) {
+                    self.ensure_enum_instance(name, &args);
+                    Type::Enum(mangle(name, &args))
+                } else {
+                    Type::App(name.clone(), args)
+                }
+            }
             Type::Struct(name) => {
                 if let Some(sd) = self.program.structs.iter().find(|s| s.name == *name) {
                     if !sd.type_params.is_empty()
@@ -995,20 +1014,23 @@ impl<'a> Checker<'a> {
                 self.generic_fns.insert(f.name.clone(), idx);
             }
             self.enter_type_params(&f.type_params);
-            for p in &f.params {
-                self.validate_type(&p.ty, p.span);
-            }
+            let params: Vec<Type> = f
+                .params
+                .iter()
+                .map(|p| {
+                    self.validate_type(&p.ty, p.span);
+                    self.concretize_type(&p.ty, p.span)
+                })
+                .collect();
             self.validate_type(&f.ret, f.span);
+            let ret = self.concretize_type(&f.ret, f.span);
             self.exit_type_params();
             if f.is_extern {
                 self.validate_extern_types(f);
             }
             self.signatures.insert(
                 f.name.clone(),
-                Signature {
-                    params: f.params.iter().map(|p| p.ty.clone()).collect(),
-                    ret: f.ret.clone(),
-                },
+                Signature { params, ret },
             );
         }
 
@@ -1036,6 +1058,127 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Resolve `Name<T,...>` applications to mangled struct/enum types and
+    /// ensure the concrete instantiation exists. Other types are normalized.
+    fn concretize_type(&mut self, ty: &Type, span: Span) -> Type {
+        match ty {
+            Type::App(name, args) => {
+                let args: Vec<Type> = args
+                    .iter()
+                    .map(|a| self.concretize_type(a, span))
+                    .collect();
+                for a in &args {
+                    self.validate_type(a, span);
+                }
+                if let Some(sd) = self.program.structs.iter().find(|s| s.name == *name) {
+                    if sd.type_params.is_empty() {
+                        self.diags.push(
+                            Diagnostic::new(
+                                "E018",
+                                format!("type '{}' is not generic", name),
+                                span,
+                            )
+                            .with_help("omit the type arguments, or declare type parameters on the struct"),
+                        );
+                        return Type::Struct(name.clone());
+                    }
+                    if sd.type_params.len() != args.len() {
+                        self.diags.push(Diagnostic::new(
+                            "E018",
+                            format!(
+                                "type '{}' expects {} type argument(s), found {}",
+                                name,
+                                sd.type_params.len(),
+                                args.len()
+                            ),
+                            span,
+                        ));
+                        return Type::App(name.clone(), args);
+                    }
+                    for (tp, ta) in sd.type_params.iter().zip(args.iter()) {
+                        for b in &tp.bounds {
+                            if !self.satisfies_bound(ta, b) {
+                                self.diags.push(
+                                    Diagnostic::new(
+                                        "E069",
+                                        format!(
+                                            "type '{}' does not satisfy bound '{}' required by '{}<...>'",
+                                            ta, b, name
+                                        ),
+                                        span,
+                                    )
+                                    .with_help(bound_help(b)),
+                                );
+                            }
+                        }
+                    }
+                    self.ensure_struct_instance(name, &args);
+                    return Type::Struct(mangle(name, &args));
+                }
+                if let Some(ed) = self.program.enums.iter().find(|e| e.name == *name) {
+                    if ed.type_params.is_empty() {
+                        self.diags.push(
+                            Diagnostic::new(
+                                "E018",
+                                format!("type '{}' is not generic", name),
+                                span,
+                            )
+                            .with_help("omit the type arguments, or declare type parameters on the enum"),
+                        );
+                        return Type::Enum(name.clone());
+                    }
+                    if ed.type_params.len() != args.len() {
+                        self.diags.push(Diagnostic::new(
+                            "E018",
+                            format!(
+                                "type '{}' expects {} type argument(s), found {}",
+                                name,
+                                ed.type_params.len(),
+                                args.len()
+                            ),
+                            span,
+                        ));
+                        return Type::App(name.clone(), args);
+                    }
+                    for (tp, ta) in ed.type_params.iter().zip(args.iter()) {
+                        for b in &tp.bounds {
+                            if !self.satisfies_bound(ta, b) {
+                                self.diags.push(
+                                    Diagnostic::new(
+                                        "E069",
+                                        format!(
+                                            "type '{}' does not satisfy bound '{}' required by '{}<...>'",
+                                            ta, b, name
+                                        ),
+                                        span,
+                                    )
+                                    .with_help(bound_help(b)),
+                                );
+                            }
+                        }
+                    }
+                    self.ensure_enum_instance(name, &args);
+                    return Type::Enum(mangle(name, &args));
+                }
+                self.diags.push(
+                    Diagnostic::new("E018", format!("unknown type '{}'", name), span).with_help(
+                        "valid types: int, float, bool, str, [T], fn(T...) -> R, Name<T,...>, or a declared struct/enum",
+                    ),
+                );
+                Type::App(name.clone(), args)
+            }
+            Type::Array(inner) => Type::Array(Box::new(self.concretize_type(inner, span))),
+            Type::Fn(params, ret) => Type::Fn(
+                params
+                    .iter()
+                    .map(|p| self.concretize_type(p, span))
+                    .collect(),
+                Box::new(self.concretize_type(ret, span)),
+            ),
+            other => self.normalize_type(other),
+        }
+    }
+
     fn validate_type(&mut self, ty: &Type, span: Span) {
         match ty {
             Type::TypeVar(name) => {
@@ -1047,23 +1190,40 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+            Type::App(_, _) => {
+                let _ = self.concretize_type(ty, span);
+            }
             Type::Struct(name) => {
                 if !self.structs.contains_key(name)
                     && !self.enums.contains_key(name)
                     && !self.mangle_map.borrow().contains_key(name)
                 {
-                    self.diags.push(
-                        Diagnostic::new("E018", format!("unknown type '{}'", name), span).with_help(
-                            "valid types: int, float, bool, str, [T], fn(T...) -> R, or a declared struct/enum",
-                        ),
-                    );
+                    // Bare generic template names are allowed in signatures of
+                    // generic items; applications must use Name<T,...>.
+                    let is_generic_template = self
+                        .program
+                        .structs
+                        .iter()
+                        .any(|s| s.name == *name && !s.type_params.is_empty())
+                        || self
+                            .program
+                            .enums
+                            .iter()
+                            .any(|e| e.name == *name && !e.type_params.is_empty());
+                    if !is_generic_template {
+                        self.diags.push(
+                            Diagnostic::new("E018", format!("unknown type '{}'", name), span).with_help(
+                                "valid types: int, float, bool, str, [T], fn(T...) -> R, Name<T,...>, or a declared struct/enum",
+                            ),
+                        );
+                    }
                 }
             }
             Type::Enum(name) => {
                 if !self.enums.contains_key(name) && !self.mangle_map.borrow().contains_key(name) {
                     self.diags.push(
                         Diagnostic::new("E018", format!("unknown enum '{}'", name), span).with_help(
-                            "valid types: int, float, bool, str, [T], fn(T...) -> R, or a declared struct/enum",
+                            "valid types: int, float, bool, str, [T], fn(T...) -> R, Name<T,...>, or a declared struct/enum",
                         ),
                     );
                 }
@@ -1212,29 +1372,30 @@ impl<'a> Checker<'a> {
     fn check_stmt(&mut self, stmt: &Stmt, scope: &mut Scope, ret: &Type, in_test: bool) {
         match &stmt.kind {
             StmtKind::Let { name, ty, value } => {
-                if let Some(t) = ty {
+                let annotated = ty.as_ref().map(|t| {
                     self.validate_type(t, stmt.span);
-                }
-                let inferred = self.infer(value, scope, ty.as_ref());
-                let final_ty = match (ty, inferred) {
+                    self.concretize_type(t, stmt.span)
+                });
+                let inferred = self.infer(value, scope, annotated.as_ref());
+                let final_ty = match (annotated, inferred) {
                     (Some(annotated), Some(actual)) => {
-                        if !self.types_equal(annotated, &actual) {
+                        if !self.types_equal(&annotated, &actual) {
                             self.diags.push(
                                 Diagnostic::new(
                                     "E030",
                                     format!(
                                         "type mismatch: '{}' is declared as '{}' but the value has type '{}'",
                                         name,
-                                        self.normalize_type(annotated),
+                                        self.normalize_type(&annotated),
                                         self.normalize_type(&actual)
                                     ),
                                     value.span,
                                 ),
                             );
                         }
-                        self.normalize_type(annotated)
+                        self.normalize_type(&annotated)
                     }
-                    (Some(annotated), None) => annotated.clone(),
+                    (Some(annotated), None) => annotated,
                     (None, Some(actual)) => actual,
                     (None, None) => Type::Int, // error already reported
                 };

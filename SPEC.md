@@ -1,4 +1,4 @@
-# The machino Language Specification (v1.1)
+# The machino Language Specification (v1.2)
 
 machino is an AI-first programming language. It is designed for code that is
 *written and verified by machines*: the syntax is small and canonical, the
@@ -344,7 +344,8 @@ runner (`runners/run.mjs`) implements the task protocol with
 `worker_threads`, `SharedArrayBuffer`, and `Atomics`; task modules import
 `task_spawn` / `task_join_*` only when the program actually uses
 concurrency, so ordinary modules still run on hosts without threads. The
-WASM-GC backend has no thread support (`E072` with `--gc`).
+WASM-GC backend supports threads/channels via host imports (`runners/run-gc.mjs`);
+spawn arguments under `--gc` are currently int/bool only.
 
 ## Standard prelude
 
@@ -460,22 +461,24 @@ fn<T, U> pair_max(a: T, b: T, tag: U) -> T where T: Ord + Num, U: Eq {
 - `struct<T>`/`enum<T>` may be constructed directly (`Box(42)`,
   `HashMap(ks, vs, buckets, cap)`); the compiler monomorphizes each
   distinct instantiation (`HashMap$str$int`) before codegen, the same
-  way it does for generic functions. Type arguments are inferred at the
-  constructor site — there is no turbofish or `HashMap<str, int>`
-  annotation syntax yet.
+  way it does for generic functions. Type arguments may also be written
+  in annotations: `let m: HashMap<str, int> = …` (nested apps and `>>`
+  are supported). Call-site turbofish remains unsupported — inference
+  is still the default at calls.
 
 ## Static verification (`machino check --verify`)
 
 Built with `--features smt` (Z3), the verifier symbolically executes a
-decidable subset — functions over `int`/`bool` (array `len`/indexing and
-struct fields become uninterpreted symbols), where calls to other int/bool
-functions are **inlined** (up to depth 8; deeper recursion reports
-`unknown`) and `for` loops with constant bounds are **unrolled** (up to
-128 iterations) — and reports, per function: contracts **proved**, a
-**counterexample** (concrete argument values violating an `ensures`), or
-**vacuous requires** (no input can satisfy them). Functions outside the
-subset (while loops, floats, strings) are skipped and still enforced at
-runtime, as always.
+decidable subset — functions over `int`/`bool`/`float` (floats as
+mathematical reals; array/`str` `len` and struct fields become
+uninterpreted symbols), where calls to other int/bool/float functions
+are **inlined** (up to depth 8; deeper recursion reports `unknown`),
+`for` loops with constant bounds are **unrolled** (up to 128
+iterations), and `while i < N` / `while i <= N` loops that start from a
+constant and step by one are unrolled the same way — and reports, per
+function: contracts **proved**, a **counterexample**, or **vacuous
+requires**. String lite: `len(s)` and `s == t` on string parameters.
+Everything else stays runtime-checked.
 
 ## Tooling
 
@@ -500,23 +503,25 @@ runtime, as always.
   package and uploads it to a registry over HTTP (client side; running a
   registry server is out of scope).
 
-## Known limits (v1.1)
+## Known limits (v1.2)
 
 - Compiled `spawn` targets must be named top-level functions (`E074`);
   lambdas and function-typed variables spawn in the interpreter only.
-  Spawned functions must return a scalar (`E071`). The WASM-GC backend
-  has no thread or channel support (`E072` with `--gc`).
-- Channels are host-mediated and work in the interpreter and the linear
-  WASM runner; cross-worker channel state in compiled WASM is best-effort
-  (prefer channels with the interpreter for multi-task messaging today).
+  Spawned functions must return a scalar (`E071`). Under `--gc`, spawn
+  arguments are currently int/bool only (float/str/struct args need the
+  linear backend or `machino run`).
+- Channels are host-mediated; the linear and GC Node runners share
+  channel state across workers via SharedArrayBuffer queues.
 - Strings are UTF-8 byte strings: `len`/`char_at`/`substr`/`chr` are
   byte-indexed; use `len_cp`/`char_at_cp`/`substr_cp`/`chr_cp` for
   Unicode scalar values.
-- The WASM-GC backend provides no extern fns beyond print/fail and needs
-  a GC-capable host (Node 22+, modern browsers). Integer overflow traps
-  on both backends with matching messages.
-- SMT verification covers int/bool contracts with bounded inlining and
-  loop unrolling; floats, strings, and while loops stay runtime-checked.
+- The WASM-GC backend needs a GC-capable host (Node 22+, modern
+  browsers). Externs (Node subset), channels, and spawn/join are
+  supported; `args()` returning `[str]` is native-runtime only.
+  Integer overflow traps on both backends with matching messages.
+- SMT verification covers int/bool/float and string-lite contracts with
+  bounded inlining and loop unrolling; richer string ops and unbounded
+  `while` stay runtime-checked.
 - Enum variants carry at most one payload value; 255 variants max.
 - Contracts on `extern fn`s are enforced by the interpreter but not in
   compiled WASM.
@@ -531,7 +536,8 @@ runtime, as always.
 
 - Hosted public registry service (`pkg publish` already speaks the
   protocol; the server itself is out of scope for the toolchain)
-- Cross-worker channel sharing in compiled WASM hosts
-- Generic type-argument syntax in annotations (`let m: HashMap<str, int>`)
+- GC spawn of float/str/struct arguments
+- Call-site turbofish (`foo::<int>(x)`)
+- User-written loop invariants for unbounded `while` proofs
 
 

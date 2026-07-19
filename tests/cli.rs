@@ -919,6 +919,86 @@ fn build_compiles_concurrency_and_runs_it() {
 }
 
 #[test]
+fn gc_extern_channel_spawn() {
+    let path = write_temp(
+        "gc_parity.mno",
+        r#"extern fn clock_ms() -> int
+
+fn square(n: int) -> int {
+    return n * n
+}
+
+fn main() {
+    print(clock_ms() > 0)
+    let ch = chan_new()
+    chan_send_int(ch, 3)
+    print(chan_recv_int(ch))
+    chan_close(ch)
+    let h = spawn(square, 11)
+    print(join_int(h))
+}
+"#,
+    );
+    let wasm = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gc_parity.wasm");
+    let built = machino(&[
+        "build",
+        "--gc",
+        "--no-cache",
+        path.to_str().unwrap(),
+        "-o",
+        wasm.to_str().unwrap(),
+    ]);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let runner = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runners/run-gc.mjs");
+    let out = std::process::Command::new("node")
+        .args([runner.to_str().unwrap(), wasm.to_str().unwrap()])
+        .output()
+        .expect("node");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("true\n"), "{}", s);
+    assert!(s.contains("3\n"), "{}", s);
+    assert!(s.contains("121\n"), "{}", s);
+}
+
+#[test]
+fn hashmap_type_annotation() {
+    let path = write_temp(
+        "hm_ann.mno",
+        r#"fn main() {
+    let ks: [str] = []
+    let vs: [int] = []
+    let m: HashMap<str, int> = HashMap(ks, vs, empty_buckets(8), 8)
+    hashmap_set(m, "a", 1)
+    print(hashmap_get(m, "a"))
+}
+
+test "ann" {
+    let ks: [str] = []
+    let vs: [int] = []
+    let m: HashMap<str, int> = HashMap(ks, vs, empty_buckets(8), 8)
+    hashmap_set(m, "a", 1)
+    assert hashmap_get(m, "a") == 1
+}
+"#,
+    );
+    let out = machino(&["test", path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn generic_hashmap_and_unicode_and_channels() {
     let path = write_temp(
         "v11.mno",
@@ -966,6 +1046,81 @@ fn main() {
         built.status.success(),
         "{}",
         String::from_utf8_lossy(&built.stderr)
+    );
+}
+
+#[test]
+#[cfg(feature = "smt")]
+fn verify_float_and_bounded_while() {
+    let path = write_temp(
+        "smt_v12.mno",
+        r#"fn add1(x: float) -> float
+ensures result > x
+{
+    return x + 1.0
+}
+
+fn sum_while() -> int
+ensures result == 45
+{
+    let i = 0
+    let s = 0
+    while i < 10 {
+        s = s + i
+        i = i + 1
+    }
+    return s
+}
+
+fn main() {}
+"#,
+    );
+    let out = machino(&["check", path.to_str().unwrap(), "--verify"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("add1") && text.contains("proved"), "{}", text);
+    assert!(
+        text.contains("sum_while") && text.contains("proved"),
+        "{}",
+        text
+    );
+}
+
+#[test]
+fn build_native_aot_smoke() {
+    if Command::new("wasmtime").arg("--version").output().is_err() {
+        return;
+    }
+    let path = write_temp(
+        "native_aot.mno",
+        "fn main() {\n    print(1 + 1)\n}\n",
+    );
+    let wasm = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native_aot.wasm");
+    let out = machino(&[
+        "build",
+        "--native",
+        "--no-cache",
+        path.to_str().unwrap(),
+        "-o",
+        wasm.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        wasm.with_extension("cwasm").is_file(),
+        "expected {}.cwasm",
+        wasm.with_extension("").display()
     );
 }
 

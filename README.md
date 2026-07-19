@@ -60,6 +60,11 @@ cargo build --release              # zero dependencies, builds in seconds
 ./target/release/machino test examples/sort.mno
 ```
 
+**New to machino?** Work through the progressive tutorial — hello → contracts →
+generics → concurrency → native I/O → SMT → deploy:
+
+→ **[tutorial/](tutorial/)** ([start here](tutorial/README.md))
+
 Compile to a portable binary and run it anywhere:
 
 ```sh
@@ -162,12 +167,22 @@ Full details in [SPEC.md](SPEC.md), the formal grammar in [docs/grammar.ebnf](do
 | `machino check [--json] [--verify]` | typecheck; `--verify` statically proves contracts with Z3 (build with `--features smt`) |
 | `machino test [--json]` | run `test` blocks, including `expects` snapshots |
 | `machino run [--trace]` | interpret; `--trace` streams `{"event":"call",...}` JSON per user function call to stderr |
-| `machino build [-o out.wasm] [--gc] [--stack-mib N] [--no-cache]` | compile to WebAssembly (content-hash cached); `--gc` targets the WASM-GC proposal instead of linear memory |
+| `machino build [-o out.wasm] [--gc] [--native] [--stack-mib N] [--no-cache]` | compile to WebAssembly (content-hash cached); `--gc` → WASM-GC; `--native` → `wasmtime compile` AOT of the linear module |
 | `machino fmt [--check\|--stdout]` | canonical formatter; refuses any edit that would change the token stream |
 | `machino query file.mno [name]` | machine-readable signatures, generics, contracts of every top-level item |
 | `machino fuzz [--runs N]` | random-input property testing driven by `requires`/`ensures` |
 | `machino synth` | generate a verified training corpus |
 | `machino pkg init/add/sync/publish` | package manager + registry client |
+
+## Tutorial
+
+Step-by-step from basics to the full language (runnable lessons under
+[`tutorial/code/`](tutorial/code/)):
+
+**[tutorial/README.md](tutorial/README.md)** — hello, types, control flow,
+functions, arrays/strings, structs, enums, contracts, generics, closures,
+HashMap, JSON/stdlib, concurrency, native externs, SMT verify, WASM/GC/AOT
+deploy, packages, and the agent toolchain loop.
 
 ## Examples
 
@@ -234,17 +249,17 @@ for f in test/ex_*.mno; do ./target/release/machino test "$f" || exit 1; done
 
 ## Status and roadmap
 
-This is **v1.1**. Everything above is implemented and covered by the end-to-end suite: interpreter/WASM byte-for-byte output parity for every language feature — on **both** backends — including generic structs/`HashMap`, channels, Unicode codepoint APIs, and trapping integer overflow on the GC backend.
+This is **v1.2**. Deploy paths are aligned: `machino run` is the official native OS runtime ([docs/native-runtime.md](docs/native-runtime.md)); linear and `--gc` WASM both support externs, channels, and spawn/join; annotations accept `HashMap<str, int>`; SMT covers floats and bounded `while`.
 
-What 1.1 closed out (on top of 1.0):
+What 1.2 closed out (on top of 1.1):
 
-- **Generic structs/enums constructed directly** — `Box(42)`, `HashMap(ks, vs, …)`; monomorphized like generic functions (no more E066).
-- **`HashMap` + `Hash` bound** — open-addressing generic map; `hash()` builtin for `int`/`bool`/`str`.
-- **Channels** — `chan_new` / `chan_send_*` / `chan_recv_*` / `chan_close` for typed message passing (interpreter + linear WASM; rejected under `--gc` with E072).
-- **Unicode codepoint APIs** — `len_cp`, `char_at_cp`, `substr_cp`, `chr_cp` (byte APIs unchanged).
-- **GC backend overflow parity** — integer `+ - * / %` trap with the same `runtime error:` messages as the linear backend.
+- **Generic type annotations** — `let m: HashMap<str, int> = …`
+- **WASM-GC parity** — extern imports, channels, spawn/join (int/bool spawn args); `runners/run-gc.mjs` host
+- **Cross-worker channels** — SharedArrayBuffer queues in `runners/run.mjs`
+- **Native story** — documented `machino run` capabilities; `machino build --native` AOT via `wasmtime compile`
+- **SMT expansion** — float (reals), string-lite (`len`/`==`), bounded `while i < N` unrolling
 
-**Remaining bounds:** SMT verification covers int/bool contracts (floats, strings, and unbounded loops fall back to always-on runtime enforcement); compiled spawn targets must be named top-level functions; channels under `--gc` and cross-worker channel sharing in compiled WASM are not yet supported; the WASM-GC host needs Node 22+. A hosted package registry stays out of the toolchain — `pkg publish` speaks the protocol.
+**Remaining bounds:** GC spawn of float/str/struct args; call-site turbofish; unbounded `while` proofs (no invariant syntax yet); hosted package registry stays out of the toolchain.
 
 ## License
 

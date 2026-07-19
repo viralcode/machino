@@ -140,6 +140,14 @@ impl<'a> Ns<'a> {
                     *name = new.clone();
                 }
             }
+            Type::App(name, args) => {
+                if let Some(new) = self.renames[seg].get(name.as_str()) {
+                    *name = new.clone();
+                }
+                for a in args {
+                    self.rewrite_type(a, seg);
+                }
+            }
             Type::Array(inner) => self.rewrite_type(inner, seg),
             Type::Fn(params, ret) => {
                 for p in params {

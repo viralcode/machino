@@ -1,4 +1,6 @@
-# Generic HashMap set/get with a type annotation.
+# Lesson 11 — HashMap and typed annotations
+# Construct with empty typed key/value arrays + empty_buckets.
+
 fn main() {
     let ks: [str] = []
     let vs: [int] = []
@@ -6,15 +8,17 @@ fn main() {
     hashmap_set(m, "a", 1)
     hashmap_set(m, "b", 2)
     print(hashmap_get(m, "a"))
+    print(hashmap_get_or(m, "z", -1))
+    print(hashmap_has(m, "b"))
+    print(hashmap_len(m))
 }
 
 test "hashmap" {
     let ks: [str] = []
     let vs: [int] = []
     let m: HashMap<str, int> = HashMap(ks, vs, empty_buckets(8), 8)
-    hashmap_set(m, "a", 1)
-    hashmap_set(m, "b", 2)
-    assert hashmap_get(m, "a") == 1
-    assert hashmap_get_or(m, "z", -1) == -1
-    assert hashmap_len(m) == 2
+    hashmap_set(m, "x", 10)
+    assert hashmap_get(m, "x") == 10
+    assert hashmap_len(m) == 1
+    assert hashmap_has(m, "x")
 }

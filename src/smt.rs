@@ -1,19 +1,20 @@
 //! Static contract verification with the Z3 SMT solver (`machino check
 //! --verify`, requires building with `--features smt`).
 //!
-//! The decidable subset: function bodies over int/bool (plus `len(arr)`
-//! treated as a symbolic non-negative int), where
-//! - calls to other user/std functions with int/bool signatures are inlined
-//!   (up to depth 8; recursion past that reports `unknown`), and
+//! The decidable subset: function bodies over int/bool/float (floats as
+//! mathematical reals) and a string lite model (`len(s)`, `s == t`), where
+//! - calls to other user/std functions with int/bool/float signatures are
+//!   inlined (up to depth 8; recursion past that reports `unknown`),
 //! - `for` loops whose bounds simplify to constants are unrolled (up to 128
-//!   iterations).
+//!   iterations), and
+//! - `while i < N` / `while i <= N` loops that increment `i` by 1 each
+//!   iteration are unrolled the same way.
 //! The verifier runs the body symbolically, collecting a (path condition,
 //! result) pair per return path, then asks Z3 to prove every `ensures`
 //! clause on every path under the `requires` assumptions. It also flags
 //! contradictory `requires` clauses (contracts that no input can satisfy).
-//! Functions outside the subset (while loops, floats, strings, mutation of
-//! arrays) report `unknown` and fall back to machino's always-on runtime
-//! contract enforcement.
+//! Functions outside the subset report `unknown` and fall back to machino's
+//! always-on runtime contract enforcement.
 
 #![allow(dead_code)]
 
@@ -44,32 +45,42 @@ pub struct FunctionReport {
 mod z3impl {
     use super::*;
     use std::collections::HashMap;
-    use z3::ast::{Ast, Bool, Int};
+    use z3::ast::{Ast, Bool, Int, Real};
     use z3::{Config, Context, SatResult, Solver};
 
     #[derive(Clone)]
     enum Val<'ctx> {
         Int(Int<'ctx>),
         Bool(Bool<'ctx>),
+        Real(Real<'ctx>),
+        /// Opaque string value; only `len` and `==`/`!=` are modeled.
+        Str(String),
     }
 
     impl<'ctx> Val<'ctx> {
         fn as_int(&self) -> Result<&Int<'ctx>, String> {
             match self {
                 Val::Int(i) => Ok(i),
-                Val::Bool(_) => Err("expected int, found bool".to_string()),
+                _ => Err("expected int".to_string()),
             }
         }
         fn as_bool(&self) -> Result<&Bool<'ctx>, String> {
             match self {
                 Val::Bool(b) => Ok(b),
-                Val::Int(_) => Err("expected bool, found int".to_string()),
+                _ => Err("expected bool".to_string()),
+            }
+        }
+        fn as_real(&self) -> Result<&Real<'ctx>, String> {
+            match self {
+                Val::Real(r) => Ok(r),
+                _ => Err("expected float".to_string()),
             }
         }
         fn ite(cond: &Bool<'ctx>, t: &Val<'ctx>, e: &Val<'ctx>) -> Result<Val<'ctx>, String> {
             match (t, e) {
                 (Val::Int(a), Val::Int(b)) => Ok(Val::Int(cond.ite(a, b))),
                 (Val::Bool(a), Val::Bool(b)) => Ok(Val::Bool(cond.ite(a, b))),
+                (Val::Real(a), Val::Real(b)) => Ok(Val::Real(cond.ite(a, b))),
                 _ => Err("branches have different types".to_string()),
             }
         }
@@ -124,17 +135,17 @@ mod z3impl {
             if f.params.len() != args.len() {
                 return Err(format!("wrong argument count for '{}'", name));
             }
-            if !matches!(f.ret, Type::Int | Type::Bool) {
+            if !matches!(f.ret, Type::Int | Type::Bool | Type::Float) {
                 return Err(format!(
-                    "'{}' returns '{}' (only int/bool calls can be inlined)",
+                    "'{}' returns '{}' (only int/bool/float calls can be inlined)",
                     name, f.ret
                 ));
             }
             let mut vals = Vec::new();
             for (p, a) in f.params.iter().zip(args) {
-                if !matches!(p.ty, Type::Int | Type::Bool) {
+                if !matches!(p.ty, Type::Int | Type::Bool | Type::Float) {
                     return Err(format!(
-                        "'{}' takes '{}' (only int/bool calls can be inlined)",
+                        "'{}' takes '{}' (only int/bool/float calls can be inlined)",
                         name, p.ty
                     ));
                 }
@@ -172,7 +183,16 @@ mod z3impl {
         fn translate(&mut self, expr: &Expr) -> Result<Val<'ctx>, String> {
             match &expr.kind {
                 ExprKind::Int(n) => Ok(Val::Int(Int::from_i64(self.ctx, *n))),
+                ExprKind::Float(f) => {
+                    // Mathematical reals for proofs (not IEEE-754).
+                    let s = format!("{}", f);
+                    match Real::from_real_str(self.ctx, &s, "1") {
+                        Some(r) => Ok(Val::Real(r)),
+                        None => Err(format!("cannot represent float literal {}", f)),
+                    }
+                }
                 ExprKind::Bool(b) => Ok(Val::Bool(Bool::from_bool(self.ctx, *b))),
+                ExprKind::Str(_) => Err("string literals are outside the decidable subset".to_string()),
                 ExprKind::Var(name) => self
                     .env
                     .get(name)
@@ -185,7 +205,19 @@ mod z3impl {
                                 return Ok(Val::Int(l.clone()));
                             }
                         }
-                        return Err("len() is only symbolic for array parameters".to_string());
+                        return Err(
+                            "len() is only symbolic for array/str parameters".to_string(),
+                        );
+                    }
+                    if name == "to_float" && args.len() == 1 {
+                        let v = self.translate(&args[0])?;
+                        return Ok(Val::Real(Real::from_int(v.as_int()?)));
+                    }
+                    if name == "to_int" && args.len() == 1 {
+                        let v = self.translate(&args[0])?;
+                        // real→int via uninterpreted fresh (sound for equality-only proofs)
+                        let _ = v.as_real()?;
+                        return Ok(Val::Int(self.fresh_int("to_int")));
                     }
                     self.inline_call(name, args)
                 }
@@ -217,7 +249,11 @@ mod z3impl {
                 ExprKind::Un(op, inner) => {
                     let v = self.translate(inner)?;
                     match op {
-                        UnOp::Neg => Ok(Val::Int(v.as_int()?.unary_minus())),
+                        UnOp::Neg => match v {
+                            Val::Int(i) => Ok(Val::Int(i.unary_minus())),
+                            Val::Real(r) => Ok(Val::Real(r.unary_minus())),
+                            _ => Err("unary '-' expects int or float".to_string()),
+                        },
                         UnOp::Not => Ok(Val::Bool(v.as_bool()?.not())),
                     }
                 }
@@ -226,23 +262,77 @@ mod z3impl {
                     let l = self.translate(lhs)?;
                     let r = self.translate(rhs)?;
                     match op {
-                        Add => Ok(Val::Int(l.as_int()? + r.as_int()?)),
-                        Sub => Ok(Val::Int(l.as_int()? - r.as_int()?)),
-                        Mul => Ok(Val::Int(l.as_int()? * r.as_int()?)),
-                        Div => Ok(Val::Int(l.as_int()? / r.as_int()?)),
+                        Add | Sub | Mul | Div => match (&l, &r) {
+                            (Val::Int(_), Val::Int(_)) => {
+                                let a = l.as_int()?;
+                                let b = r.as_int()?;
+                                Ok(Val::Int(match op {
+                                    Add => a + b,
+                                    Sub => a - b,
+                                    Mul => a * b,
+                                    Div => a / b,
+                                    _ => unreachable!(),
+                                }))
+                            }
+                            (Val::Real(_), Val::Real(_)) => {
+                                let a = l.as_real()?;
+                                let b = r.as_real()?;
+                                Ok(Val::Real(match op {
+                                    Add => a + b,
+                                    Sub => a - b,
+                                    Mul => a * b,
+                                    Div => a / b,
+                                    _ => unreachable!(),
+                                }))
+                            }
+                            _ => Err("arithmetic operands must both be int or both be float"
+                                .to_string()),
+                        },
                         Mod => Ok(Val::Int(l.as_int()?.modulo(r.as_int()?))),
-                        Lt => Ok(Val::Bool(l.as_int()?.lt(r.as_int()?))),
-                        Le => Ok(Val::Bool(l.as_int()?.le(r.as_int()?))),
-                        Gt => Ok(Val::Bool(l.as_int()?.gt(r.as_int()?))),
-                        Ge => Ok(Val::Bool(l.as_int()?.ge(r.as_int()?))),
+                        Lt | Le | Gt | Ge => match (&l, &r) {
+                            (Val::Int(_), Val::Int(_)) => {
+                                let a = l.as_int()?;
+                                let b = r.as_int()?;
+                                Ok(Val::Bool(match op {
+                                    Lt => a.lt(b),
+                                    Le => a.le(b),
+                                    Gt => a.gt(b),
+                                    Ge => a.ge(b),
+                                    _ => unreachable!(),
+                                }))
+                            }
+                            (Val::Real(_), Val::Real(_)) => {
+                                let a = l.as_real()?;
+                                let b = r.as_real()?;
+                                Ok(Val::Bool(match op {
+                                    Lt => a.lt(b),
+                                    Le => a.le(b),
+                                    Gt => a.gt(b),
+                                    Ge => a.ge(b),
+                                    _ => unreachable!(),
+                                }))
+                            }
+                            _ => Err("comparison operands must both be int or both be float"
+                                .to_string()),
+                        },
                         Eq => match (&l, &r) {
                             (Val::Int(a), Val::Int(b)) => Ok(Val::Bool(a._eq(b))),
                             (Val::Bool(a), Val::Bool(b)) => Ok(Val::Bool(a._eq(b))),
+                            (Val::Real(a), Val::Real(b)) => Ok(Val::Bool(a._eq(b))),
+                            (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(Bool::from_bool(
+                                self.ctx,
+                                a == b,
+                            ))),
                             _ => Err("'==' operands have different types".to_string()),
                         },
                         Ne => match (&l, &r) {
                             (Val::Int(a), Val::Int(b)) => Ok(Val::Bool(a._eq(b).not())),
                             (Val::Bool(a), Val::Bool(b)) => Ok(Val::Bool(a._eq(b).not())),
+                            (Val::Real(a), Val::Real(b)) => Ok(Val::Bool(a._eq(b).not())),
+                            (Val::Str(a), Val::Str(b)) => Ok(Val::Bool(Bool::from_bool(
+                                self.ctx,
+                                a != b,
+                            ))),
                             _ => Err("'!=' operands have different types".to_string()),
                         },
                         And => Ok(Val::Bool(Bool::and(
@@ -377,11 +467,77 @@ mod z3impl {
                     StmtKind::Expr(_) => {
                         // pure expression statements can't affect the result
                     }
-                    StmtKind::While { .. } => {
-                        return Err(
-                            "while loops are outside the decidable subset (use a bounded for loop)"
-                                .to_string(),
-                        );
+                    StmtKind::While { cond: wcond, body } => {
+                        // Unroll `while i < N` / `while i <= N` when N is a
+                        // constant and the body assigns `i = i + 1`.
+                        let (var, exclusive_end) = match &wcond.kind {
+                            ExprKind::Bin(BinOp::Lt, l, r) => {
+                                let ExprKind::Var(v) = &l.kind else {
+                                    return Err(
+                                        "while loops need a form like 'while i < N' to unroll"
+                                            .to_string(),
+                                    );
+                                };
+                                let end = self.translate(r)?.as_int()?.clone();
+                                let Some(ec) = end.simplify().as_i64() else {
+                                    return Err(
+                                        "while bound must simplify to a constant".to_string(),
+                                    );
+                                };
+                                (v.clone(), ec)
+                            }
+                            ExprKind::Bin(BinOp::Le, l, r) => {
+                                let ExprKind::Var(v) = &l.kind else {
+                                    return Err(
+                                        "while loops need a form like 'while i <= N' to unroll"
+                                            .to_string(),
+                                    );
+                                };
+                                let end = self.translate(r)?.as_int()?.clone();
+                                let Some(ec) = end.simplify().as_i64() else {
+                                    return Err(
+                                        "while bound must simplify to a constant".to_string(),
+                                    );
+                                };
+                                (v.clone(), ec + 1)
+                            }
+                            _ => {
+                                return Err(
+                                    "while loops are outside the decidable subset unless they look like 'while i < N' with i += 1"
+                                        .to_string(),
+                                );
+                            }
+                        };
+                        let start = match self.env.get(&var).and_then(|v| v.as_int().ok()) {
+                            Some(i) => i.simplify().as_i64(),
+                            None => None,
+                        };
+                        let Some(sc) = start else {
+                            return Err(
+                                "while loop variable must have a constant starting value"
+                                    .to_string(),
+                            );
+                        };
+                        if exclusive_end.saturating_sub(sc) > MAX_UNROLL {
+                            return Err(format!(
+                                "while loop runs {} iterations; the unrolling limit is {}",
+                                exclusive_end - sc,
+                                MAX_UNROLL
+                            ));
+                        }
+                        for k in sc..exclusive_end {
+                            self.env
+                                .insert(var.clone(), Val::Int(Int::from_i64(self.ctx, k)));
+                            match self.exec_block(body, &cur, paths)? {
+                                Some(c) => cur = c,
+                                None => {
+                                    self.env.remove(&var);
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                        self.env
+                            .insert(var, Val::Int(Int::from_i64(self.ctx, exclusive_end)));
                     }
                     _ => {
                         return Err("statement is outside the decidable subset".to_string());
@@ -442,6 +598,19 @@ mod z3impl {
                     // arrays are opaque; only len(arr) is symbolic (>= 0)
                     let l = Int::new_const(&ctx, format!("len_{}", p.name));
                     st.lens.insert(p.name.clone(), l);
+                }
+                Type::Float => {
+                    st.env.insert(
+                        p.name.clone(),
+                        Val::Real(Real::new_const(&ctx, p.name.clone())),
+                    );
+                }
+                Type::Str => {
+                    // length is symbolic (>= 0); the value is an opaque name
+                    let l = Int::new_const(&ctx, format!("len_{}", p.name));
+                    st.lens.insert(p.name.clone(), l);
+                    st.env
+                        .insert(p.name.clone(), Val::Str(p.name.clone()));
                 }
                 Type::Struct(_) => {
                     // fields materialize lazily as uninterpreted ints

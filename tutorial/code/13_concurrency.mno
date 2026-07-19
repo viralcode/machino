@@ -1,0 +1,31 @@
+# Lesson 13 — spawn/join and channels
+# Compiled spawn targets must be named top-level functions (E074).
+
+fn square(n: int) -> int {
+    return n * n
+}
+
+fn worker(ch: int) -> int {
+    chan_send_int(ch, 21)
+    return 0
+}
+
+fn main() {
+    let h = spawn(square, 12)
+    print(join_int(h))
+
+    let ch = chan_new()
+    let wh = spawn(worker, ch)
+    print(chan_recv_int(ch) * 2)
+    print(join_int(wh))
+    chan_close(ch)
+}
+
+test "concurrency" {
+    let h = spawn(square, 5)
+    assert join_int(h) == 25
+    let ch = chan_new()
+    chan_send_int(ch, 7)
+    assert chan_recv_int(ch) == 7
+    chan_close(ch)
+}

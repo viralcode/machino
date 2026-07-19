@@ -1,0 +1,10 @@
+# Lesson 01 — Hello, machino
+# Run:  machino run tutorial/code/01_hello.mno
+
+fn main() {
+    print("hello from machino")
+}
+
+test "greets" expects "hello from machino" {
+    print("hello from machino")
+}

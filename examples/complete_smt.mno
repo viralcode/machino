@@ -45,6 +45,24 @@ ensures result <= max
     return x + 1
 }
 
+fn add1_float(x: float) -> float
+ensures result > x
+{
+    return x + 1.0
+}
+
+fn sum_while_ten() -> int
+ensures result == 45
+{
+    let i = 0
+    let s = 0
+    while i < 10 {
+        s = s + i
+        i = i + 1
+    }
+    return s
+}
+
 test "array sum" {
     let arr = [1, 2, 3, 4, 5]
     assert array_sum(arr, 3) == 6
@@ -62,6 +80,11 @@ test "bounded increment" {
     assert bounded_increment(9, 10) == 10
 }
 
+test "float and while" {
+    assert add1_float(2.5) > 2.5
+    assert sum_while_ten() == 45
+}
+
 fn main() {
     print("=== Complete SMT Verification ===")
 
@@ -76,4 +99,9 @@ fn main() {
 
     print("Bounded increment of 7 (max 10):")
     print(bounded_increment(7, 10))
+
+    print("add1_float(2.5):")
+    print(add1_float(2.5))
+    print("sum_while_ten:")
+    print(sum_while_ten())
 }

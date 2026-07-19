@@ -164,52 +164,125 @@ const tasks = new Map();
 let nextTask = 1;
 let wasmModule; // compiled module, shared with workers
 
-// ---- channels (main-thread host queues) ----
+// ---- channels (SharedArrayBuffer queues — visible to workers) ----
+// Layout per channel (bytes):
+//   0:i32 closed, 4:i32 count, 8:i32 head, 12:i32 notify, 16:i32 unused,
+//   20..: QUEUE_CAP slots of { kind:i32, pad:i32, value:i64|f64bits }
+// kind: 1=i64, 2=f64, 3=str-inline (value = length, bytes follow in side table —
+//       for str we keep a process-local Map of id->bytes[] for the payload,
+//       keyed by a monotonic token stored in value; workers post str via
+//       structured clone into the shared strInbox SAB index).
+// For cross-worker int/float/bool, the queue alone is enough. Strings use a
+// companion SharedArrayBuffer string heap.
 
-const channels = new Map();
-let nextChan = 1;
+const MAX_CHANS = 128;
+const QUEUE_CAP = 256;
+const SLOT = 16; // kind:i32 + pad:i32 + value:i64
+const CHAN_BYTES = 20 + QUEUE_CAP * SLOT;
+const TABLE_BYTES = 8 + MAX_CHANS * CHAN_BYTES; // [0]=nextId i32
+
+function freshChannelTable() {
+  return new SharedArrayBuffer(TABLE_BYTES);
+}
+
+let channelTable = isMainThread
+  ? freshChannelTable()
+  : workerData.channelTable;
 
 function runtimeError(msg) {
   console.error(msg);
   process.exit(1);
 }
 
-function getChan(id) {
-  const ch = channels.get(Number(id));
-  if (!ch) {
+function chanBase(id) {
+  const n = Number(id);
+  if (n < 1 || n >= MAX_CHANS) {
     runtimeError(`runtime error: no channel with handle ${id}`);
   }
-  return ch;
+  return 8 + n * CHAN_BYTES;
 }
 
-function makeChannel() {
-  return {
-    queue: [],
-    closed: false,
-    signal: new Int32Array(new SharedArrayBuffer(4)),
-  };
-}
-
-function chanSendEnqueue(ch, val) {
-  if (ch.closed) {
-    runtimeError("runtime error: send on closed channel");
-  }
-  ch.queue.push(val);
-  Atomics.add(ch.signal, 0, 1);
-  Atomics.notify(ch.signal, 0);
-}
-
-function chanRecvWait(ch) {
+function chanSendEnqueue(id, kind, bits) {
+  const base = chanBase(id);
+  const view = new DataView(channelTable);
+  const ia = new Int32Array(channelTable);
   for (;;) {
-    if (ch.queue.length > 0) {
-      return ch.queue.shift();
+    if (Atomics.load(ia, base / 4) !== 0) {
+      runtimeError("runtime error: send on closed channel");
     }
-    if (ch.closed) {
+    const count = Atomics.load(ia, base / 4 + 1);
+    if (count >= QUEUE_CAP) {
+      const epoch = Atomics.load(ia, base / 4 + 3);
+      Atomics.wait(ia, base / 4 + 3, epoch, 50);
+      continue;
+    }
+    const head = Atomics.load(ia, base / 4 + 2);
+    const slot = base + 20 + head * SLOT;
+    view.setInt32(slot, kind, true);
+    view.setBigInt64(slot + 8, bits, true);
+    Atomics.store(ia, base / 4 + 2, (head + 1) % QUEUE_CAP);
+    Atomics.add(ia, base / 4 + 1, 1);
+    Atomics.add(ia, base / 4 + 3, 1);
+    Atomics.notify(ia, base / 4 + 3);
+    return;
+  }
+}
+
+function chanRecvWait(id) {
+  const base = chanBase(id);
+  const view = new DataView(channelTable);
+  const ia = new Int32Array(channelTable);
+  for (;;) {
+    const count = Atomics.load(ia, base / 4 + 1);
+    if (count > 0) {
+      // pop from tail = (head - count) mod CAP
+      const head = Atomics.load(ia, base / 4 + 2);
+      const tail = (head - count + QUEUE_CAP) % QUEUE_CAP;
+      const slot = base + 20 + tail * SLOT;
+      const kind = view.getInt32(slot, true);
+      const bits = view.getBigInt64(slot + 8, true);
+      Atomics.sub(ia, base / 4 + 1, 1);
+      Atomics.add(ia, base / 4 + 3, 1);
+      Atomics.notify(ia, base / 4 + 3);
+      return { kind, bits };
+    }
+    if (Atomics.load(ia, base / 4) !== 0) {
       runtimeError("runtime error: receive on closed empty channel");
     }
-    const epoch = Atomics.load(ch.signal, 0);
-    Atomics.wait(ch.signal, 0, epoch);
+    const epoch = Atomics.load(ia, base / 4 + 3);
+    Atomics.wait(ia, base / 4 + 3, epoch);
   }
+}
+
+// String payloads: shared map via structured-clone inbox is awkward under
+// Atomics.wait. Keep str bytes in a process-wide Map keyed by token; workers
+// and main share the Map only within one process via workerData.strStore
+// (a plain object mutated carefully — structured clone at spawn freezes it).
+// Instead: pack short strings into the i64 (not enough). Use a growable
+// SharedArrayBuffer string heap.
+const STR_HEAP_SIZE = 1 << 22; // 4 MiB
+let strHeap = isMainThread
+  ? new SharedArrayBuffer(8 + STR_HEAP_SIZE)
+  : workerData.strHeap;
+const strHeapNext = new Int32Array(strHeap, 0, 1); // bump allocator
+
+function internStrBytes(bytes) {
+  const n = bytes.length;
+  const off = Atomics.add(strHeapNext, 0, n + 4);
+  if (off + n + 4 > STR_HEAP_SIZE) {
+    runtimeError("runtime error: channel string heap exhausted");
+  }
+  const view = new DataView(strHeap);
+  view.setInt32(8 + off, n, true);
+  new Uint8Array(strHeap, 12 + off, n).set(bytes);
+  return BigInt(off);
+}
+
+function readInterned(off) {
+  const o = Number(off);
+  const view = new DataView(strHeap);
+  const n = view.getInt32(8 + o, true);
+  return new Uint8Array(strHeap, 12 + o, n);
 }
 
 function copyStrBytes(addr) {
@@ -259,7 +332,15 @@ function makeImports(programArgs) {
         }
         const sab = new SharedArrayBuffer(4096, { maxByteLength: 1 << 28 });
         const worker = new Worker(new URL(import.meta.url), {
-          workerData: { module: wasmModule, fnName, sig, args, sab },
+          workerData: {
+            module: wasmModule,
+            fnName,
+            sig,
+            args,
+            sab,
+            channelTable,
+            strHeap,
+          },
         });
         worker.unref();
         const h = nextTask++;
@@ -280,54 +361,64 @@ function makeImports(programArgs) {
         const bytes = new Uint8Array(sab.slice(8, 8 + len));
         return makeBytes(bytes);
       },
-      // ---- channels (blocking queues on the main host thread) ----
+      // ---- channels (SharedArrayBuffer queues shared with workers) ----
       chan_new() {
-        const id = nextChan++;
-        channels.set(id, makeChannel());
+        const ia = new Int32Array(channelTable);
+        const id = Atomics.add(ia, 0, 1) + 1; // ids start at 1
+        if (id >= MAX_CHANS) {
+          runtimeError("runtime error: too many channels");
+        }
+        const base = chanBase(id);
+        ia.fill(0, base / 4, base / 4 + 5);
         return BigInt(id);
       },
       chan_close(id) {
-        const ch = getChan(id);
-        if (ch.closed) return;
-        ch.closed = true;
-        Atomics.add(ch.signal, 0, 1);
-        Atomics.notify(ch.signal, 0);
+        const base = chanBase(id);
+        const ia = new Int32Array(channelTable);
+        Atomics.store(ia, base / 4, 1);
+        Atomics.add(ia, base / 4 + 3, 1);
+        Atomics.notify(ia, base / 4 + 3);
       },
       chan_send_i64(id, val) {
-        chanSendEnqueue(getChan(id), { kind: "i64", v: val });
+        chanSendEnqueue(id, 1, val);
       },
       chan_send_f64(id, val) {
-        chanSendEnqueue(getChan(id), { kind: "f64", v: val });
+        const bits = new DataView(new ArrayBuffer(8));
+        bits.setFloat64(0, val, true);
+        chanSendEnqueue(id, 2, bits.getBigInt64(0, true));
       },
       chan_send_str(id, ptr) {
-        chanSendEnqueue(getChan(id), { kind: "str", bytes: copyStrBytes(ptr) });
+        const token = internStrBytes(copyStrBytes(ptr));
+        chanSendEnqueue(id, 3, token);
       },
       chan_recv_i64(id) {
-        const v = chanRecvWait(getChan(id));
-        if (v.kind !== "i64") {
+        const v = chanRecvWait(id);
+        if (v.kind !== 1) {
           runtimeError(
             "runtime error: chan_recv_i64: channel delivered a value of a different type"
           );
         }
-        return v.v;
+        return v.bits;
       },
       chan_recv_f64(id) {
-        const v = chanRecvWait(getChan(id));
-        if (v.kind !== "f64") {
+        const v = chanRecvWait(id);
+        if (v.kind !== 2) {
           runtimeError(
             "runtime error: chan_recv_f64: channel delivered a value of a different type"
           );
         }
-        return v.v;
+        const bits = new DataView(new ArrayBuffer(8));
+        bits.setBigInt64(0, v.bits, true);
+        return bits.getFloat64(0, true);
       },
       chan_recv_str(id) {
-        const v = chanRecvWait(getChan(id));
-        if (v.kind !== "str") {
+        const v = chanRecvWait(id);
+        if (v.kind !== 3) {
           runtimeError(
             "runtime error: chan_recv_str: channel delivered a value of a different type"
           );
         }
-        return makeBytes(v.bytes);
+        return makeBytes(readInterned(v.bits));
       },
       // ---- native externs (declare the ones you need with `extern fn`) ----
       clock_ms() {
@@ -404,6 +495,8 @@ function setInstance(instance) {
 
 async function workerMain() {
   const { module, fnName, sig, args, sab } = workerData;
+  channelTable = workerData.channelTable;
+  strHeap = workerData.strHeap;
   const status = new Int32Array(sab, 0, 1);
   const post = (code, len) => {
     new DataView(sab).setInt32(4, len ?? 0, true);

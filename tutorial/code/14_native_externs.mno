@@ -1,0 +1,15 @@
+# Lesson 14 — Native runtime capabilities (machino run)
+# Declare only the externs you need — that is the capability boundary.
+
+extern fn clock_ms() -> int
+extern fn getenv(name: str) -> str
+
+fn main() {
+    print(clock_ms() > 0)
+    let home = getenv("HOME")
+    print(len(home) > 0)
+}
+
+test "clock" {
+    assert clock_ms() > 0
+}

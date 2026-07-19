@@ -748,7 +748,30 @@ impl<'a> Parser<'a> {
                         let seg = self.parse_ident("type name after '::'")?;
                         name = format!("{}::{}", name, seg);
                     }
-                    Ok(Type::Struct(name))
+                    // Generic application: Name<T, U> (nested >> is two Gt tokens)
+                    if self.eat(&Tok::Lt) {
+                        let open_span = self.peek_span();
+                        let mut args = Vec::new();
+                        if !matches!(self.peek(), Tok::Gt) {
+                            loop {
+                                args.push(self.parse_type()?);
+                                if !self.eat(&Tok::Comma) {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect(Tok::Gt, "'>' to close type arguments")?;
+                        if args.is_empty() {
+                            return Err(Diagnostic::new(
+                                "E018",
+                                format!("expected at least one type argument for '{}'", name),
+                                open_span,
+                            ));
+                        }
+                        Ok(Type::App(name, args))
+                    } else {
+                        Ok(Type::Struct(name))
+                    }
                 }
             },
             Token {
@@ -782,7 +805,9 @@ impl<'a> Parser<'a> {
                 format!("expected a type, found {}", describe(&t.tok)),
                 t.span,
             )
-            .with_help("valid types: int, float, bool, str, [T], fn(T...) -> R, or a struct name")),
+            .with_help(
+                "valid types: int, float, bool, str, [T], fn(T...) -> R, Name<T,...>, or a struct name",
+            )),
         }
     }
 

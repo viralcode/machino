@@ -46,6 +46,7 @@ pub fn contains_typevar(ty: &Type) -> bool {
     match ty {
         Type::TypeVar(_) => true,
         Type::Array(inner) => contains_typevar(inner),
+        Type::App(_, args) => args.iter().any(contains_typevar),
         Type::Fn(ps, r) => ps.iter().any(contains_typevar) || contains_typevar(r),
         _ => false,
     }
@@ -61,6 +62,10 @@ fn mangle_type(ty: &Type, out: &mut String) {
         Type::Array(inner) => {
             out.push_str("arr_");
             mangle_type(inner, out);
+        }
+        Type::App(name, args) => {
+            // Prefer the same mangling as a resolved instance.
+            out.push_str(&mangle(name, args));
         }
         Type::Struct(n) | Type::Enum(n) | Type::TypeVar(n) => out.push_str(n),
         Type::Fn(params, ret) => {
@@ -133,6 +138,26 @@ fn apply_subst_full(
                 Type::Enum(mangled)
             } else {
                 Type::Enum(name.clone())
+            }
+        }
+        Type::App(name, args) => {
+            let args: Vec<Type> = args
+                .iter()
+                .map(|a| apply_subst_full(a, subst, struct_tps, enum_tps, queue))
+                .collect();
+            let mangled = mangle(name, &args);
+            if struct_tps.contains_key(name.as_str()) {
+                if !args.iter().any(contains_typevar) {
+                    queue.push((name.clone(), args));
+                }
+                Type::Struct(mangled)
+            } else if enum_tps.contains_key(name.as_str()) {
+                if !args.iter().any(contains_typevar) {
+                    queue.push((name.clone(), args));
+                }
+                Type::Enum(mangled)
+            } else {
+                Type::App(name.clone(), args)
             }
         }
         _ => ty.clone(),

@@ -123,7 +123,7 @@ fn valtype(ty: &Type) -> u8 {
 fn is_ptr(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Str | Type::Array(_) | Type::Struct(_) | Type::Fn(_, _)
+        Type::Str | Type::Array(_) | Type::Struct(_) | Type::App(_, _) | Type::Fn(_, _)
     )
 }
 

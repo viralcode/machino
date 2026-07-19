@@ -13,6 +13,9 @@ pub enum Type {
     Struct(String),
     /// A named enum type.
     Enum(String),
+    /// A generic nominal applied to type arguments, e.g. `HashMap<str, int>`.
+    /// The checker resolves this to a mangled `Struct`/`Enum` (`HashMap$str$int`).
+    App(String, Vec<Type>),
     /// A function value type: fn(params) -> ret.
     Fn(Vec<Type>, Box<Type>),
     /// A type parameter (e.g., T in fn<T>).
@@ -31,6 +34,16 @@ impl std::fmt::Display for Type {
             Type::Array(inner) => write!(f, "[{}]", inner),
             Type::Struct(name) => write!(f, "{}", name),
             Type::Enum(name) => write!(f, "{}", name),
+            Type::App(name, args) => {
+                write!(f, "{}<", name)?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", a)?;
+                }
+                write!(f, ">")
+            }
             Type::TypeVar(name) => write!(f, "{}", name),
             Type::Fn(params, ret) => {
                 write!(f, "fn(")?;

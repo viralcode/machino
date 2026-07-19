@@ -28,7 +28,7 @@ USAGE:
   machino test  <file.mno> [--json]              run test blocks (contracts enforced)
   machino run   <file.mno> [args...] [--trace]   run fn main(); --trace emits JSON call events
   machino build <file.mno> [-o out.wasm]         compile to a portable .wasm module
-                [--gc] [--stack-mib N] [--no-cache]
+                [--gc] [--native] [--stack-mib N] [--no-cache]
   machino query <file.mno>                       JSON signatures of every top-level item
   machino fmt   <file.mno> [--check]             canonical formatter
   machino fuzz  <file.mno> [--runs N] [--seed S] contract-driven property testing
@@ -616,6 +616,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 
 fn cmd_build(rest: &[String]) -> ExitCode {
     let use_gc = rest.iter().any(|a| a == "--gc");
+    let use_native = rest.iter().any(|a| a == "--native");
     let no_cache = rest.iter().any(|a| a == "--no-cache");
     let stack_mib: u32 = rest
         .iter()
@@ -623,6 +624,10 @@ fn cmd_build(rest: &[String]) -> ExitCode {
         .and_then(|i| rest.get(i + 1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(16);
+    if use_gc && use_native {
+        eprintln!("error: --native applies to the linear WASM backend; omit --gc");
+        return ExitCode::from(2);
+    }
     // drop flag-value pairs so the positional file argument is found correctly
     let positional: Vec<String> = {
         let mut out = Vec::new();
@@ -634,6 +639,9 @@ fn cmd_build(rest: &[String]) -> ExitCode {
             }
             if a == "-o" || a == "--stack-mib" {
                 skip = true;
+                continue;
+            }
+            if a == "--gc" || a == "--native" || a == "--no-cache" {
                 continue;
             }
             out.push(a.clone());
@@ -669,18 +677,8 @@ fn cmd_build(rest: &[String]) -> ExitCode {
         eprintln!("error: 'machino build' requires a 'fn main()' entry point");
         return ExitCode::FAILURE;
     }
-    if use_gc {
-        if let Some(span) = find_concurrency_use(&loaded.program) {
-            let d = Diagnostic::new(
-                "E072",
-                "the WASM-GC backend has no thread or channel support; use the default backend for spawn/join and channels",
-                span,
-            )
-            .with_help("compile without --gc, or run with 'machino run'");
-            eprintln!("{}", loaded.render_error(&d));
-            return ExitCode::FAILURE;
-        }
-    } else if let Some(d) = validate_spawn_targets(&loaded.program) {
+    // Both backends require named top-level spawn targets.
+    if let Some(d) = validate_spawn_targets(&loaded.program) {
         eprintln!("{}", loaded.render_error(&d));
         return ExitCode::FAILURE;
     }
@@ -733,10 +731,57 @@ fn cmd_build(rest: &[String]) -> ExitCode {
             } else {
                 println!("run it anywhere:  node runners/run.mjs {}", out_path);
             }
+            if use_native {
+                return aot_native(&out_path);
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("error: cannot write '{}': {}", out_path, e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// AOT-compile a linear `.wasm` with `wasmtime compile` when available.
+fn aot_native(wasm_path: &str) -> ExitCode {
+    let cwasm = {
+        let p = std::path::Path::new(wasm_path);
+        p.with_extension("cwasm")
+    };
+    let status = std::process::Command::new("wasmtime")
+        .args([
+            "compile",
+            wasm_path,
+            "-o",
+            cwasm.to_str().unwrap_or("out.cwasm"),
+        ])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!(
+                "wrote {} (wasmtime AOT); run with:  wasmtime run {}",
+                cwasm.display(),
+                wasm_path
+            );
+            println!(
+                "note: host imports (print_*, fail, channels, …) still come from the wasmtime runtime / a custom linker"
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(s) => {
+            eprintln!(
+                "error: wasmtime compile failed (exit {}); is wasmtime installed?",
+                s.code().unwrap_or(-1)
+            );
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!(
+                "error: --native requires the 'wasmtime' CLI on PATH ({})",
+                e
+            );
+            eprintln!("install: https://wasmtime.dev/  (or use 'machino run' for the native OS runtime)");
             ExitCode::FAILURE
         }
     }
@@ -816,73 +861,6 @@ fn validate_spawn_targets(program: &ast::Program) -> Option<Diagnostic> {
         .functions
         .iter()
         .find_map(|f| in_stmts(&f.body, &fns))
-}
-
-/// Returns the span of the first spawn/join or chan_* call, if any. The
-/// WASM-GC backend has no thread or channel support, so `machino build --gc`
-/// rejects these programs.
-fn find_concurrency_use(program: &ast::Program) -> Option<Span> {
-    const UNSUPPORTED: &[&str] = &[
-        "spawn",
-        "join_int",
-        "join_float",
-        "join_bool",
-        "join_str",
-        "chan_new",
-        "chan_close",
-        "chan_send_int",
-        "chan_send_float",
-        "chan_send_bool",
-        "chan_send_str",
-        "chan_recv_int",
-        "chan_recv_float",
-        "chan_recv_bool",
-        "chan_recv_str",
-    ];
-    fn in_expr(e: &ast::Expr) -> Option<Span> {
-        use ast::ExprKind::*;
-        match &e.kind {
-            Call(name, args) => {
-                if UNSUPPORTED.contains(&name.as_str()) {
-                    return Some(e.span);
-                }
-                args.iter().find_map(in_expr)
-            }
-            Array(elems) => elems.iter().find_map(in_expr),
-            Index(a, b) | Bin(_, a, b) => in_expr(a).or_else(|| in_expr(b)),
-            Field(a, _) | Un(_, a) => in_expr(a),
-            Lambda(l) => in_stmts(&l.body),
-            Match(m) => in_expr(&m.scrutinee)
-                .or_else(|| m.arms.iter().find_map(|arm| in_expr(&arm.body))),
-            _ => None,
-        }
-    }
-    fn in_stmts(stmts: &[ast::Stmt]) -> Option<Span> {
-        use ast::StmtKind::*;
-        stmts.iter().find_map(|s| match &s.kind {
-            Let { value, .. } | Assign { value, .. } => in_expr(value),
-            IndexAssign { base, index, value } => in_expr(base)
-                .or_else(|| in_expr(index))
-                .or_else(|| in_expr(value)),
-            FieldAssign { base, value, .. } => in_expr(base).or_else(|| in_expr(value)),
-            If {
-                cond,
-                then_body,
-                else_body,
-            } => in_expr(cond)
-                .or_else(|| in_stmts(then_body))
-                .or_else(|| in_stmts(else_body)),
-            While { cond, body } => in_expr(cond).or_else(|| in_stmts(body)),
-            For {
-                start, end, body, ..
-            } => in_expr(start)
-                .or_else(|| in_expr(end))
-                .or_else(|| in_stmts(body)),
-            Return(Some(e)) | Assert(e) | Expr(e) => in_expr(e),
-            _ => None,
-        })
-    }
-    program.functions.iter().find_map(|f| in_stmts(&f.body))
 }
 
 const PKG_USAGE: &str = "usage:\n  machino pkg init <name>\n  machino pkg add <name> <source> [ref]\n  machino pkg sync\n  machino pkg publish [--registry <url>] [--token <token>]";

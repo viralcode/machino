@@ -1,0 +1,41 @@
+# Lesson 15 — Contracts that Z3 can prove (machino check --verify)
+# Requires a binary built with: cargo build --features smt
+# Floats are modeled as mathematical reals; while i < N unrolls when N is constant.
+
+fn add1(x: float) -> float
+ensures result > x
+{
+    return x + 1.0
+}
+
+fn sum_while() -> int
+ensures result == 45
+{
+    let i = 0
+    let s = 0
+    while i < 10 {
+        s = s + i
+        i = i + 1
+    }
+    return s
+}
+
+fn bounded_inc(x: int, max: int) -> int
+requires x < max
+ensures result > x
+ensures result <= max
+{
+    return x + 1
+}
+
+fn main() {
+    print(add1(2.5))
+    print(sum_while())
+    print(bounded_inc(7, 10))
+}
+
+test "smt examples" {
+    assert add1(1.0) > 1.0
+    assert sum_while() == 45
+    assert bounded_inc(3, 10) == 4
+}

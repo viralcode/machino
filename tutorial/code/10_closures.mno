@@ -1,0 +1,38 @@
+# Lesson 10 — First-class functions and closures
+# Lambdas capture by value; captured vars are read-only (mutate via struct/array).
+
+fn map_ints(xs: [int], f: fn(int) -> int) -> [int] {
+    let out: [int] = []
+    for i in 0..len(xs) {
+        out = push(out, f(xs[i]))
+    }
+    return out
+}
+
+fn make_adder(n: int) -> fn(int) -> int {
+    return fn(x: int) -> int {
+        return x + n
+    }
+}
+
+fn main() {
+    let xs = [1, 2, 3]
+    let doubled = map_ints(xs, fn(x: int) -> int {
+        return x * 2
+    })
+    print(doubled[0])
+    print(doubled[2])
+    let add10 = make_adder(10)
+    print(add10(5))
+}
+
+test "closures" {
+    let add3 = make_adder(3)
+    assert add3(4) == 7
+    let xs = [1, 2]
+    let ys = map_ints(xs, fn(x: int) -> int {
+        return x + 1
+    })
+    assert ys[0] == 2
+    assert ys[1] == 3
+}

@@ -1,0 +1,25 @@
+# Lesson 12 — JSON and standard prelude helpers
+
+fn main() {
+    let raw = "{\"n\":3,\"ok\":true}"
+    let parsed = json_parse(raw)
+    let s = match parsed {
+        JsonParsed::JVal(v) => json_serialize(v)
+        JsonParsed::JError(e) => e
+    }
+    print(s)
+    print(str_of_int(42))
+    print(sqrt(9.0))
+    print(join(split("a,b,c", ","), "|"))
+}
+
+test "json and strings" {
+    let p = json_parse("{\"x\":1}")
+    let ok = match p {
+        JsonParsed::JVal(_) => true
+        JsonParsed::JError(_) => false
+    }
+    assert ok
+    assert join(split("a-b", "-"), "/") == "a/b"
+    assert floor(3.7) == 3
+}

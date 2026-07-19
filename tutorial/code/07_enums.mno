@@ -1,0 +1,23 @@
+# Lesson 07 — Enums and exhaustive match
+
+enum Option {
+    None
+    Some(int)
+}
+
+fn unwrap_or(opt: Option, default: int) -> int {
+    return match opt {
+        Option::Some(v) => v
+        Option::None => default
+    }
+}
+
+fn main() {
+    print(unwrap_or(Option::Some(42), 0))
+    print(unwrap_or(Option::None, 7))
+}
+
+test "option" {
+    assert unwrap_or(Option::Some(3), 0) == 3
+    assert unwrap_or(Option::None, 9) == 9
+}

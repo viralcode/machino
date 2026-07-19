@@ -1,0 +1,23 @@
+# Lesson 02 — Values, types, and operators
+# No implicit conversions: int + float is an error.
+
+fn main() {
+    let n = 42
+    let x = 3.14
+    let ok = true
+    let name = "machino"
+    print(n)
+    print(x)
+    print(ok)
+    print(name)
+    print(n + 8)
+    print(x * 2.0)
+    print(to_float(n) + x)
+    print(name + " v1.2")
+}
+
+test "conversions" {
+    assert to_int(3.9) == 3
+    assert to_float(2) + 0.5 == 2.5
+    assert "a" + "b" == "ab"
+}

@@ -1,0 +1,47 @@
+# Lesson 03 — Control flow: if, while, for, break, continue
+
+fn classify(n: int) -> str {
+    if n < 0 {
+        return "neg"
+    } else {
+        if n == 0 {
+            return "zero"
+        }
+        return "pos"
+    }
+}
+
+fn sum_to(n: int) -> int
+requires n >= 0
+{
+    let i = 0
+    let s = 0
+    while i < n {
+        s = s + i
+        i = i + 1
+    }
+    return s
+}
+
+fn main() {
+    print(classify(-1))
+    print(classify(0))
+    print(classify(7))
+    print(sum_to(10))
+    for i in 0..5 {
+        if i == 2 {
+            continue
+        }
+        if i == 4 {
+            break
+        }
+        print(i)
+    }
+}
+
+test "control" {
+    assert classify(-3) == "neg"
+    assert classify(0) == "zero"
+    assert classify(9) == "pos"
+    assert sum_to(10) == 45
+}

@@ -1,0 +1,28 @@
+# Lesson 04 — Functions, recursion, early return
+
+fn my_abs(n: int) -> int {
+    if n < 0 {
+        return 0 - n
+    }
+    return n
+}
+
+fn fib(n: int) -> int
+requires n >= 0
+ensures result >= 0
+{
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() {
+    print(my_abs(-9))
+    print(fib(10))
+}
+
+test "fib and abs" {
+    assert my_abs(-5) == 5
+    assert fib(10) == 55
+}

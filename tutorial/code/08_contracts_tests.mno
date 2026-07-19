@@ -1,0 +1,23 @@
+# Lesson 08 — Contracts and tests
+# requires: checked on entry; ensures: checked on exit (result is the return)
+
+fn safe_div(a: int, b: int) -> int
+requires b != 0
+ensures result * b <= a
+{
+    return a / b
+}
+
+fn main() {
+    print(safe_div(10, 2))
+}
+
+test "safe_div" {
+    assert safe_div(10, 2) == 5
+    assert safe_div(9, 2) == 4
+}
+
+test "snapshot" expects "ok\n1" {
+    print("ok")
+    print(1)
+}
