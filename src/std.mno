@@ -236,23 +236,50 @@ fn repeat(s: str, n: int) -> str
     return out
 }
 
-# ---- StrMap: string-keyed map of strings ----
+# ---- StrMap: string-keyed hash map of strings ----
+# Buckets hold indices into the insertion-ordered keys/vals arrays, so
+# lookups are O(1) amortized while iteration order stays deterministic.
 
 struct StrMap {
     keys: [str]
     vals: [str]
+    buckets: [[int]]
+    nbuckets: int
+}
+
+# polynomial hash mod a large prime; stays far below int overflow
+fn str_hash(s: str) -> int
+    ensures result >= 0
+{
+    let h = 0
+    for i in 0..len(s) {
+        h = (h * 31 + char_at(s, i)) % 1000000007
+    }
+    return h
+}
+
+fn empty_buckets(n: int) -> [[int]]
+    requires n > 0
+{
+    let bs: [[int]] = []
+    for i in 0..n {
+        let e: [int] = []
+        bs = push(bs, e)
+    }
+    return bs
 }
 
 fn strmap_new() -> StrMap {
     let ks: [str] = []
     let vs: [str] = []
-    return StrMap(ks, vs)
+    return StrMap(ks, vs, empty_buckets(8), 8)
 }
 
 fn strmap_index(m: StrMap, key: str) -> int {
-    for i in 0..len(m.keys) {
-        if m.keys[i] == key {
-            return i
+    let bucket = m.buckets[str_hash(key) % m.nbuckets]
+    for i in 0..len(bucket) {
+        if m.keys[bucket[i]] == key {
+            return bucket[i]
         }
     }
     return -1
@@ -260,6 +287,18 @@ fn strmap_index(m: StrMap, key: str) -> int {
 
 fn strmap_has(m: StrMap, key: str) -> bool {
     return strmap_index(m, key) >= 0
+}
+
+fn strmap_rehash(m: StrMap, n: int)
+    requires n > 0
+{
+    let bs = empty_buckets(n)
+    for i in 0..len(m.keys) {
+        let b = str_hash(m.keys[i]) % n
+        bs[b] = push(bs[b], i)
+    }
+    m.buckets = bs
+    m.nbuckets = n
 }
 
 fn strmap_set(m: StrMap, key: str, val: str) {
@@ -270,6 +309,11 @@ fn strmap_set(m: StrMap, key: str, val: str) {
     }
     m.keys = push(m.keys, key)
     m.vals = push(m.vals, val)
+    let b = str_hash(key) % m.nbuckets
+    m.buckets[b] = push(m.buckets[b], len(m.keys) - 1)
+    if len(m.keys) > m.nbuckets * 2 {
+        strmap_rehash(m, m.nbuckets * 4)
+    }
 }
 
 fn strmap_get(m: StrMap, key: str) -> str
@@ -448,23 +492,33 @@ fn pow_float(base: float, exp: int) -> float {
     return out
 }
 
-# ---- IntMap: int-keyed map of ints ----
+# ---- IntMap: int-keyed hash map of ints ----
+# Same bucketed design as StrMap.
 
 struct IntMap {
     keys: [int]
     vals: [int]
+    buckets: [[int]]
+    nbuckets: int
+}
+
+fn int_hash(k: int) -> int
+    ensures result >= 0
+{
+    return abs_int(k % 1000000007)
 }
 
 fn intmap_new() -> IntMap {
     let ks: [int] = []
     let vs: [int] = []
-    return IntMap(ks, vs)
+    return IntMap(ks, vs, empty_buckets(8), 8)
 }
 
 fn intmap_index(m: IntMap, key: int) -> int {
-    for i in 0..len(m.keys) {
-        if m.keys[i] == key {
-            return i
+    let bucket = m.buckets[int_hash(key) % m.nbuckets]
+    for i in 0..len(bucket) {
+        if m.keys[bucket[i]] == key {
+            return bucket[i]
         }
     }
     return -1
@@ -472,6 +526,18 @@ fn intmap_index(m: IntMap, key: int) -> int {
 
 fn intmap_has(m: IntMap, key: int) -> bool {
     return intmap_index(m, key) >= 0
+}
+
+fn intmap_rehash(m: IntMap, n: int)
+    requires n > 0
+{
+    let bs = empty_buckets(n)
+    for i in 0..len(m.keys) {
+        let b = int_hash(m.keys[i]) % n
+        bs[b] = push(bs[b], i)
+    }
+    m.buckets = bs
+    m.nbuckets = n
 }
 
 fn intmap_set(m: IntMap, key: int, val: int) {
@@ -482,6 +548,11 @@ fn intmap_set(m: IntMap, key: int, val: int) {
     }
     m.keys = push(m.keys, key)
     m.vals = push(m.vals, val)
+    let b = int_hash(key) % m.nbuckets
+    m.buckets[b] = push(m.buckets[b], len(m.keys) - 1)
+    if len(m.keys) > m.nbuckets * 2 {
+        intmap_rehash(m, m.nbuckets * 4)
+    }
 }
 
 fn intmap_get(m: IntMap, key: int) -> int

@@ -50,7 +50,7 @@ try {
   instance.exports.main();
 } catch (e) {
   if (e instanceof WebAssembly.RuntimeError) {
-    console.error("runtime error: trap (contract violation, assert failure, or out-of-bounds)");
+    console.error("runtime error: trap (contract violation, assert failure, integer overflow, or out-of-bounds)");
     process.exit(1);
   }
   throw e;
