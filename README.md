@@ -284,9 +284,10 @@ What 1.3 adds (on top of 1.2):
 - **Hosts** — Node TCP; DOM last-event x/y/key/button/value; `packages/ws`
 - **DB** — `--features sqlite` embeds rusqlite; CLI fallback otherwise
 - **`--native`** — Clang/LLVM host executables via `runtime/native` (lambdas,
-  spawn/channels, `-O3 -flto -march=native`, `--target` / `--universal`)
+  spawn/channels, mark-sweep cycle GC, `-O3 -flto -march=native`,
+  `--target` / `--universal`)
 
-**Remaining bounds:** GC spawn of struct/array graphs; native cycle GC; full PCRE/libm; hosted package registry.
+**Remaining bounds:** GC spawn of struct/array graphs; full PCRE/libm; hosted package registry.
 
 ## License
 

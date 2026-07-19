@@ -53,6 +53,18 @@ fn value_kind(ty: &Type) -> char {
     }
 }
 
+fn is_heap_ty(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Str
+            | Type::Array(_)
+            | Type::Struct(_)
+            | Type::Enum(_)
+            | Type::App(_, _)
+            | Type::Fn(_, _)
+    )
+}
+
 fn closure_fn_ptr_type(n_params: usize) -> String {
     let mut s = String::from("mno_i64 (*)(");
     for i in 0..=n_params {
@@ -124,6 +136,8 @@ struct Emitter<'a> {
     spawn_entries: HashSet<String>,
     /// When emitting a lambda body, convert returns to i64 ABI.
     in_lambda: bool,
+    /// Temps already registered as GC roots in the current frame.
+    rooted: HashSet<String>,
 }
 
 impl<'a> Emitter<'a> {
@@ -172,7 +186,22 @@ impl<'a> Emitter<'a> {
             wrapped_fns: HashSet::new(),
             spawn_entries: HashSet::new(),
             in_lambda: false,
+            rooted: HashSet::new(),
         }
+    }
+
+    fn root_slot(&mut self, cname: &str, ty: &Type) {
+        if !is_heap_ty(ty) {
+            return;
+        }
+        if !self.rooted.insert(cname.to_string()) {
+            return;
+        }
+        let _ = writeln!(self.out, "  mno_gc_add_root(&{});", cname);
+    }
+
+    fn emit_gc_maybe(&mut self) {
+        self.out.push_str("  mno_gc_maybe();\n");
     }
 
     fn prepare(&mut self, reachable: &HashSet<String>) -> Result<(), Diagnostic> {
@@ -330,8 +359,16 @@ impl<'a> Emitter<'a> {
             self.closure_params(n_params)
         );
 
-        let mut body = String::new();
-        let _ = writeln!(body, "static mno_i64 {}({}) {{", lam, self.closure_params(n_params));
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_rooted = std::mem::take(&mut self.rooted);
+        self.in_lambda = true;
+        self.out.push_str(&format!(
+            "static mno_i64 {}({}) {{\n",
+            lam,
+            self.closure_params(n_params)
+        ));
+        self.out.push_str("  mno_gc_push_frame();\n");
+        self.rooted.clear();
 
         self.locals = vec![HashMap::new()];
         for (i, p) in l.params.iter().enumerate() {
@@ -339,37 +376,45 @@ impl<'a> Emitter<'a> {
             self.bind(&p.name, p.ty.clone());
             if p.ty == Type::Float {
                 let _ = writeln!(
-                    body,
+                    self.out,
                     "  mno_f64 {} = mno_bits_to_f64({});",
                     c_ident(&p.name),
                     raw
                 );
             } else {
-                let _ = writeln!(body, "  mno_i64 {} = {};", c_ident(&p.name), raw);
+                let _ = writeln!(
+                    self.out,
+                    "  mno_i64 {} = {};",
+                    c_ident(&p.name),
+                    raw
+                );
+                self.root_slot(&c_ident(&p.name), &p.ty);
             }
         }
+        // Env closure itself is a live root for capture loads.
+        self.out.push_str("  mno_gc_add_root(&__env);\n");
+        let _ = self.rooted.insert("__env".into());
         for (i, (name, ty)) in captures.iter().enumerate() {
             let cap = self.fresh("cap");
             let _ = writeln!(
-                body,
+                self.out,
                 "  mno_i64 {} = mno_closure_get(__env, {}LL);",
                 cap, i
             );
             if *ty == Type::Float {
                 let _ = writeln!(
-                    body,
+                    self.out,
                     "  mno_f64 {} = mno_bits_to_f64({});",
                     c_ident(name),
                     cap
                 );
             } else {
-                let _ = writeln!(body, "  mno_i64 {} = {};", c_ident(name), cap);
+                let _ = writeln!(self.out, "  mno_i64 {} = {};", c_ident(name), cap);
+                self.root_slot(&c_ident(name), ty);
             }
             self.bind(name, ty.clone());
         }
 
-        let saved_out = std::mem::take(&mut self.out);
-        self.in_lambda = true;
         let result_tmp = if l.ret != Type::Unit {
             Some(self.fresh("lam_ret"))
         } else {
@@ -377,33 +422,33 @@ impl<'a> Emitter<'a> {
         };
         if let Some(ref r) = result_tmp {
             if l.ret == Type::Float {
-                let _ = writeln!(body, "  mno_f64 {} = 0;", r);
+                let _ = writeln!(self.out, "  mno_f64 {} = 0;", r);
             } else {
-                let _ = writeln!(body, "  mno_i64 {} = 0;", r);
+                let _ = writeln!(self.out, "  mno_i64 {} = 0;", r);
+                self.root_slot(r, &l.ret);
             }
         }
         let exit_lbl = self.fresh_label("lam_exit");
         self.emit_block(&l.body, result_tmp.as_deref(), &l.ret, &exit_lbl)?;
-        let emitted = std::mem::take(&mut self.out);
-        self.out = saved_out;
-        self.in_lambda = false;
 
-        body.push_str(&emitted);
-        let _ = writeln!(body, "  {}:;", exit_lbl);
+        let _ = writeln!(self.out, "  {}:;", exit_lbl);
+        self.out.push_str("  mno_gc_pop_frame();\n");
         if let Some(r) = result_tmp {
             if l.ret == Type::Float {
-                let _ = writeln!(body, "  return mno_f64_to_bits({});", r);
+                let _ = writeln!(self.out, "  return mno_f64_to_bits({});", r);
             } else if l.ret == Type::Unit {
-                let _ = writeln!(body, "  return 0LL;");
+                let _ = writeln!(self.out, "  return 0LL;");
             } else {
-                let _ = writeln!(body, "  return {};", r);
+                let _ = writeln!(self.out, "  return {};", r);
             }
         } else {
-            let _ = writeln!(body, "  return 0LL;");
+            let _ = writeln!(self.out, "  return 0LL;");
         }
-        let _ = writeln!(body, "}}");
-        self.aux_code.push_str(&body);
-        self.aux_code.push('\n');
+        self.out.push_str("}\n\n");
+        self.aux_code.push_str(&self.out);
+        self.out = saved_out;
+        self.rooted = saved_rooted;
+        self.in_lambda = false;
         Ok(())
     }
 
@@ -416,6 +461,7 @@ impl<'a> Emitter<'a> {
             "  mno_i64 {} = mno_closure_new((void *)&{}, 0LL);",
             t, wrap
         );
+        self.root_slot(&t, &Type::Fn(vec![], Box::new(Type::Unit)));
         let _ = span;
         Ok(t)
     }
@@ -540,10 +586,13 @@ impl<'a> Emitter<'a> {
             let _ = write!(self.out, "{} {}", pt, c_ident(&p.name));
         }
         self.out.push_str(") {\n");
+        self.out.push_str("  mno_gc_push_frame();\n");
+        self.rooted.clear();
 
         self.locals = vec![HashMap::new()];
         for p in &f.params {
             self.bind(&p.name, p.ty.clone());
+            self.root_slot(&c_ident(&p.name), &p.ty);
         }
 
         // shadow params for ensures
@@ -564,6 +613,7 @@ impl<'a> Emitter<'a> {
                     c_ident(&p.name)
                 );
                 shadows.push((p.name.clone(), p.ty.clone()));
+                self.root_slot(&sh, &p.ty);
             }
         }
 
@@ -589,6 +639,7 @@ impl<'a> Emitter<'a> {
                 "mno_i64"
             };
             let _ = writeln!(self.out, "  {} {} = 0;", pt, t);
+            self.root_slot(&t, &f.ret);
             Some(t)
         } else {
             None
@@ -625,6 +676,7 @@ impl<'a> Emitter<'a> {
             self.ensures_alias.clear();
         }
 
+        self.out.push_str("  mno_gc_pop_frame();\n");
         if let Some(r) = result_tmp {
             let _ = writeln!(self.out, "  return {};", r);
         } else {
@@ -669,7 +721,9 @@ impl<'a> Emitter<'a> {
                     "mno_i64"
                 };
                 let _ = writeln!(self.out, "  {} {} = {};", pt, cname, v);
-                self.bind(name, inferred);
+                self.bind(name, inferred.clone());
+                self.root_slot(&cname, &inferred);
+                self.emit_gc_maybe();
             }
             StmtKind::Assign { name, value } => {
                 let ty = self
@@ -748,6 +802,7 @@ impl<'a> Emitter<'a> {
                 let _ = writeln!(self.out, "    if (!({})) break;", c);
                 self.emit_block(body, result_tmp, ret_ty, exit_lbl)?;
                 let _ = writeln!(self.out, "    {}:;", cont);
+                self.emit_gc_maybe();
                 self.out.push_str("  }\n");
                 let _ = writeln!(self.out, "  {}:;", brk);
                 self.loop_labels.pop();
@@ -780,6 +835,7 @@ impl<'a> Emitter<'a> {
                 self.emit_block(body, result_tmp, ret_ty, exit_lbl)?;
                 self.pop_scope();
                 let _ = writeln!(self.out, "    {}:;", cont);
+                self.emit_gc_maybe();
                 self.out.push_str("  }\n");
                 let _ = writeln!(self.out, "  {}:;", brk);
                 self.loop_labels.pop();
@@ -840,6 +896,7 @@ impl<'a> Emitter<'a> {
                     lit,
                     s.len()
                 );
+                self.root_slot(&t, &Type::Str);
                 Ok(t)
             }
             ExprKind::Var(name) => {
@@ -868,6 +925,7 @@ impl<'a> Emitter<'a> {
                             "  mno_i64 {} = mno_enum_new({}LL, 0LL);",
                             t, tag
                         );
+                        self.root_slot(&t, &Type::Enum(en.to_string()));
                         return Ok(t);
                     }
                 }
@@ -891,6 +949,7 @@ impl<'a> Emitter<'a> {
                     .first()
                     .map(|e| self.type_of(e))
                     .unwrap_or(Type::Int);
+                self.root_slot(&t, &Type::Array(Box::new(elem_ty.clone())));
                 for (i, e) in elems.iter().enumerate() {
                     let v = self.emit_expr(e, Some(&elem_ty))?;
                     if elem_ty == Type::Float {
@@ -1002,6 +1061,13 @@ impl<'a> Emitter<'a> {
                     lam,
                     captures.len()
                 );
+                self.root_slot(
+                    &t,
+                    &Type::Fn(
+                        l.params.iter().map(|p| p.ty.clone()).collect(),
+                        Box::new(l.ret.clone()),
+                    ),
+                );
                 for (i, (cap_name, cap_ty)) in captures.iter().enumerate() {
                     let v = self.emit_expr(
                         &Expr {
@@ -1039,6 +1105,7 @@ impl<'a> Emitter<'a> {
                     "  mno_i64 {} = mno_str_concat({}, {});",
                     t, l, r
                 );
+                self.root_slot(&t, &Type::Str);
             }
             (Type::Str, Type::Str, Eq) => {
                 let _ = writeln!(self.out, "  mno_i64 {} = mno_str_eq({}, {});", t, l, r);
@@ -1274,6 +1341,7 @@ impl<'a> Emitter<'a> {
                         t, a, v
                     );
                 }
+                self.root_slot(&t, &Type::Array(Box::new(elem_ty)));
                 return Ok(t);
             }
             "char_at" => {
@@ -1293,12 +1361,14 @@ impl<'a> Emitter<'a> {
                     "  mno_i64 {} = mno_substr({}, {}, {});",
                     t, s, a, b
                 );
+                self.root_slot(&t, &Type::Str);
                 return Ok(t);
             }
             "chr" => {
                 let c = self.emit_expr(&args[0], Some(&Type::Int))?;
                 let t = self.fresh("chr");
                 let _ = writeln!(self.out, "  mno_i64 {} = mno_chr({});", t, c);
+                self.root_slot(&t, &Type::Str);
                 return Ok(t);
             }
             "len_cp" => {
@@ -1328,12 +1398,14 @@ impl<'a> Emitter<'a> {
                     "  mno_i64 {} = mno_substr_cp({}, {}, {});",
                     t, s, a, b
                 );
+                self.root_slot(&t, &Type::Str);
                 return Ok(t);
             }
             "chr_cp" => {
                 let c = self.emit_expr(&args[0], Some(&Type::Int))?;
                 let t = self.fresh("chrp");
                 let _ = writeln!(self.out, "  mno_i64 {} = mno_chr_cp({});", t, c);
+                self.root_slot(&t, &Type::Str);
                 return Ok(t);
             }
             "to_int" => {
@@ -1426,6 +1498,7 @@ impl<'a> Emitter<'a> {
                 let h = self.emit_expr(&args[0], Some(&Type::Int))?;
                 let t = self.fresh("join");
                 let _ = writeln!(self.out, "  mno_i64 {} = mno_task_join_str({});", t, h);
+                self.root_slot(&t, &Type::Str);
                 return Ok(t);
             }
             "chan_new" => {
@@ -1472,6 +1545,7 @@ impl<'a> Emitter<'a> {
                 let ch = self.emit_expr(&args[0], Some(&Type::Int))?;
                 let t = self.fresh("recv");
                 let _ = writeln!(self.out, "  mno_i64 {} = mno_chan_recv_str({});", t, ch);
+                self.root_slot(&t, &Type::Str);
                 return Ok(t);
             }
             _ => {}
@@ -1494,6 +1568,8 @@ impl<'a> Emitter<'a> {
             "tcp_read" => Some(("mno_tcp_read", true, Type::Str)),
             "tcp_write" => Some(("mno_tcp_write", true, Type::Int)),
             "tcp_close" => Some(("mno_tcp_close", false, Type::Unit)),
+            "gc_collect" => Some(("mno_gc_collect", false, Type::Unit)),
+            "heap_live_count" => Some(("mno_heap_live_count", true, Type::Int)),
             _ => None,
         };
         if let Some((fname, has_ret, ret)) = host {
@@ -1524,6 +1600,7 @@ impl<'a> Emitter<'a> {
                     self.out.push_str(a);
                 }
                 self.out.push_str(");\n");
+                self.root_slot(&t, &ret);
                 return Ok(t);
             } else {
                 let _ = write!(self.out, "  {}(", fname);
@@ -1557,6 +1634,7 @@ impl<'a> Emitter<'a> {
                     tag,
                     variant.payloads.len()
                 );
+                self.root_slot(&t, &Type::Enum(en.to_string()));
                 for (i, (a, pty)) in args.iter().zip(variant.payloads.iter()).enumerate() {
                     let v = self.emit_expr(a, Some(pty))?;
                     if *pty == Type::Float {
@@ -1592,6 +1670,7 @@ impl<'a> Emitter<'a> {
                 t,
                 fields.len()
             );
+            self.root_slot(&t, &Type::Struct(name.to_string()));
             for (i, (fld, a)) in fields.iter().zip(args.iter()).enumerate() {
                 let v = self.emit_expr(a, Some(&fld.ty))?;
                 if fld.ty == Type::Float {
@@ -1648,6 +1727,7 @@ impl<'a> Emitter<'a> {
                 self.out.push_str(a);
             }
             self.out.push_str(");\n");
+            self.root_slot(&t, &ret);
             Ok(t)
         }
     }

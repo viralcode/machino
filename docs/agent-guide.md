@@ -301,8 +301,8 @@ imported names stay global (collisions are errors).
   spawn with int/bool args); run with `node runners/run-gc.mjs` (Node 22+)
 - `machino build file.mno --native` — Clang/LLVM host executable (needs
   `clang` on PATH). Links `runtime/native/machino_rt.c`; supports lambdas,
-  spawn/channels, `-O3 -flto -march=native`, plus `--target` / `--universal`.
-  See `docs/native-runtime.md`
+  spawn/channels, mark-sweep cycle GC, `-O3 -flto -march=native`, plus
+  `--target` / `--universal`. See `docs/native-runtime.md`
 - Type annotations may name generic apps: `let m: HashMap<str, int> = …`
 
 ## Error codes you will see most

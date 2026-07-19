@@ -416,6 +416,12 @@ allocations and at the end of each top-level call when the live heap grew.
 Strings stay immutable (`Rc<Vec<u8>>`). Test hooks: `extern fn gc_collect()`
 and `extern fn heap_live_count() -> int`.
 
+`machino build --native` links the same mark-sweep policy in
+`runtime/native/machino_rt.c`: non-moving `malloc` objects, roots via
+per-function `mno_gc_push_frame` / `mno_gc_add_root` frames, safepoints at
+loop back-edges (`mno_gc_maybe`, threshold 256 allocations), plus the same
+`gc_collect` / `heap_live_count` externs. Reference cycles are reclaimed.
+
 The module exports `memory`, `alloc`, and every non-prelude function. Hosts
 that create objects (strings, arrays) must write the 16-byte header — see
 `runners/run.mjs` for the reference implementation.
@@ -550,10 +556,11 @@ runtime-checked.
 - `machino build --native` emits C, compiles with **Clang/LLVM** into a
   host executable linked with `runtime/native/machino_rt.c` (also writes
   LLVM IR). Supports lambdas, first-class function values, `spawn`/`join_*`,
-  and channels (pthreads). Host builds use `-O3 -flto -march=native`;
-  `--target TRIPLE` cross-compiles; `--universal` (macOS) lipo-merges
-  arm64+x86_64. Portable one-binary deploy across browsers/Workers still
-  prefers `.wasm`.
+  channels (pthreads), and a mark-sweep GC that reclaims cycles (rooted
+  via per-function frames; `gc_collect` / `heap_live_count` externs).
+  Host builds use `-O3 -flto -march=native`; `--target TRIPLE` cross-compiles;
+  `--universal` (macOS) lipo-merges arm64+x86_64. Portable one-binary deploy
+  across browsers/Workers still prefers `.wasm`.
 - Browser hosts have no raw TCP; use WebSockets (`packages/ws`) or HTTP.
   Node `runners/run.mjs` provides TCP via a worker-backed `node:net` host.
 - DOM events expose type/target plus x/y/key/button/value; virtual CSSOM
@@ -566,6 +573,5 @@ runtime-checked.
 - Hosted public registry service (`pkg publish` already speaks the
   protocol; the server itself is out of scope for the toolchain)
 - GC spawn of struct/array argument graphs
-- Native backend: cycle-collecting GC
 
 

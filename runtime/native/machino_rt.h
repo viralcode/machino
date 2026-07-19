@@ -124,8 +124,16 @@ mno_i64 mno_chan_recv_i64(mno_i64 id);
 mno_f64 mno_chan_recv_f64(mno_i64 id);
 mno_i64 mno_chan_recv_str(mno_i64 id);
 
-/* GC hook (v1: no-op; heap uses malloc, cycles are not collected). */
+/* Mark-sweep GC (non-moving). Roots are addresses of mno_i64 locals holding
+ * heap pointers; push a frame at function entry, add_root for each pointer
+ * local/temp, pop_frame before return. Collection runs at safepoints via
+ * mno_gc_maybe() or explicitly via mno_gc_collect(). */
+void mno_gc_push_frame(void);
+void mno_gc_add_root(mno_i64 *slot);
+void mno_gc_pop_frame(void);
 void mno_gc_collect(void);
+void mno_gc_maybe(void);
+mno_i64 mno_heap_live_count(void);
 
 #ifdef __cplusplus
 }

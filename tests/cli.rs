@@ -1153,6 +1153,59 @@ fn native_build_run(src: &str, bin: &str) -> (bool, String, String) {
 }
 
 #[test]
+fn build_native_cycle_gc_reclaims() {
+    if Command::new("clang").arg("--version").output().is_err() {
+        return;
+    }
+    // Explicit collect must reclaim a dropped cycle (same as interpreter ex_103).
+    let path = write_temp(
+        "native_cycle_gc.mno",
+        r#"
+extern fn gc_collect()
+extern fn heap_live_count() -> int
+
+struct Node {
+    children: [Node]
+}
+
+fn make_cycle() {
+    let n = Node([])
+    n.children = [n]
+}
+
+fn main() {
+    let before = heap_live_count()
+    make_cycle()
+    gc_collect()
+    print(heap_live_count() - before)
+}
+"#,
+    );
+    let exe = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native_cycle_gc_bin");
+    let _ = std::fs::remove_file(&exe);
+    let out = machino(&[
+        "build",
+        "--native",
+        "--no-cache",
+        path.to_str().unwrap(),
+        "-o",
+        exe.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = Command::new(&exe).output().expect("run");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "0");
+}
+
+#[test]
 fn build_native_closures_spawn_channels() {
     if Command::new("clang").arg("--version").output().is_err() {
         return;

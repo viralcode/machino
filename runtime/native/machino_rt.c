@@ -1,9 +1,9 @@
 /*
  * machino native C runtime (v1)
  *
- * Heap objects are allocated with malloc and never moved. There is no cycle-
- * collecting GC in v1 — mno_gc_collect() is a no-op. Programs that form
- * reference cycles among heap objects will leak until process exit.
+ * Heap objects are allocated with malloc and never moved. A precise
+ * mark-sweep collector reclaims unreachable objects (including cycles).
+ * Codegen roots pointer-typed locals via mno_gc_push_frame / mno_gc_add_root.
  */
 
 #include "machino_rt.h"
@@ -76,10 +76,25 @@ static void *mno_xrealloc(void *p, size_t n) {
 }
 
 /* Registered heap object addresses (so float bit-patterns are never treated as
- * pointers during opportunistic string/pointer checks). */
+ * pointers during opportunistic string/pointer checks). Also the sweep set. */
+#define HEAP_EMPTY ((uintptr_t)0)
+#define HEAP_TOMB ((uintptr_t)1)
+#define META_MARK_BIT ((mno_i64)8)
+#define GC_ALLOC_THRESHOLD 256
+
 static uintptr_t *g_heap_keys = NULL;
 static size_t g_heap_cap = 0;
 static size_t g_heap_len = 0;
+static size_t g_allocs_since_gc = 0;
+
+typedef struct MnoGcFrame {
+    mno_i64 **slots;
+    size_t len;
+    size_t cap;
+    struct MnoGcFrame *prev;
+} MnoGcFrame;
+
+static MnoGcFrame *g_gc_top = NULL;
 
 static size_t mno_heap_hash(uintptr_t key) {
     /* SplitMix64-ish mix; good enough for pointer keys. */
@@ -98,11 +113,11 @@ static void mno_heap_rehash(size_t new_cap) {
     }
     for (size_t i = 0; i < g_heap_cap; i++) {
         uintptr_t k = g_heap_keys[i];
-        if (k == 0) {
+        if (k == HEAP_EMPTY || k == HEAP_TOMB) {
             continue;
         }
         size_t j = mno_heap_hash(k) & (new_cap - 1);
-        while (next[j] != 0) {
+        while (next[j] != HEAP_EMPTY) {
             j = (j + 1) & (new_cap - 1);
         }
         next[j] = k;
@@ -118,19 +133,51 @@ static void mno_heap_register(void *p) {
     }
     if (g_heap_cap == 0) {
         mno_heap_rehash(64);
-    } else if (g_heap_len * 2 >= g_heap_cap) {
-        mno_heap_rehash(g_heap_cap * 2);
+    } else if ((g_heap_len + 1) * 2 >= g_heap_cap) {
+        mno_heap_rehash(g_heap_cap ? g_heap_cap * 2 : 64);
     }
     uintptr_t key = (uintptr_t)p;
     size_t i = mno_heap_hash(key) & (g_heap_cap - 1);
-    while (g_heap_keys[i] != 0) {
-        if (g_heap_keys[i] == key) {
+    size_t tomb = (size_t)-1;
+    for (;;) {
+        uintptr_t k = g_heap_keys[i];
+        if (k == HEAP_EMPTY) {
+            if (tomb != (size_t)-1) {
+                i = tomb;
+            }
+            g_heap_keys[i] = key;
+            g_heap_len++;
+            g_allocs_since_gc++;
+            return;
+        }
+        if (k == key) {
+            return;
+        }
+        if (k == HEAP_TOMB && tomb == (size_t)-1) {
+            tomb = i;
+        }
+        i = (i + 1) & (g_heap_cap - 1);
+    }
+}
+
+static void mno_heap_unregister(void *p) {
+    if (!p || g_heap_cap == 0) {
+        return;
+    }
+    uintptr_t key = (uintptr_t)p;
+    size_t i = mno_heap_hash(key) & (g_heap_cap - 1);
+    for (;;) {
+        uintptr_t k = g_heap_keys[i];
+        if (k == HEAP_EMPTY) {
+            return;
+        }
+        if (k == key) {
+            g_heap_keys[i] = HEAP_TOMB;
+            g_heap_len--;
             return;
         }
         i = (i + 1) & (g_heap_cap - 1);
     }
-    g_heap_keys[i] = key;
-    g_heap_len++;
 }
 
 static int mno_heap_contains(mno_i64 v) {
@@ -138,10 +185,13 @@ static int mno_heap_contains(mno_i64 v) {
         return 0;
     }
     uintptr_t key = (uintptr_t)(intptr_t)v;
+    if (key == HEAP_TOMB) {
+        return 0;
+    }
     size_t i = mno_heap_hash(key) & (g_heap_cap - 1);
     for (;;) {
         uintptr_t k = g_heap_keys[i];
-        if (k == 0) {
+        if (k == HEAP_EMPTY) {
             return 0;
         }
         if (k == key) {
@@ -150,6 +200,55 @@ static int mno_heap_contains(mno_i64 v) {
         i = (i + 1) & (g_heap_cap - 1);
     }
 }
+
+void mno_gc_push_frame(void) {
+    MnoGcFrame *f = (MnoGcFrame *)mno_xmalloc(sizeof(MnoGcFrame));
+    f->slots = NULL;
+    f->len = 0;
+    f->cap = 0;
+    f->prev = g_gc_top;
+    g_gc_top = f;
+}
+
+void mno_gc_add_root(mno_i64 *slot) {
+    if (!slot) {
+        return;
+    }
+    if (!g_gc_top) {
+        mno_fail("runtime error: gc_add_root without a GC frame");
+    }
+    if (g_gc_top->len == g_gc_top->cap) {
+        size_t ncap = g_gc_top->cap ? g_gc_top->cap * 2 : 8;
+        g_gc_top->slots =
+            (mno_i64 **)mno_xrealloc(g_gc_top->slots, ncap * sizeof(mno_i64 *));
+        g_gc_top->cap = ncap;
+    }
+    g_gc_top->slots[g_gc_top->len++] = slot;
+}
+
+void mno_gc_pop_frame(void) {
+    if (!g_gc_top) {
+        mno_fail("runtime error: gc_pop_frame with empty GC stack");
+    }
+    MnoGcFrame *f = g_gc_top;
+    g_gc_top = f->prev;
+    free(f->slots);
+    free(f);
+}
+
+static int mno_is_marked(const MnoHeader *h) {
+    return (h->meta & META_MARK_BIT) != 0;
+}
+
+static void mno_set_mark(MnoHeader *h) { h->meta |= META_MARK_BIT; }
+
+static void mno_clear_mark(MnoHeader *h) { h->meta &= ~META_MARK_BIT; }
+
+/* Forward decls — mark helpers defined after tasks/channels. */
+static void mno_gc_mark_value(mno_i64 v);
+static void mno_gc_mark_roots(void);
+static void mno_gc_mark_tasks(void);
+static void mno_gc_mark_channels(void);
 
 /* ---- fail / init ---- */
 
@@ -1163,7 +1262,131 @@ mno_i64 mno_hash_str(mno_i64 s) {
     return (mno_i64)h;
 }
 
-void mno_gc_collect(void) {}
+/* ---- mark-sweep GC ---- */
+
+static void mno_gc_mark_value(mno_i64 v) {
+    if (!mno_heap_contains(v)) {
+        return;
+    }
+    MnoHeader *h = (MnoHeader *)(intptr_t)v;
+    if (mno_is_marked(h)) {
+        return;
+    }
+    mno_set_mark(h);
+    mno_i64 tag = mno_tag_of(h);
+    mno_i64 n = mno_count_of(h);
+    if (tag == TAG_BYTES) {
+        return;
+    }
+    if (tag == TAG_ARR || tag == TAG_STRUCT) {
+        mno_i64 *slots = (mno_i64 *)(h + 1);
+        for (mno_i64 i = 0; i < n; i++) {
+            mno_gc_mark_value(slots[i]);
+        }
+        return;
+    }
+    if (tag == TAG_CLOSURE) {
+        /* slot 0 is a function pointer, not a heap object. */
+        mno_i64 *slots = (mno_i64 *)(h + 1);
+        for (mno_i64 i = 1; i < n; i++) {
+            mno_gc_mark_value(slots[i]);
+        }
+        return;
+    }
+    if (tag == TAG_ENUM) {
+        /* Layout: MnoHeader, tag word, then `n` payloads. */
+        mno_i64 *payloads = (mno_i64 *)((char *)h + sizeof(MnoHeader) + sizeof(mno_i64));
+        for (mno_i64 i = 0; i < n; i++) {
+            mno_gc_mark_value(payloads[i]);
+        }
+    }
+}
+
+static void mno_gc_mark_roots(void) {
+    for (MnoGcFrame *f = g_gc_top; f; f = f->prev) {
+        for (size_t i = 0; i < f->len; i++) {
+            mno_i64 *slot = f->slots[i];
+            if (slot) {
+                mno_gc_mark_value(*slot);
+            }
+        }
+    }
+}
+
+static void mno_gc_mark_tasks(void) {
+    for (size_t i = 1; i < g_task_cap; i++) {
+        if (!g_tasks[i].in_use) {
+            continue;
+        }
+        MnoTaskSlot *slot = &g_tasks[i];
+        if (slot->argv) {
+            for (mno_i64 a = 0; a < slot->argc; a++) {
+                mno_gc_mark_value(slot->argv[a]);
+            }
+        }
+        if (slot->joined || slot->ret_kind == 's' || slot->ret_kind == 'p') {
+            /* result may hold a heap pointer for str/pointer returns once set */
+        }
+        if (slot->ret_kind == 's' || slot->ret_kind == 'i' || slot->ret_kind == 'b' ||
+            slot->ret_kind == 'f') {
+            /* Always mark result if it looks like a heap object; ints/floats
+             * that are not registered are ignored by mno_gc_mark_value. */
+            mno_gc_mark_value(slot->result);
+        }
+    }
+}
+
+static void mno_gc_mark_channels(void) {
+    for (size_t i = 1; i < g_chan_cap; i++) {
+        if (!g_chans[i].in_use) {
+            continue;
+        }
+        MnoChanNode *node = g_chans[i].head;
+        while (node) {
+            if (node->kind == CHAN_VAL_STR) {
+                mno_gc_mark_value(node->payload);
+            }
+            /* i64/f64 payloads are never heap pointers */
+            node = node->next;
+        }
+    }
+}
+
+static void mno_gc_sweep(void) {
+    if (g_heap_cap == 0) {
+        return;
+    }
+    for (size_t i = 0; i < g_heap_cap; i++) {
+        uintptr_t k = g_heap_keys[i];
+        if (k == HEAP_EMPTY || k == HEAP_TOMB) {
+            continue;
+        }
+        MnoHeader *h = (MnoHeader *)k;
+        if (mno_is_marked(h)) {
+            mno_clear_mark(h);
+            continue;
+        }
+        g_heap_keys[i] = HEAP_TOMB;
+        g_heap_len--;
+        free(h);
+    }
+}
+
+void mno_gc_collect(void) {
+    mno_gc_mark_roots();
+    mno_gc_mark_tasks();
+    mno_gc_mark_channels();
+    mno_gc_sweep();
+    g_allocs_since_gc = 0;
+}
+
+void mno_gc_maybe(void) {
+    if (g_allocs_since_gc >= GC_ALLOC_THRESHOLD) {
+        mno_gc_collect();
+    }
+}
+
+mno_i64 mno_heap_live_count(void) { return (mno_i64)g_heap_len; }
 
 /* ---- host helpers ---- */
 

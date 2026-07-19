@@ -43,8 +43,17 @@ Float values stored in generic `mno_i64` slots are bitcast with
 v1 uses `malloc` for heap objects. Objects are never moved. `mno_arr_push`
 returns a **new** array (copy-grow), matching machino's interpreter semantics.
 
-`mno_gc_collect()` is currently a no-op. Reference cycles are not reclaimed;
-avoid them or accept leaks until a mark-sweep collector is added.
+A **mark-sweep** collector reclaims unreachable objects, including reference
+cycles. Codegen emits `mno_gc_push_frame` / `mno_gc_add_root` /
+`mno_gc_pop_frame` around functions so pointer locals are roots; `mno_gc_maybe`
+runs at loop safepoints (every 256 allocations). Explicit hooks:
+
+```c
+void mno_gc_collect(void);
+mno_i64 mno_heap_live_count(void);
+```
+
+(exposed to machino as `extern fn gc_collect()` / `heap_live_count() -> int`).
 
 ## Errors
 
