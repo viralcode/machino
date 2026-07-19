@@ -1,9 +1,10 @@
-# dom — browser DOM via host imports (WASM) + virtual DOM in `machino run`
+# dom — browser DOM via host imports + virtual DOM in `machino run`
 #
-# Handles are opaque ints (0 = missing/null).
-# Browser: runners/run.html provides real document bindings.
-# Native: machino run uses an in-memory virtual DOM for tests/CLIs.
-# Node WASM: runners/run.mjs provides the same virtual DOM.
+# Handles are opaque ints (0 = null).
+# Events: dom_add_listener(el, "click", "handler_fn_name") binds an exported
+# zero-arg function. In the browser the host calls it on the real event; in
+# machino run / tests use dom_dispatch(el, "click"). Handlers read
+# dom_last_event_type() / dom_last_event_target().
 
 extern fn dom_document() -> int
 extern fn dom_get_element_by_id(id: str) -> int
@@ -18,8 +19,31 @@ extern fn dom_get_attr(el: int, name: str) -> str
 extern fn dom_append_child(parent: int, child: int)
 extern fn dom_remove_child(parent: int, child: int)
 extern fn dom_add_class(el: int, cls: str)
+extern fn dom_remove_class(el: int, cls: str)
+extern fn dom_toggle_class(el: int, cls: str) -> bool
+extern fn dom_has_class(el: int, cls: str) -> bool
 extern fn dom_set_style(el: int, prop: str, value: str)
 extern fn dom_get_style(el: int, prop: str) -> str
+extern fn dom_get_computed_style(el: int, prop: str) -> str
+extern fn dom_client_width(el: int) -> int
+extern fn dom_client_height(el: int) -> int
+extern fn dom_offset_width(el: int) -> int
+extern fn dom_offset_height(el: int) -> int
+extern fn dom_get_bounding_rect(el: int) -> str
+extern fn dom_focus(el: int)
+extern fn dom_blur(el: int)
+extern fn dom_parent(el: int) -> int
+extern fn dom_child_count(el: int) -> int
+extern fn dom_child_at(el: int, index: int) -> int
+extern fn dom_clear_children(el: int)
+extern fn dom_dataset_set(el: int, key: str, value: str)
+extern fn dom_dataset_get(el: int, key: str) -> str
+extern fn dom_scroll_to(el: int, x: int, y: int)
+extern fn dom_add_listener(el: int, event: str, handler: str)
+extern fn dom_remove_listener(el: int, event: str)
+extern fn dom_dispatch(el: int, event: str)
+extern fn dom_last_event_type() -> str
+extern fn dom_last_event_target() -> int
 
 fn dom_ok(el: int) -> bool {
     return el != 0
@@ -57,6 +81,10 @@ fn dom_el(tag: str) -> int {
     return dom_create_element(tag)
 }
 
+fn dom_on_click(el: int, handler: str) {
+    dom_add_listener(el, "click", handler)
+}
+
 test "virtual dom" {
     let root = dom_document()
     assert dom_ok(root)
@@ -64,13 +92,38 @@ test "virtual dom" {
     dom_set_attr(box, "id", "app")
     dom_set_text(box, "hello")
     dom_append_child(root, box)
-    let found = dom_get_element_by_id("app")
-    assert found == box
-    assert dom_get_text(found) == "hello"
-    dom_set_style(found, "color", "red")
-    assert dom_get_style(found, "color") == "red"
+    assert dom_get_element_by_id("app") == box
+    assert dom_get_text(box) == "hello"
+    dom_set_style(box, "color", "red")
+    assert dom_get_style(box, "color") == "red"
+    dom_add_class(box, "card")
+    assert dom_has_class(box, "card")
+    dom_remove_class(box, "card")
+    assert !dom_has_class(box, "card")
+    dom_dataset_set(box, "n", "1")
+    assert dom_dataset_get(box, "n") == "1"
     let child = dom_create_element("span")
     dom_set_text(child, "!")
-    dom_append_child(found, child)
-    assert contains(dom_get_html(found), "!")
+    dom_append_child(box, child)
+    assert dom_child_count(box) == 1
+    assert dom_child_at(box, 0) == child
+    assert dom_parent(child) == box
+}
+
+fn _dom_test_clicked() {
+    # filled by listener test via side effect on a data attr
+    let t = dom_last_event_target()
+    dom_set_attr(t, "data-clicked", "1")
+}
+
+test "dom events" {
+    let root = dom_document()
+    let btn = dom_create_element("button")
+    dom_set_attr(btn, "id", "btn")
+    dom_append_child(root, btn)
+    dom_add_listener(btn, "click", "_dom_test_clicked")
+    dom_dispatch(btn, "click")
+    assert dom_last_event_type() == "click"
+    assert dom_last_event_target() == btn
+    assert dom_get_attr(btn, "data-clicked") == "1"
 }

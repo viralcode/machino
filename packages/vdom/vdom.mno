@@ -1,0 +1,52 @@
+# vdom — tiny reconcile helpers on top of packages/dom
+# Not React: keyed upsert by element id, patch text/attrs, clear+rebuild kids.
+
+import "../dom/dom.mno"
+
+fn vdom_ensure(parent: int, tag: str, id: str) -> int {
+    let el = dom_get_element_by_id(id)
+    if el == 0 {
+        el = dom_create_element(tag)
+        dom_set_attr(el, "id", id)
+        if parent != 0 {
+            dom_append_child(parent, el)
+        }
+    }
+    return el
+}
+
+fn vdom_text(parent: int, id: str, text: str) -> int {
+    let el = vdom_ensure(parent, "div", id)
+    if dom_get_text(el) != text {
+        dom_set_text(el, text)
+    }
+    return el
+}
+
+fn vdom_button(parent: int, id: str, label: str, handler: str) -> int {
+    let el = vdom_ensure(parent, "button", id)
+    if dom_get_text(el) != label {
+        dom_set_text(el, label)
+    }
+    dom_add_listener(el, "click", handler)
+    return el
+}
+
+fn vdom_set_kids_text(parent: int, id_prefix: str, labels: [str]) {
+    dom_clear_children(parent)
+    for i in 0..len(labels) {
+        let id = id_prefix + str_of_int(i)
+        let el = dom_create_element("li")
+        dom_set_attr(el, "id", id)
+        dom_set_text(el, labels[i])
+        dom_append_child(parent, el)
+    }
+}
+
+test "vdom upsert" {
+    let root = dom_document()
+    let a = vdom_text(root, "msg", "one")
+    let b = vdom_text(root, "msg", "two")
+    assert a == b
+    assert dom_get_text(a) == "two"
+}

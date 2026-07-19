@@ -92,7 +92,9 @@ import "pkg:mathx/mathx.mno" as mx
 | [`template`](template/) | mustache lite | `{{key}}` via StrMap |
 | [`color`](color/) | CSS color | RGB hex, lerp, luma |
 | [`regex`](regex/) | JS `RegExp` lite | `. * + ? \| () ^ $ [] \d\w\s`, find/replace |
-| [`dom`](dom/) | browser DOM | create/query/text/attr/style; real DOM in `run.html`, virtual in `machino run` |
+| [`dom`](dom/) | browser DOM | create/query/text/attr/style/layout + **events** (`dom_add_listener` / `dom_dispatch`) |
+| [`vdom`](vdom/) | tiny React-ish | keyed upsert / patch helpers on top of `dom` |
+| [`db`](db/) | DB drivers | `memory` (always), `sqlite`/`mysql`/`postgres`/`mongo` via CLI hosts |
 
 That’s ~42 packages covering collections, text/wire formats, HTTP/CLI,
 geometry, math, **regex**, and **DOM**. Still not literally everything: no
@@ -107,6 +109,8 @@ a practical subset (not full PCRE). DOM is capability-based via `extern fn`.
 | [`examples/pkg_text_pipeline.mno`](../examples/pkg_text_pipeline.mno) | regex, encoding, template, text, csv |
 | [`examples/pkg_http_router.mno`](../examples/pkg_http_router.mno) | httpkit, urlparse, pathutil, cli |
 | [`examples/pkg_dom_ui.mno`](../examples/pkg_dom_ui.mno) | dom (browser + virtual) |
+| [`examples/pkg_dom_events.mno`](../examples/pkg_dom_events.mno) | dom events + vdom |
+| [`examples/pkg_db_demo.mno`](../examples/pkg_db_demo.mno) | db memory / SQL / mongo drivers |
 | [`examples/pkg_science.mno`](../examples/pkg_science.mno) | statsadv, signal, sortx, bigint, geom2d, … |
 
 ## Try the demo

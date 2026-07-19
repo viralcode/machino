@@ -226,14 +226,25 @@ extern fn dom_remove_child(parent: int, child: int)
 extern fn dom_add_class(el: int, cls: str)
 extern fn dom_set_style(el: int, prop: str, value: str)
 extern fn dom_get_style(el: int, prop: str) -> str
+extern fn dom_add_listener(el: int, event: str, handler: str)
+extern fn dom_dispatch(el: int, event: str)
+extern fn dom_last_event_type() -> str
+extern fn dom_last_event_target() -> int
+extern fn db_open(driver: str, conn: str) -> int
+extern fn db_close(h: int)
+extern fn db_exec(h: int, sql: str) -> str
+extern fn db_query(h: int, sql: str) -> str
 ```
 
 Servers: `tcp_listen` → loop `tcp_accept` → `tcp_read` → `tcp_write` →
-`tcp_close`. See `examples/http_server.mno` for a complete HTTP server.
-The Node WASM host provides everything except `tcp_*`. Prefer
-`import "../packages/dom/dom.mno"` (or `pkg:dom/dom.mno`) instead of redeclaring
-DOM externs. Regex is a pure package: `packages/regex` (`regex_is_match`,
-`regex_find`, `regex_capture`, `regex_replace_all`).
+`tcp_close`. See `examples/http_server.mno`. Prefer packages:
+`packages/dom` (events: bind exported zero-arg `handler` name),
+`packages/vdom`, `packages/db` (`memory`|`sqlite`|`mysql`|`postgres`|`mongo`),
+`packages/regex`. Node WASM host provides DOM + DB; not `tcp_*`.
+
+DOM events: `dom_add_listener(btn, "click", "on_inc")` then define
+`fn on_inc() { ... }` (exported). Native/tests: `dom_dispatch(btn, "click")`.
+Browser: real listeners via `runners/dom_host.mjs` after `bindExports`.
 
 ## Packages
 

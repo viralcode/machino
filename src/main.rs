@@ -1,5 +1,6 @@
 mod ast;
 mod checker;
+mod db_runtime;
 mod diag;
 mod fmt;
 mod interp;

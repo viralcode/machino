@@ -26,7 +26,8 @@ Declare what you need with `extern fn`; undeclared host powers are unreachable.
 | `exit(code: int)` | Terminate the process |
 | `http_get(url: str) -> str` | Blocking HTTP GET body |
 | `tcp_listen` / `tcp_accept` / `tcp_read` / `tcp_write` / `tcp_close` | TCP sockets |
-| `dom_*` | Virtual DOM (create/query/text/attr/style/append). Same import names as the browser host in `runners/run.html` — see `packages/dom` |
+| `dom_*` | Virtual DOM + events (`dom_add_listener` / `dom_dispatch`, layout/dataset helpers). Browser: `runners/run.html` + `dom_host.mjs` |
+| `db_open` / `db_close` / `db_exec` / `db_query` | DB drivers: `memory`, `sqlite`, `mysql`, `postgres`, `mongo` (CLI-backed). See `packages/db` |
 
 Contracts, asserts, bounds checks, and overflow traps are enforced the same way
 as in compiled WASM.

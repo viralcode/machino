@@ -1,0 +1,87 @@
+# db — database drivers via host capabilities
+#
+#   import "../packages/db/db.mno"
+#   let h = db_connect_memory()
+#   db_put(h, "users", "{\"id\":1,\"name\":\"ada\"}")
+#   print(db_get(h, "users"))
+#
+# Drivers (native runtime):
+#   memory  — always available (PUT/GET/CLEAR/COUNT mini-language)
+#   sqlite  — requires `sqlite3` on PATH; conn = path or sqlite://path
+#   mysql   — requires `mysql` CLI; conn = mysql://user:pass@host:3306/db
+#   postgres— requires `psql`; conn = postgres://...
+#   mongo   — requires `mongosh`; conn = mongodb://host/db
+#             db_query/db_exec send mongosh --eval scripts
+#
+# Results are JSON strings: {"ok":true,...} or {"ok":false,"error":"..."}.
+
+extern fn db_open(driver: str, conn: str) -> int
+extern fn db_close(h: int)
+extern fn db_exec(h: int, sql: str) -> str
+extern fn db_query(h: int, sql: str) -> str
+
+fn db_connect_memory() -> int {
+    return db_open("memory", "")
+}
+
+fn db_connect_sqlite(path: str) -> int {
+    return db_open("sqlite", path)
+}
+
+fn db_connect_mysql(url: str) -> int {
+    return db_open("mysql", url)
+}
+
+fn db_connect_postgres(url: str) -> int {
+    return db_open("postgres", url)
+}
+
+fn db_connect_mongo(url: str) -> int {
+    return db_open("mongo", url)
+}
+
+fn db_ok(json: str) -> bool {
+    return starts_with(json, "{\"ok\":true")
+}
+
+fn db_put(h: int, coll: str, doc: str) -> str {
+    return db_exec(h, "PUT " + coll + " " + doc)
+}
+
+fn db_get(h: int, coll: str) -> str {
+    return db_query(h, "GET " + coll)
+}
+
+fn db_clear(h: int, coll: str) -> str {
+    return db_exec(h, "CLEAR " + coll)
+}
+
+fn db_count(h: int, coll: str) -> str {
+    return db_query(h, "COUNT " + coll)
+}
+
+fn db_sql(h: int, sql: str) -> str {
+    return db_query(h, sql)
+}
+
+fn db_sql_exec(h: int, sql: str) -> str {
+    return db_exec(h, sql)
+}
+
+fn db_mongo_eval(h: int, js: str) -> str {
+    return db_query(h, js)
+}
+
+test "memory driver" {
+    let h = db_connect_memory()
+    assert h > 0
+    assert db_ok(db_put(h, "users", "{\"id\":1,\"name\":\"ada\"}"))
+    assert db_ok(db_put(h, "users", "{\"id\":2,\"name\":\"grace\"}"))
+    let rows = db_get(h, "users")
+    assert db_ok(rows)
+    assert contains(rows, "ada")
+    assert contains(db_count(h, "users"), "2")
+    assert db_ok(db_clear(h, "users"))
+    assert contains(db_count(h, "users"), "0")
+    db_close(h)
+}

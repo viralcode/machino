@@ -193,9 +193,10 @@ Install with `machino pkg add` and `import "pkg:regex/regex.mno"`.
 See [`packages/README.md`](packages/README.md), try [`packages/demo`](packages/demo),
 and the package demos `examples/pkg_*.mno` (math, text/regex, HTTP, DOM, science).
 
-DOM: declare via `packages/dom` → real browser bindings in
-[`runners/run.html`](runners/run.html) / [`runners/dom_host.mjs`](runners/dom_host.mjs);
-`machino run` uses a virtual DOM so the same programs test natively.
+DOM: [`packages/dom`](packages/dom) (+ events/layout) and [`packages/vdom`](packages/vdom);
+browser host [`runners/dom_host.mjs`](runners/dom_host.mjs). Databases:
+[`packages/db`](packages/db) — `memory`, `sqlite`, `mysql`, `postgres`, `mongo`
+(CLI-backed on the host; memory always works).
 
 ## Examples
 
@@ -237,6 +238,8 @@ Curated demos live in [`examples/`](examples/). A 100-file language corpus (each
 | [`examples/pkg_text_pipeline.mno`](examples/pkg_text_pipeline.mno) | Packages: regex / encoding / template / csv |
 | [`examples/pkg_http_router.mno`](examples/pkg_http_router.mno) | Packages: httpkit / urlparse / cli |
 | [`examples/pkg_dom_ui.mno`](examples/pkg_dom_ui.mno) | Packages: DOM (virtual + browser WASM) |
+| [`examples/pkg_dom_events.mno`](examples/pkg_dom_events.mno) | Packages: DOM events + vdom |
+| [`examples/pkg_db_demo.mno`](examples/pkg_db_demo.mno) | Packages: db drivers (memory / SQL / mongo) |
 | [`examples/pkg_science.mno`](examples/pkg_science.mno) | Packages: statsadv / signal / bigint / geom2d |
 
 ### `test/` — 100 language examples + services

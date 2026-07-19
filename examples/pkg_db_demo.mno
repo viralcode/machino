@@ -1,0 +1,27 @@
+# Database drivers demo (memory always works; sqlite/mysql/mongo need CLIs).
+#   machino run examples/pkg_db_demo.mno
+#
+# Real engines:
+#   let h = db_connect_sqlite("/tmp/app.db")
+#   print(db_sql_exec(h, "create table if not exists t(x int)"))
+#   print(db_sql(h, "select * from t"))
+#   let m = db_connect_mongo("mongodb://localhost:27017/demo")
+#   print(db_mongo_eval(m, "db.users.find().toArray()"))
+
+import "../packages/db/db.mno"
+
+fn main() {
+    let h = db_connect_memory()
+    print(db_put(h, "users", "{\"id\":1,\"name\":\"ada\"}"))
+    print(db_put(h, "users", "{\"id\":2,\"name\":\"grace\"}"))
+    print(db_get(h, "users"))
+    print(db_count(h, "users"))
+    db_close(h)
+}
+
+test "db memory" {
+    let h = db_connect_memory()
+    assert db_ok(db_put(h, "items", "{\"sku\":\"a\"}"))
+    assert contains(db_get(h, "items"), "sku")
+    db_close(h)
+}

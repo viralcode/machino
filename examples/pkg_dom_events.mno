@@ -1,0 +1,46 @@
+# DOM events + vdom reconcile demo (virtual under machino run).
+#   machino run examples/pkg_dom_events.mno
+# Browser: build to wasm, drop into runners/run.html, click the button.
+
+import "../packages/dom/dom.mno"
+import "../packages/vdom/vdom.mno"
+
+fn on_inc() {
+    let t = dom_last_event_target()
+    let n = 0
+    let cur = dom_dataset_get(t, "n")
+    if is_int_str(cur) {
+        n = parse_int(cur)
+    }
+    n = n + 1
+    dom_dataset_set(t, "n", str_of_int(n))
+    dom_set_text(t, "clicks: " + str_of_int(n))
+    let out = dom_get_element_by_id("out")
+    if out != 0 {
+        vdom_text(dom_document(), "out", "last=" + str_of_int(n))
+    }
+}
+
+fn main() {
+    let root = dom_get_element_by_id("machino-root")
+    if root == 0 {
+        root = dom_document()
+    }
+    let btn = vdom_button(root, "btn", "clicks: 0", "on_inc")
+    dom_dataset_set(btn, "n", "0")
+    vdom_text(root, "out", "last=0")
+    # exercise the listener without a real browser click
+    dom_dispatch(btn, "click")
+    dom_dispatch(btn, "click")
+    print(dom_get_text(btn))
+    print(dom_get_text(dom_get_element_by_id("out")))
+}
+
+test "events" {
+    let root = dom_document()
+    let btn = vdom_button(root, "b2", "clicks: 0", "on_inc")
+    dom_dataset_set(btn, "n", "0")
+    vdom_text(root, "out", "last=0")
+    dom_dispatch(btn, "click")
+    assert dom_get_text(btn) == "clicks: 1"
+}

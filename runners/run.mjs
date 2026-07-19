@@ -27,6 +27,7 @@ import {
   workerData,
 } from "node:worker_threads";
 import { createDomHost } from "./dom_host.mjs";
+import { createDbHost } from "./db_host.mjs";
 
 let memory; // set after instantiation
 let alloc; // exported allocator
@@ -293,8 +294,12 @@ function copyStrBytes(addr) {
   return new Uint8Array(memory.buffer.slice(a + 16, a + 16 + len));
 }
 
+let domHost = null;
+
 function makeImports(programArgs) {
-  const dom = createDomHost({ readStr, makeStr, mode: "virtual" });
+  domHost = createDomHost({ readStr, makeStr, mode: "virtual" });
+  const dom = domHost;
+  const db = createDbHost({ readStr, makeStr });
   return {
     env: {
       // called just before the module traps on a contract/assert/bounds failure
@@ -463,6 +468,7 @@ function makeImports(programArgs) {
       // Node's socket API is asynchronous, so this synchronous WASM host does
       // not implement them; provide your own host (or WASI sockets) if needed.
       ...dom,
+      ...db,
     },
   };
 }
@@ -491,6 +497,9 @@ function setInstance(instance) {
   alloc = instance.exports.alloc;
   if (instance.exports.heap_base !== undefined) {
     heapBase = Number(instance.exports.heap_base.value);
+  }
+  if (domHost && typeof domHost.bindExports === "function") {
+    domHost.bindExports(instance.exports);
   }
 }
 

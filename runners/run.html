@@ -127,6 +127,9 @@ async function run(bytes, name) {
     const { instance } = await WebAssembly.instantiate(bytes, imports);
     memory = instance.exports.memory;
     alloc = instance.exports.alloc;
+    if (typeof dom.bindExports === "function") {
+      dom.bindExports(instance.exports);
+    }
     // Prefer mounting under #stage when present so demos don't fight the UI.
     if (stage) {
       const app = document.createElement("div");
@@ -134,7 +137,7 @@ async function run(bytes, name) {
       stage.appendChild(app);
     }
     instance.exports.main();
-    line("— finished —", "meta");
+    line("— finished (DOM listeners stay active) —", "meta");
   } catch (e) {
     if (!(e instanceof WebAssembly.RuntimeError)) line(String(e), "err");
     line("— trapped —", "meta");

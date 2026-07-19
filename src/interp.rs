@@ -285,6 +285,11 @@ pub struct Interp<'a> {
     /// Virtual DOM for `dom_*` externs (native runtime / tests).
     dom_nodes: HashMap<i64, VDomNode>,
     next_dom: i64,
+    dom_listeners: HashMap<(i64, String), String>,
+    dom_last_event_type: String,
+    dom_last_event_target: i64,
+    db_conns: HashMap<i64, crate::db_runtime::DbConn>,
+    next_db: i64,
 }
 
 #[derive(Clone)]
@@ -295,6 +300,8 @@ struct VDomNode {
     styles: HashMap<String, String>,
     children: Vec<i64>,
     parent: i64,
+    width: i64,
+    height: i64,
 }
 
 type RResult<T> = Result<T, RuntimeError>;
@@ -349,11 +356,18 @@ impl<'a> Interp<'a> {
                         styles: HashMap::new(),
                         children: Vec::new(),
                         parent: 0,
+                        width: 800,
+                        height: 600,
                     },
                 );
                 m
             },
             next_dom: 2,
+            dom_listeners: HashMap::new(),
+            dom_last_event_type: String::new(),
+            dom_last_event_target: 0,
+            db_conns: HashMap::new(),
+            next_db: 1,
         }
     }
 
@@ -790,6 +804,8 @@ impl<'a> Interp<'a> {
                         styles: HashMap::new(),
                         children: Vec::new(),
                         parent: 0,
+                        width: 100,
+                        height: 40,
                     },
                 );
                 Ok(Value::Int(h))
@@ -1027,14 +1043,374 @@ impl<'a> Interp<'a> {
                     .unwrap_or_default();
                 Ok(Value::str_value(&v))
             }
+            "dom_get_computed_style" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Str,
+                    "extern fn dom_get_computed_style(el: int, prop: str) -> str"
+                );
+                // Virtual DOM: same as inline style.
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let prop = as_string(&args[1]);
+                let v = self
+                    .dom_nodes
+                    .get(&h)
+                    .and_then(|n| n.styles.get(&prop).cloned())
+                    .unwrap_or_default();
+                Ok(Value::str_value(&v))
+            }
+            "dom_remove_class" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Unit,
+                    "extern fn dom_remove_class(el: int, cls: str)"
+                );
+                if let Value::Int(h) = &args[0] {
+                    let cls = as_string(&args[1]);
+                    if let Some(n) = self.dom_nodes.get_mut(h) {
+                        let next: Vec<&str> = n
+                            .attrs
+                            .get("class")
+                            .map(|c| c.split_whitespace().filter(|c| *c != cls).collect())
+                            .unwrap_or_default();
+                        n.attrs.insert("class".into(), next.join(" "));
+                    }
+                }
+                Ok(Value::Unit)
+            }
+            "dom_toggle_class" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Bool,
+                    "extern fn dom_toggle_class(el: int, cls: str) -> bool"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let cls = as_string(&args[1]);
+                let mut on = false;
+                if let Some(n) = self.dom_nodes.get_mut(&h) {
+                    let mut parts: Vec<String> = n
+                        .attrs
+                        .get("class")
+                        .map(|c| c.split_whitespace().map(|s| s.to_string()).collect())
+                        .unwrap_or_default();
+                    if let Some(i) = parts.iter().position(|c| c == &cls) {
+                        parts.remove(i);
+                        on = false;
+                    } else {
+                        parts.push(cls);
+                        on = true;
+                    }
+                    n.attrs.insert("class".into(), parts.join(" "));
+                }
+                Ok(Value::Bool(on))
+            }
+            "dom_has_class" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Bool,
+                    "extern fn dom_has_class(el: int, cls: str) -> bool"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let cls = as_string(&args[1]);
+                let on = self
+                    .dom_nodes
+                    .get(&h)
+                    .and_then(|n| n.attrs.get("class"))
+                    .map(|c| c.split_whitespace().any(|x| x == cls))
+                    .unwrap_or(false);
+                Ok(Value::Bool(on))
+            }
+            "dom_client_width" | "dom_offset_width" => {
+                check_sig!(vec![Type::Int], Type::Int, "extern fn dom_*_width(el: int) -> int");
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                Ok(Value::Int(
+                    self.dom_nodes.get(&h).map(|n| n.width).unwrap_or(0),
+                ))
+            }
+            "dom_client_height" | "dom_offset_height" => {
+                check_sig!(vec![Type::Int], Type::Int, "extern fn dom_*_height(el: int) -> int");
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                Ok(Value::Int(
+                    self.dom_nodes.get(&h).map(|n| n.height).unwrap_or(0),
+                ))
+            }
+            "dom_get_bounding_rect" => {
+                check_sig!(
+                    vec![Type::Int],
+                    Type::Str,
+                    "extern fn dom_get_bounding_rect(el: int) -> str"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let (w, ht) = self
+                    .dom_nodes
+                    .get(&h)
+                    .map(|n| (n.width, n.height))
+                    .unwrap_or((0, 0));
+                Ok(Value::str_value(&format!("0,0,{},{}", w, ht)))
+            }
+            "dom_focus" | "dom_blur" => {
+                check_sig!(vec![Type::Int], Type::Unit, "extern fn dom_focus/blur(el: int)");
+                Ok(Value::Unit)
+            }
+            "dom_scroll_to" => {
+                check_sig!(
+                    vec![Type::Int, Type::Int, Type::Int],
+                    Type::Unit,
+                    "extern fn dom_scroll_to(el: int, x: int, y: int)"
+                );
+                Ok(Value::Unit)
+            }
+            "dom_parent" => {
+                check_sig!(vec![Type::Int], Type::Int, "extern fn dom_parent(el: int) -> int");
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                Ok(Value::Int(
+                    self.dom_nodes.get(&h).map(|n| n.parent).unwrap_or(0),
+                ))
+            }
+            "dom_child_count" => {
+                check_sig!(
+                    vec![Type::Int],
+                    Type::Int,
+                    "extern fn dom_child_count(el: int) -> int"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                Ok(Value::Int(
+                    self.dom_nodes
+                        .get(&h)
+                        .map(|n| n.children.len() as i64)
+                        .unwrap_or(0),
+                ))
+            }
+            "dom_child_at" => {
+                check_sig!(
+                    vec![Type::Int, Type::Int],
+                    Type::Int,
+                    "extern fn dom_child_at(el: int, index: int) -> int"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let i = match &args[1] {
+                    Value::Int(i) => *i,
+                    _ => 0,
+                };
+                let child = self
+                    .dom_nodes
+                    .get(&h)
+                    .and_then(|n| n.children.get(i as usize).copied())
+                    .unwrap_or(0);
+                Ok(Value::Int(child))
+            }
+            "dom_clear_children" => {
+                check_sig!(
+                    vec![Type::Int],
+                    Type::Unit,
+                    "extern fn dom_clear_children(el: int)"
+                );
+                if let Value::Int(h) = &args[0] {
+                    let kids = self
+                        .dom_nodes
+                        .get(h)
+                        .map(|n| n.children.clone())
+                        .unwrap_or_default();
+                    for c in kids {
+                        if let Some(ch) = self.dom_nodes.get_mut(&c) {
+                            ch.parent = 0;
+                        }
+                    }
+                    if let Some(n) = self.dom_nodes.get_mut(h) {
+                        n.children.clear();
+                        n.text.clear();
+                    }
+                }
+                Ok(Value::Unit)
+            }
+            "dom_dataset_set" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str, Type::Str],
+                    Type::Unit,
+                    "extern fn dom_dataset_set(el: int, key: str, value: str)"
+                );
+                if let Value::Int(h) = &args[0] {
+                    let key = format!("data-{}", as_string(&args[1]));
+                    if let Some(n) = self.dom_nodes.get_mut(h) {
+                        n.attrs.insert(key, as_string(&args[2]));
+                    }
+                }
+                Ok(Value::Unit)
+            }
+            "dom_dataset_get" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Str,
+                    "extern fn dom_dataset_get(el: int, key: str) -> str"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let key = format!("data-{}", as_string(&args[1]));
+                let v = self
+                    .dom_nodes
+                    .get(&h)
+                    .and_then(|n| n.attrs.get(&key).cloned())
+                    .unwrap_or_default();
+                Ok(Value::str_value(&v))
+            }
+            "dom_add_listener" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str, Type::Str],
+                    Type::Unit,
+                    "extern fn dom_add_listener(el: int, event: str, handler: str)"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let event = as_string(&args[1]);
+                let handler = as_string(&args[2]);
+                self.dom_listeners.insert((h, event), handler);
+                Ok(Value::Unit)
+            }
+            "dom_remove_listener" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Unit,
+                    "extern fn dom_remove_listener(el: int, event: str)"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let event = as_string(&args[1]);
+                self.dom_listeners.remove(&(h, event));
+                Ok(Value::Unit)
+            }
+            "dom_dispatch" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Unit,
+                    "extern fn dom_dispatch(el: int, event: str)"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let event = as_string(&args[1]);
+                self.dom_last_event_type = event.clone();
+                self.dom_last_event_target = h;
+                let handler = self.dom_listeners.get(&(h, event)).cloned();
+                if let Some(name) = handler {
+                    self.call_by_name(&name, Vec::new())?;
+                }
+                Ok(Value::Unit)
+            }
+            "dom_last_event_type" => {
+                check_sig!(
+                    Vec::<Type>::new(),
+                    Type::Str,
+                    "extern fn dom_last_event_type() -> str"
+                );
+                Ok(Value::str_value(&self.dom_last_event_type.clone()))
+            }
+            "dom_last_event_target" => {
+                check_sig!(
+                    Vec::<Type>::new(),
+                    Type::Int,
+                    "extern fn dom_last_event_target() -> int"
+                );
+                Ok(Value::Int(self.dom_last_event_target))
+            }
+            "db_open" => {
+                check_sig!(
+                    vec![Type::Str, Type::Str],
+                    Type::Int,
+                    "extern fn db_open(driver: str, conn: str) -> int"
+                );
+                let driver = as_string(&args[0]);
+                let conn = as_string(&args[1]);
+                match crate::db_runtime::open(&driver, &conn) {
+                    Ok(c) => {
+                        let h = self.next_db;
+                        self.next_db += 1;
+                        self.db_conns.insert(h, c);
+                        Ok(Value::Int(h))
+                    }
+                    Err(e) => Err(RuntimeError::new(format!("db_open: {}", e), call_span)),
+                }
+            }
+            "db_close" => {
+                check_sig!(vec![Type::Int], Type::Unit, "extern fn db_close(h: int)");
+                if let Value::Int(h) = &args[0] {
+                    self.db_conns.remove(h);
+                }
+                Ok(Value::Unit)
+            }
+            "db_exec" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Str,
+                    "extern fn db_exec(h: int, sql: str) -> str"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let sql = as_string(&args[1]);
+                let Some(conn) = self.db_conns.get_mut(&h) else {
+                    return Ok(Value::str_value(
+                        "{\"ok\":false,\"error\":\"invalid db handle\"}",
+                    ));
+                };
+                Ok(Value::str_value(&crate::db_runtime::exec(conn, &sql)))
+            }
+            "db_query" => {
+                check_sig!(
+                    vec![Type::Int, Type::Str],
+                    Type::Str,
+                    "extern fn db_query(h: int, sql: str) -> str"
+                );
+                let h = match &args[0] {
+                    Value::Int(h) => *h,
+                    _ => 0,
+                };
+                let sql = as_string(&args[1]);
+                let Some(conn) = self.db_conns.get_mut(&h) else {
+                    return Ok(Value::str_value(
+                        "{\"ok\":false,\"error\":\"invalid db handle\"}",
+                    ));
+                };
+                Ok(Value::str_value(&crate::db_runtime::query(conn, &sql)))
+            }
             other => Err(RuntimeError::new(
                 format!(
                     "extern '{}' is not provided by the machino native runtime. Available externs: \
-                     clock_ms, sleep_ms, read_file, write_file, file_exists, read_line, getenv, http_get, \
-                     args, exit, tcp_listen, tcp_accept, tcp_read, tcp_write, tcp_close, \
-                     dom_document, dom_get_element_by_id, dom_query_selector, dom_create_element, \
-                     dom_set_text, dom_get_text, dom_set_html, dom_get_html, dom_set_attr, dom_get_attr, \
-                     dom_append_child, dom_remove_child, dom_add_class, dom_set_style, dom_get_style. \
+                     clock_ms, sleep_ms, files/env/http/args/exit/tcp_*, dom_*, db_open/db_close/db_exec/db_query. \
                      For other capabilities, compile with 'machino build' and provide the import \
                      from your own host.",
                     other

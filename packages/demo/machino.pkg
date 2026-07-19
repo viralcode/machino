@@ -42,3 +42,5 @@ dep template ../template
 dep color ../color
 dep regex ../regex
 dep dom ../dom
+dep vdom ../vdom
+dep db ../db

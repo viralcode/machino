@@ -1,0 +1,3 @@
+name vdom
+version 0.1.0
+dep dom ../dom
