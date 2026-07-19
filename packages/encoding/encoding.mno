@@ -1,0 +1,105 @@
+# encoding — hex, base64, URL encode/decode (ASCII)
+
+fn enc_hex_byte(b: int) -> str
+requires b >= 0
+requires b < 256
+{
+    let digits = "0123456789abcdef"
+    return chr(char_at(digits, b / 16)) + chr(char_at(digits, b % 16))
+}
+
+fn enc_hex_encode(s: str) -> str {
+    let out = ""
+    for i in 0..len(s) {
+        out = out + enc_hex_byte(char_at(s, i))
+    }
+    return out
+}
+
+fn enc_hex_nibble(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    return 0
+}
+
+fn enc_hex_decode(s: str) -> str
+requires len(s) % 2 == 0
+{
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let hi = enc_hex_nibble(char_at(s, i))
+        let lo = enc_hex_nibble(char_at(s, i + 1))
+        out = out + chr(hi * 16 + lo)
+        i = i + 2
+    }
+    return out
+}
+
+fn enc_url_encode(s: str) -> str {
+    let out = ""
+    for i in 0..len(s) {
+        let c = char_at(s, i)
+        let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 95 || c == 46 || c == 126
+        if ok {
+            out = out + chr(c)
+        } else if c == 32 {
+            out = out + "+"
+        } else {
+            out = out + "%" + enc_hex_byte(c)
+        }
+    }
+    return out
+}
+
+fn enc_b64_table() -> str {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+}
+
+fn enc_base64_encode(s: str) -> str {
+    let table = enc_b64_table()
+    let out = ""
+    let i = 0
+    let n = len(s)
+    while i < n {
+        let b0 = char_at(s, i)
+        let b1 = 0
+        let b2 = 0
+        let rem = n - i
+        if rem > 1 {
+            b1 = char_at(s, i + 1)
+        }
+        if rem > 2 {
+            b2 = char_at(s, i + 2)
+        }
+        let triple = b0 * 65536 + b1 * 256 + b2
+        out = out + chr(char_at(table, (triple / 262144) % 64))
+        out = out + chr(char_at(table, (triple / 4096) % 64))
+        if rem > 1 {
+            out = out + chr(char_at(table, (triple / 64) % 64))
+        } else {
+            out = out + "="
+        }
+        if rem > 2 {
+            out = out + chr(char_at(table, triple % 64))
+        } else {
+            out = out + "="
+        }
+        i = i + 3
+    }
+    return out
+}
+
+test "encoding" {
+    assert enc_hex_encode("Ab") == "4162"
+    assert enc_hex_decode("4162") == "Ab"
+    assert enc_url_encode("a b") == "a+b"
+    assert enc_base64_encode("Man") == "TWFu"
+}

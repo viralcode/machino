@@ -1,0 +1,61 @@
+# text — string layout helpers
+
+fn text_lines(s: str) -> [str] {
+    return split(s, "\n")
+}
+
+fn text_pad_left(s: str, width: int, ch: str) -> str
+requires len(ch) == 1
+{
+    let out = s
+    while len(out) < width {
+        out = ch + out
+    }
+    return out
+}
+
+fn text_pad_right(s: str, width: int, ch: str) -> str
+requires len(ch) == 1
+{
+    let out = s
+    while len(out) < width {
+        out = out + ch
+    }
+    return out
+}
+
+fn text_indent(s: str, spaces: int) -> str
+requires spaces >= 0
+{
+    let pad = repeat(" ", spaces)
+    let lines = text_lines(s)
+    let out: [str] = []
+    for i in 0..len(lines) {
+        out = push(out, pad + lines[i])
+    }
+    return join(out, "\n")
+}
+
+fn text_replace(s: str, old: str, new: str) -> str
+requires len(old) > 0
+{
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        if i + len(old) <= len(s) && substr(s, i, i + len(old)) == old {
+            out = out + new
+            i = i + len(old)
+        } else {
+            out = out + chr(char_at(s, i))
+            i = i + 1
+        }
+    }
+    return out
+}
+
+test "text" {
+    assert text_pad_left("7", 3, "0") == "007"
+    assert text_pad_right("a", 3, "-") == "a--"
+    assert text_replace("a_b_a", "_", "-") == "a-b-a"
+    assert text_indent("x\ny", 2) == "  x\n  y"
+}

@@ -1,0 +1,69 @@
+# jsonutil — helpers on top of prelude JSON
+
+fn json_as_str(v: Json, default: str) -> str {
+    return match v {
+        Json::JStr(s) => s
+        _ => default
+    }
+}
+
+fn json_as_num(v: Json, default: float) -> float {
+    return match v {
+        Json::JNum(n) => n
+        _ => default
+    }
+}
+
+fn json_as_bool(v: Json, default: bool) -> bool {
+    return match v {
+        Json::JBool(b) => b
+        _ => default
+    }
+}
+
+fn json_obj_str(o: JsonObj, key: str, default: str) -> str {
+    return json_as_str(json_obj_get(o, key), default)
+}
+
+fn json_obj_num(o: JsonObj, key: str, default: float) -> float {
+    return json_as_num(json_obj_get(o, key), default)
+}
+
+fn json_is_ok(p: JsonParsed) -> bool {
+    return match p {
+        JsonParsed::JVal(_) => true
+        JsonParsed::JError(_) => false
+    }
+}
+
+fn json_error_msg(p: JsonParsed) -> str {
+    return match p {
+        JsonParsed::JError(e) => e
+        JsonParsed::JVal(_) => ""
+    }
+}
+
+fn json_describe(v: Json) -> str {
+    return match v {
+        Json::JNull => "null"
+        Json::JBool(b) => str_of_bool(b)
+        Json::JNum(n) => str_of_float(n, 2)
+        Json::JStr(s) => s
+        Json::JArr(xs) => "array(len=" + str_of_int(len(xs)) + ")"
+        Json::JObj(_) => "object"
+    }
+}
+
+test "jsonutil" {
+    let p = json_parse("{\"n\":3,\"s\":\"hi\",\"ok\":true}")
+    assert json_is_ok(p)
+    let summary = match p {
+        JsonParsed::JVal(v) => match v {
+            Json::JObj(o) => json_obj_str(o, "s", "") + ":" + str_of_int(to_int(json_obj_num(o, "n", 0.0)))
+            _ => "bad"
+        }
+        JsonParsed::JError(e) => e
+    }
+    assert summary == "hi:3"
+    assert json_describe(Json::JNull) == "null"
+}

@@ -1,0 +1,43 @@
+# queue — FIFO queue of ints
+
+struct IntQueue {
+    data: [int]
+    head: int
+}
+
+fn queue_new() -> IntQueue {
+    let xs: [int] = []
+    return IntQueue(xs, 0)
+}
+
+fn queue_len(q: IntQueue) -> int {
+    return len(q.data) - q.head
+}
+
+fn queue_push(q: IntQueue, v: int) {
+    q.data = push(q.data, v)
+}
+
+fn queue_pop(q: IntQueue) -> int
+requires queue_len(q) > 0
+{
+    let v = q.data[q.head]
+    q.head = q.head + 1
+    return v
+}
+
+fn queue_peek(q: IntQueue) -> int
+requires queue_len(q) > 0
+{
+    return q.data[q.head]
+}
+
+test "queue" {
+    let q = queue_new()
+    queue_push(q, 1)
+    queue_push(q, 2)
+    assert queue_peek(q) == 1
+    assert queue_pop(q) == 1
+    assert queue_pop(q) == 2
+    assert queue_len(q) == 0
+}

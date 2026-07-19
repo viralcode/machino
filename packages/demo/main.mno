@@ -1,0 +1,62 @@
+# Demo app that pulls in the official packages/ ecosystem.
+# From this directory:
+#   machino pkg sync
+#   machino run main.mno
+#   machino test main.mno
+
+import "pkg:mathx/mathx.mno"
+import "pkg:vec/vec.mno"
+import "pkg:algo/algo.mno"
+import "pkg:encoding/encoding.mno"
+import "pkg:stats/stats.mno"
+import "pkg:httpkit/httpkit.mno"
+import "pkg:pathutil/pathutil.mno"
+import "pkg:urlparse/urlparse.mno"
+import "pkg:set/set.mno"
+import "pkg:text/text.mno"
+import "pkg:jsonutil/jsonutil.mno"
+import "pkg:graph/graph.mno"
+import "pkg:rand/rand.mno"
+import "pkg:option/option.mno"
+import "pkg:result/result.mno"
+
+fn main() {
+    print(mathx_gcd(48, 18))
+    print(vec_join_strs(["machino", "packages"], " "))
+    print(algo_binary_search([1, 2, 3, 5, 8], 5))
+    print(enc_hex_encode("OK"))
+    print(stats_mean([2, 4, 6]))
+    print(path_join("src", "main.mno"))
+    let u = url_parse("https://example.com/x?q=1")
+    print(u.host)
+    let s = intset_new()
+    intset_add(s, 9)
+    print(intset_has(s, 9))
+    let g = graph_new(3)
+    graph_add_edge(g, 0, 1)
+    print(graph_bfs_dist(g, 0)[1])
+    let r = rng_new(1)
+    print(rng_int(r, 0, 100) >= 0)
+    print(int_maybe_unwrap_or(int_maybe_some(42), 0))
+    print(res_unwrap_or(res_ok("yes"), "no"))
+    let req = http_parse_request("GET /api HTTP/1.1\r\n\r\n")
+    print(req.path)
+    print(text_replace("a_b", "_", "/"))
+    let jp = json_parse("{\"v\":1}")
+    print(json_is_ok(jp))
+    let summary = match jp {
+        JsonParsed::JVal(v) => json_describe(v)
+        JsonParsed::JError(e) => e
+    }
+    print(summary)
+}
+
+test "demo packages" {
+    assert mathx_gcd(48, 18) == 6
+    assert enc_base64_encode("Man") == "TWFu"
+    assert stats_median([1, 3, 2]) == 2.0
+    assert path_basename("/a/b.c") == "b.c"
+    assert url_query_get("a=1&b=2", "b") == "2"
+    assert text_pad_left("1", 3, "0") == "001"
+    assert int_maybe_unwrap_or(int_maybe_some(1), 0) == 1
+}

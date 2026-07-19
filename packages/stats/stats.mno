@@ -1,0 +1,51 @@
+# stats — mean / min / max / sum for int arrays
+
+fn stats_sum(xs: [int]) -> int {
+    return sum_ints(xs)
+}
+
+fn stats_min(xs: [int]) -> int
+requires len(xs) > 0
+{
+    let m = xs[0]
+    for i in 1..len(xs) {
+        m = min_int(m, xs[i])
+    }
+    return m
+}
+
+fn stats_max(xs: [int]) -> int
+requires len(xs) > 0
+{
+    let m = xs[0]
+    for i in 1..len(xs) {
+        m = max_int(m, xs[i])
+    }
+    return m
+}
+
+fn stats_mean(xs: [int]) -> float
+requires len(xs) > 0
+{
+    return to_float(sum_ints(xs)) / to_float(len(xs))
+}
+
+fn stats_median(xs: [int]) -> float
+requires len(xs) > 0
+{
+    let s = sort_ints(xs)
+    let n = len(s)
+    if n % 2 == 1 {
+        return to_float(s[n / 2])
+    }
+    return (to_float(s[n / 2 - 1]) + to_float(s[n / 2])) / 2.0
+}
+
+test "stats" {
+    let xs = [1, 2, 3, 4]
+    assert stats_sum(xs) == 10
+    assert stats_min(xs) == 1
+    assert stats_max(xs) == 4
+    assert stats_mean(xs) == 2.5
+    assert stats_median(xs) == 2.5
+}

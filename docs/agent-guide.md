@@ -229,6 +229,16 @@ Dependencies land in `machino_modules/` (commit machino.pkg and
 machino.lock; ignore machino_modules). Transitive deps are flattened —
 one source per package name.
 
+Official starter libraries ship in the repo under `packages/` (vec, mathx,
+algo, httpkit, encoding, csv, cli, …). From an app next to a machino clone:
+
+```
+machino pkg add mathx /path/to/machino/packages/mathx
+import "pkg:mathx/mathx.mno"
+```
+
+See `packages/README.md` and `packages/demo` for the full catalog.
+
 Any import can be namespaced: `import "lib.mno" as lib` renames every
 top-level item lib.mno defines to `lib::name` — call `lib::helper(...)`,
 annotate `let p: lib::Point`, match `lib::Verdict::Yes`. Without `as`,

@@ -1,0 +1,46 @@
+# stack — LIFO stack of ints
+
+struct IntStack {
+    data: [int]
+}
+
+fn stack_new() -> IntStack {
+    let xs: [int] = []
+    return IntStack(xs)
+}
+
+fn stack_len(s: IntStack) -> int {
+    return len(s.data)
+}
+
+fn stack_push(s: IntStack, v: int) {
+    s.data = push(s.data, v)
+}
+
+fn stack_pop(s: IntStack) -> int
+requires len(s.data) > 0
+{
+    let n = len(s.data)
+    let v = s.data[n - 1]
+    let next: [int] = []
+    for i in 0..(n - 1) {
+        next = push(next, s.data[i])
+    }
+    s.data = next
+    return v
+}
+
+fn stack_peek(s: IntStack) -> int
+requires len(s.data) > 0
+{
+    return s.data[len(s.data) - 1]
+}
+
+test "stack" {
+    let s = stack_new()
+    stack_push(s, 1)
+    stack_push(s, 2)
+    assert stack_peek(s) == 2
+    assert stack_pop(s) == 2
+    assert stack_pop(s) == 1
+}

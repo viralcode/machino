@@ -1,0 +1,25 @@
+name demo
+version 0.1.0
+dep mathx ../mathx
+dep vec ../vec
+dep algo ../algo
+dep encoding ../encoding
+dep httpkit ../httpkit
+dep stats ../stats
+dep rand ../rand
+dep pathutil ../pathutil
+dep urlparse ../urlparse
+dep set ../set
+dep queue ../queue
+dep stack ../stack
+dep heap ../heap
+dep csv ../csv
+dep text ../text
+dep jsonutil ../jsonutil
+dep graph ../graph
+dep cli ../cli
+dep option ../option
+dep result ../result
+dep log ../log
+dep datetime ../datetime
+dep bitset ../bitset

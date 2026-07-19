@@ -1,0 +1,60 @@
+# bitset — bit operations packed into an int (0..62)
+
+fn bit_set(bits: int, i: int) -> int
+requires i >= 0
+requires i < 63
+{
+    let mask = pow_int(2, i)
+    return bits + mask - (bits / mask % 2) * mask
+}
+
+fn bit_clear(bits: int, i: int) -> int
+requires i >= 0
+requires i < 63
+{
+    let mask = pow_int(2, i)
+    return bits - (bits / mask % 2) * mask
+}
+
+fn bit_test(bits: int, i: int) -> bool
+requires i >= 0
+requires i < 63
+{
+    let mask = pow_int(2, i)
+    return bits / mask % 2 == 1
+}
+
+fn bit_toggle(bits: int, i: int) -> int
+requires i >= 0
+requires i < 63
+{
+    if bit_test(bits, i) {
+        return bit_clear(bits, i)
+    }
+    return bit_set(bits, i)
+}
+
+fn bit_count(bits: int) -> int {
+    let n = 0
+    let x = bits
+    if x < 0 {
+        x = 0 - x
+    }
+    while x > 0 {
+        n = n + x % 2
+        x = x / 2
+    }
+    return n
+}
+
+test "bitset" {
+    let b = 0
+    b = bit_set(b, 0)
+    b = bit_set(b, 3)
+    assert bit_test(b, 0)
+    assert bit_test(b, 3)
+    assert !bit_test(b, 1)
+    assert bit_count(b) == 2
+    b = bit_clear(b, 0)
+    assert !bit_test(b, 0)
+}

@@ -1,0 +1,77 @@
+# vec — array utilities for [int] and [str]
+
+fn vec_rev_ints(xs: [int]) -> [int] {
+    let out: [int] = []
+    let i = len(xs)
+    while i > 0 {
+        i = i - 1
+        out = push(out, xs[i])
+    }
+    return out
+}
+
+fn vec_slice_ints(xs: [int], start: int, end: int) -> [int]
+requires start >= 0
+requires end >= start
+requires end <= len(xs)
+{
+    let out: [int] = []
+    for i in start..end {
+        out = push(out, xs[i])
+    }
+    return out
+}
+
+fn vec_map_ints(xs: [int], f: fn(int) -> int) -> [int] {
+    let out: [int] = []
+    for i in 0..len(xs) {
+        out = push(out, f(xs[i]))
+    }
+    return out
+}
+
+fn vec_filter_ints(xs: [int], pred: fn(int) -> bool) -> [int] {
+    let out: [int] = []
+    for i in 0..len(xs) {
+        if pred(xs[i]) {
+            out = push(out, xs[i])
+        }
+    }
+    return out
+}
+
+fn vec_contains_int(xs: [int], v: int) -> bool {
+    for i in 0..len(xs) {
+        if xs[i] == v {
+            return true
+        }
+    }
+    return false
+}
+
+fn vec_join_strs(xs: [str], sep: str) -> str {
+    return join(xs, sep)
+}
+
+fn vec_concat_ints(a: [int], b: [int]) -> [int] {
+    let out: [int] = []
+    for i in 0..len(a) {
+        out = push(out, a[i])
+    }
+    for i in 0..len(b) {
+        out = push(out, b[i])
+    }
+    return out
+}
+
+test "vec" {
+    let xs = [1, 2, 3, 4]
+    assert vec_rev_ints(xs)[0] == 4
+    assert len(vec_slice_ints(xs, 1, 3)) == 2
+    let doubled = vec_map_ints(xs, fn(x: int) -> int { return x * 2 })
+    assert doubled[0] == 2
+    let evens = vec_filter_ints(xs, fn(x: int) -> bool { return x % 2 == 0 })
+    assert len(evens) == 2
+    assert vec_contains_int(xs, 3)
+    assert vec_join_strs(["a", "b"], "-") == "a-b"
+}

@@ -1,0 +1,66 @@
+# graph — adjacency-list BFS distances on int nodes
+
+struct Graph {
+    # edges[i] = neighbor list for node i; nodes are 0..n-1
+    edges: [[int]]
+}
+
+fn graph_new(n: int) -> Graph
+requires n >= 0
+{
+    let edges: [[int]] = []
+    for i in 0..n {
+        let empty: [int] = []
+        edges = push(edges, empty)
+    }
+    return Graph(edges)
+}
+
+fn graph_add_edge(g: Graph, a: int, b: int)
+requires a >= 0
+requires b >= 0
+requires a < len(g.edges)
+requires b < len(g.edges)
+{
+    g.edges[a] = push(g.edges[a], b)
+}
+
+fn graph_bfs_dist(g: Graph, start: int) -> [int]
+requires start >= 0
+requires start < len(g.edges)
+{
+    let n = len(g.edges)
+    let dist: [int] = []
+    for i in 0..n {
+        dist = push(dist, 0 - 1)
+    }
+    dist[start] = 0
+    let q: [int] = []
+    q = push(q, start)
+    let head = 0
+    while head < len(q) {
+        let u = q[head]
+        head = head + 1
+        let nbrs = g.edges[u]
+        for i in 0..len(nbrs) {
+            let v = nbrs[i]
+            if dist[v] < 0 {
+                dist[v] = dist[u] + 1
+                q = push(q, v)
+            }
+        }
+    }
+    return dist
+}
+
+test "graph" {
+    let g = graph_new(4)
+    graph_add_edge(g, 0, 1)
+    graph_add_edge(g, 1, 2)
+    graph_add_edge(g, 0, 3)
+    let d = graph_bfs_dist(g, 0)
+    assert d[0] == 0
+    assert d[1] == 1
+    assert d[2] == 2
+    assert d[3] == 1
+}

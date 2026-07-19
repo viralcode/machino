@@ -292,11 +292,13 @@ import "pkg:mathx/mathx.mno"     # after machino pkg add / sync
 
 ```sh
 machino pkg init myapp
-machino pkg add mathx ../mathx
+machino pkg add mathx /path/to/machino/packages/mathx
 machino pkg sync
 ```
 
-See `examples/namespaces/` for a namespaced import demo.
+Official libraries (vec, mathx, httpkit, encoding, …) live in
+[`packages/`](../packages/) — see [`packages/README.md`](../packages/README.md)
+and try `packages/demo`. Also see `examples/namespaces/` for `as` imports.
 
 ---
 

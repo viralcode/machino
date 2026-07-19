@@ -1,0 +1,59 @@
+# cli — argv helpers (use with extern fn args)
+
+fn cli_has_flag(argv: [str], flag: str) -> bool {
+    for i in 0..len(argv) {
+        if argv[i] == flag {
+            return true
+        }
+    }
+    return false
+}
+
+fn cli_get_opt(argv: [str], flag: str, default: str) -> str {
+    for i in 0..len(argv) {
+        if argv[i] == flag && i + 1 < len(argv) {
+            return argv[i + 1]
+        }
+    }
+    return default
+}
+
+fn cli_get_int(argv: [str], flag: str, default: int) -> int {
+    let s = cli_get_opt(argv, flag, "")
+    if s == "" || !is_int_str(s) {
+        return default
+    }
+    return parse_int(s)
+}
+
+fn cli_positional(argv: [str], index: int, default: str) -> str {
+    # --long takes an optional value; short -f never consumes the next arg
+    let pos: [str] = []
+    let i = 0
+    while i < len(argv) {
+        let a = argv[i]
+        if starts_with(a, "--") {
+            if i + 1 < len(argv) && !starts_with(argv[i + 1], "-") {
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+        } else if starts_with(a, "-") {
+            i = i + 1
+        } else {
+            pos = push(pos, a)
+            i = i + 1
+        }
+    }
+    if index < 0 || index >= len(pos) {
+        return default
+    }
+    return pos[index]
+}
+
+test "cli" {
+    let argv = ["--port", "8080", "-v", "file.txt"]
+    assert cli_has_flag(argv, "-v")
+    assert cli_get_int(argv, "--port", 80) == 8080
+    assert cli_positional(argv, 0, "") == "file.txt"
+}

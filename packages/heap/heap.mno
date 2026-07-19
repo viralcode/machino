@@ -1,0 +1,90 @@
+# heap — binary min-heap of ints
+
+struct IntHeap {
+    data: [int]
+}
+
+fn heap_new() -> IntHeap {
+    let xs: [int] = []
+    return IntHeap(xs)
+}
+
+fn heap_len(h: IntHeap) -> int {
+    return len(h.data)
+}
+
+fn heap_sift_up(h: IntHeap, i: int) {
+    let cur = i
+    while cur > 0 {
+        let parent = (cur - 1) / 2
+        if h.data[cur] >= h.data[parent] {
+            break
+        }
+        let tmp = h.data[cur]
+        h.data[cur] = h.data[parent]
+        h.data[parent] = tmp
+        cur = parent
+    }
+}
+
+fn heap_sift_down(h: IntHeap, i: int) {
+    let n = len(h.data)
+    let cur = i
+    while true {
+        let left = cur * 2 + 1
+        let right = left + 1
+        let smallest = cur
+        if left < n && h.data[left] < h.data[smallest] {
+            smallest = left
+        }
+        if right < n && h.data[right] < h.data[smallest] {
+            smallest = right
+        }
+        if smallest == cur {
+            break
+        }
+        let tmp = h.data[cur]
+        h.data[cur] = h.data[smallest]
+        h.data[smallest] = tmp
+        cur = smallest
+    }
+}
+
+fn heap_push(h: IntHeap, v: int) {
+    h.data = push(h.data, v)
+    heap_sift_up(h, len(h.data) - 1)
+}
+
+fn heap_peek(h: IntHeap) -> int
+requires len(h.data) > 0
+{
+    return h.data[0]
+}
+
+fn heap_pop(h: IntHeap) -> int
+requires len(h.data) > 0
+{
+    let n = len(h.data)
+    let top = h.data[0]
+    h.data[0] = h.data[n - 1]
+    let next: [int] = []
+    for i in 0..(n - 1) {
+        next = push(next, h.data[i])
+    }
+    h.data = next
+    if len(h.data) > 0 {
+        heap_sift_down(h, 0)
+    }
+    return top
+}
+
+test "heap" {
+    let h = heap_new()
+    heap_push(h, 5)
+    heap_push(h, 1)
+    heap_push(h, 3)
+    assert heap_peek(h) == 1
+    assert heap_pop(h) == 1
+    assert heap_pop(h) == 3
+    assert heap_pop(h) == 5
+}

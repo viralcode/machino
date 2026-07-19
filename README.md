@@ -184,6 +184,13 @@ functions, arrays/strings, structs, enums, contracts, generics, closures,
 HashMap, JSON/stdlib, concurrency, native externs, SMT verify, WASM/GC/AOT
 deploy, packages, and the agent toolchain loop.
 
+## Packages
+
+Ready-to-import libraries (vec, mathx, httpkit, encoding, csv, …) live in
+**[`packages/`](packages/)** — install with `machino pkg add` and
+`import "pkg:mathx/mathx.mno"`. See [`packages/README.md`](packages/README.md)
+and try [`packages/demo`](packages/demo).
+
 ## Examples
 
 Curated demos live in [`examples/`](examples/). A 100-file language corpus (each with `main` + `test` blocks) lives in [`test/ex_*.mno`](test/). Larger HTTP services also sit under [`test/`](test/).

@@ -1,0 +1,37 @@
+# csv — simple comma-separated parse/serialize (no quoted commas)
+
+fn csv_parse_line(line: str) -> [str] {
+    return split(line, ",")
+}
+
+fn csv_parse(text: str) -> [[str]] {
+    let lines = split(text, "\n")
+    let rows: [[str]] = []
+    for i in 0..len(lines) {
+        let line = lines[i]
+        if line != "" {
+            rows = push(rows, csv_parse_line(line))
+        }
+    }
+    return rows
+}
+
+fn csv_serialize_row(row: [str]) -> str {
+    return join(row, ",")
+}
+
+fn csv_serialize(rows: [[str]]) -> str {
+    let lines: [str] = []
+    for i in 0..len(rows) {
+        lines = push(lines, csv_serialize_row(rows[i]))
+    }
+    return join(lines, "\n")
+}
+
+test "csv" {
+    let rows = csv_parse("a,b\n1,2")
+    assert len(rows) == 2
+    assert rows[0][0] == "a"
+    assert rows[1][1] == "2"
+    assert csv_serialize(rows) == "a,b\n1,2"
+}

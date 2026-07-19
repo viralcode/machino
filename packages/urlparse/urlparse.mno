@@ -1,0 +1,62 @@
+# urlparse — tiny URL parser (scheme://host/path?query)
+
+struct Url {
+    scheme: str
+    host: str
+    path: str
+    query: str
+}
+
+fn url_parse(s: str) -> Url {
+    let scheme = ""
+    let rest = s
+    let sep = find(s, "://")
+    if sep >= 0 {
+        scheme = substr(s, 0, sep)
+        rest = substr(s, sep + 3, len(s))
+    }
+    let path = "/"
+    let query = ""
+    let host = rest
+    let slash = find(rest, "/")
+    if slash < 0 {
+        let q = find(rest, "?")
+        if q >= 0 {
+            host = substr(rest, 0, q)
+            query = substr(rest, q + 1, len(rest))
+        }
+    } else {
+        host = substr(rest, 0, slash)
+        let after = substr(rest, slash, len(rest))
+        let q = find(after, "?")
+        if q < 0 {
+            path = after
+        } else {
+            path = substr(after, 0, q)
+            query = substr(after, q + 1, len(after))
+        }
+    }
+    return Url(scheme, host, path, query)
+}
+
+fn url_query_get(query: str, key: str) -> str {
+    let parts = split(query, "&")
+    for i in 0..len(parts) {
+        let kv = split(parts[i], "=")
+        if len(kv) >= 1 && kv[0] == key {
+            if len(kv) >= 2 {
+                return kv[1]
+            }
+            return ""
+        }
+    }
+    return ""
+}
+
+test "urlparse" {
+    let u = url_parse("https://ex.com/a/b?x=1&y=2")
+    assert u.scheme == "https"
+    assert u.host == "ex.com"
+    assert u.path == "/a/b"
+    assert url_query_get(u.query, "y") == "2"
+}

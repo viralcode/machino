@@ -1,0 +1,34 @@
+# datetime — duration and epoch helpers on top of time_*
+
+fn dt_ms_per_day() -> int {
+    return 86400000
+}
+
+fn dt_add_days(ms: int, days: int) -> int {
+    return ms + days * dt_ms_per_day()
+}
+
+fn dt_day_of_year(ms: int) -> int {
+    let t = time_from_ms(ms)
+    # rough: month lengths non-leap for tutorial use
+    let md = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    return md[t.month - 1] + t.day
+}
+
+fn dt_format_ms(ms: int) -> str {
+    return time_iso(ms)
+}
+
+fn dt_same_utc_day(a: int, b: int) -> bool {
+    let ta = time_from_ms(a)
+    let tb = time_from_ms(b)
+    return ta.year == tb.year && ta.month == tb.month && ta.day == tb.day
+}
+
+test "datetime" {
+    let t0 = 0
+    assert dt_format_ms(t0) == "1970-01-01T00:00:00Z"
+    let t1 = dt_add_days(t0, 1)
+    assert dt_same_utc_day(t1, t1)
+    assert !dt_same_utc_day(t0, t1)
+}

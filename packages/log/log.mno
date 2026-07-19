@@ -1,0 +1,25 @@
+# log — leveled logging via print (debug/info/warn/error)
+
+fn log_debug(msg: str) {
+    print("[debug] " + msg)
+}
+
+fn log_info(msg: str) {
+    print("[info] " + msg)
+}
+
+fn log_warn(msg: str) {
+    print("[warn] " + msg)
+}
+
+fn log_error(msg: str) {
+    print("[error] " + msg)
+}
+
+fn log_fmt(level: str, msg: str) {
+    print("[" + level + "] " + msg)
+}
+
+test "log" expects "[info] hi" {
+    log_info("hi")
+}

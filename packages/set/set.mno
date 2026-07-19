@@ -1,0 +1,53 @@
+# set — int and string sets via IntMap / StrMap
+
+struct IntSet {
+    m: IntMap
+}
+
+struct StrSet {
+    m: StrMap
+}
+
+fn intset_new() -> IntSet {
+    return IntSet(intmap_new())
+}
+
+fn intset_add(s: IntSet, v: int) {
+    intmap_set(s.m, v, 1)
+}
+
+fn intset_has(s: IntSet, v: int) -> bool {
+    return intmap_has(s.m, v)
+}
+
+fn intset_len(s: IntSet) -> int {
+    return intmap_len(s.m)
+}
+
+fn strset_new() -> StrSet {
+    return StrSet(strmap_new())
+}
+
+fn strset_add(s: StrSet, v: str) {
+    strmap_set(s.m, v, "1")
+}
+
+fn strset_has(s: StrSet, v: str) -> bool {
+    return strmap_has(s.m, v)
+}
+
+fn strset_len(s: StrSet) -> int {
+    return strmap_len(s.m)
+}
+
+test "set" {
+    let a = intset_new()
+    intset_add(a, 1)
+    intset_add(a, 1)
+    intset_add(a, 2)
+    assert intset_len(a) == 2
+    assert intset_has(a, 2)
+    let b = strset_new()
+    strset_add(b, "x")
+    assert strset_has(b, "x")
+}

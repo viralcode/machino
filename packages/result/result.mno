@@ -1,0 +1,42 @@
+# result — Result<T> as Ok(str payload) / Err(str) for common error strings
+# For typed payloads, wrap your own enums; this kit is string-oriented.
+
+enum Res {
+    Ok(str)
+    Err(str)
+}
+
+fn res_ok(v: str) -> Res {
+    return Res::Ok(v)
+}
+
+fn res_err(e: str) -> Res {
+    return Res::Err(e)
+}
+
+fn res_is_ok(r: Res) -> bool {
+    return match r {
+        Res::Ok(_) => true
+        Res::Err(_) => false
+    }
+}
+
+fn res_unwrap_or(r: Res, default: str) -> str {
+    return match r {
+        Res::Ok(v) => v
+        Res::Err(_) => default
+    }
+}
+
+fn res_map_ok(r: Res, prefix: str) -> Res {
+    return match r {
+        Res::Ok(v) => Res::Ok(prefix + v)
+        Res::Err(e) => Res::Err(e)
+    }
+}
+
+test "result" {
+    assert res_is_ok(res_ok("x"))
+    assert res_unwrap_or(res_err("e"), "d") == "d"
+    assert res_unwrap_or(res_map_ok(res_ok("hi"), "!"), "") == "!hi"
+}

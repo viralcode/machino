@@ -1,0 +1,98 @@
+# mathx — number theory and float helpers beyond the prelude
+
+fn mathx_gcd(a: int, b: int) -> int {
+    let x = abs_int(a)
+    let y = abs_int(b)
+    while y != 0 {
+        let t = y
+        y = x % y
+        x = t
+    }
+    return x
+}
+
+fn mathx_lcm(a: int, b: int) -> int
+requires a != 0
+requires b != 0
+{
+    return abs_int(a / mathx_gcd(a, b) * b)
+}
+
+fn mathx_clamp_int(x: int, lo: int, hi: int) -> int
+requires lo <= hi
+{
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+fn mathx_clamp_float(x: float, lo: float, hi: float) -> float
+requires lo <= hi
+{
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+fn mathx_lerp(a: float, b: float, t: float) -> float {
+    return a + (b - a) * t
+}
+
+fn mathx_is_prime(n: int) -> bool {
+    if n < 2 {
+        return false
+    }
+    let d = 2
+    while d * d <= n {
+        if n % d == 0 {
+            return false
+        }
+        d = d + 1
+    }
+    return true
+}
+
+fn mathx_factorial(n: int) -> int
+requires n >= 0
+requires n <= 20
+{
+    let r = 1
+    for i in 1..(n + 1) {
+        r = r * i
+    }
+    return r
+}
+
+fn mathx_pow_mod(base: int, exp: int, mod: int) -> int
+requires exp >= 0
+requires mod > 0
+{
+    let b = base % mod
+    let e = exp
+    let r = 1
+    while e > 0 {
+        if e % 2 == 1 {
+            r = (r * b) % mod
+        }
+        b = (b * b) % mod
+        e = e / 2
+    }
+    return r
+}
+
+test "mathx" {
+    assert mathx_gcd(48, 36) == 12
+    assert mathx_lcm(4, 6) == 12
+    assert mathx_clamp_int(15, 0, 10) == 10
+    assert mathx_is_prime(17)
+    assert mathx_factorial(5) == 120
+    assert mathx_pow_mod(2, 10, 1000) == 24
+}

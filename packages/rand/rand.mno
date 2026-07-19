@@ -1,0 +1,42 @@
+# rand — deterministic LCG PRNG (seedable)
+
+struct Rng {
+    state: int
+}
+
+fn rng_new(seed: int) -> Rng {
+    let s = seed
+    if s <= 0 {
+        s = 1
+    }
+    return Rng(s)
+}
+
+fn rng_next(r: Rng) -> int {
+    # Numerical Recipes LCG
+    r.state = (r.state * 1664525 + 1013904223) % 2147483647
+    if r.state < 0 {
+        r.state = 0 - r.state
+    }
+    return r.state
+}
+
+fn rng_int(r: Rng, lo: int, hi: int) -> int
+requires hi > lo
+{
+    let span = hi - lo
+    return lo + rng_next(r) % span
+}
+
+fn rng_bool(r: Rng) -> bool {
+    return rng_next(r) % 2 == 0
+}
+
+test "rand" {
+    let r = rng_new(42)
+    let a = rng_next(r)
+    let b = rng_next(r)
+    assert a != b
+    let x = rng_int(r, 0, 10)
+    assert x >= 0 && x < 10
+}

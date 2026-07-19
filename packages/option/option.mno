@@ -1,0 +1,56 @@
+# option — optional int/str values (concrete; prefer import as opt)
+
+enum IntMaybe {
+    None
+    Some(int)
+}
+
+enum StrMaybe {
+    None
+    Some(str)
+}
+
+fn int_maybe_some(v: int) -> IntMaybe {
+    return IntMaybe::Some(v)
+}
+
+fn int_maybe_none() -> IntMaybe {
+    return IntMaybe::None
+}
+
+fn int_maybe_is_some(m: IntMaybe) -> bool {
+    return match m {
+        IntMaybe::Some(_) => true
+        IntMaybe::None => false
+    }
+}
+
+fn int_maybe_unwrap_or(m: IntMaybe, default: int) -> int {
+    return match m {
+        IntMaybe::Some(v) => v
+        IntMaybe::None => default
+    }
+}
+
+fn str_maybe_some(v: str) -> StrMaybe {
+    return StrMaybe::Some(v)
+}
+
+fn str_maybe_none() -> StrMaybe {
+    return StrMaybe::None
+}
+
+fn str_maybe_unwrap_or(m: StrMaybe, default: str) -> str {
+    return match m {
+        StrMaybe::Some(v) => v
+        StrMaybe::None => default
+    }
+}
+
+test "option" {
+    let a = int_maybe_some(7)
+    assert int_maybe_is_some(a)
+    assert int_maybe_unwrap_or(a, 0) == 7
+    assert int_maybe_unwrap_or(int_maybe_none(), 9) == 9
+    assert str_maybe_unwrap_or(str_maybe_some("x"), "") == "x"
+}

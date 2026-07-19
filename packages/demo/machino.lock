@@ -1,0 +1,24 @@
+# machino.lock — written by 'machino pkg sync'
+algo ../algo path
+bitset ../bitset path
+cli ../cli path
+csv ../csv path
+datetime ../datetime path
+encoding ../encoding path
+graph ../graph path
+heap ../heap path
+httpkit ../httpkit path
+jsonutil ../jsonutil path
+log ../log path
+mathx ../mathx path
+option ../option path
+pathutil ../pathutil path
+queue ../queue path
+rand ../rand path
+result ../result path
+set ../set path
+stack ../stack path
+stats ../stats path
+text ../text path
+urlparse ../urlparse path
+vec ../vec path

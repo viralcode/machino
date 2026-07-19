@@ -1,0 +1,64 @@
+# pathutil — POSIX-style path string helpers
+
+fn path_join(a: str, b: str) -> str {
+    if a == "" {
+        return b
+    }
+    if b == "" {
+        return a
+    }
+    let ends = ends_with(a, "/")
+    let starts = starts_with(b, "/")
+    if ends && starts {
+        return a + substr(b, 1, len(b))
+    }
+    if ends || starts {
+        return a + b
+    }
+    return a + "/" + b
+}
+
+fn path_basename(p: str) -> str {
+    if p == "" {
+        return ""
+    }
+    let i = len(p) - 1
+    while i >= 0 {
+        if char_at(p, i) == 47 {
+            return substr(p, i + 1, len(p))
+        }
+        i = i - 1
+    }
+    return p
+}
+
+fn path_dirname(p: str) -> str {
+    let i = len(p) - 1
+    while i >= 0 {
+        if char_at(p, i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return substr(p, 0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn path_ext(p: str) -> str {
+    let base = path_basename(p)
+    let dot = find(base, ".")
+    if dot <= 0 {
+        return ""
+    }
+    return substr(base, dot, len(base))
+}
+
+test "pathutil" {
+    assert path_join("a", "b") == "a/b"
+    assert path_join("a/", "/b") == "a/b"
+    assert path_basename("/x/y.z") == "y.z"
+    assert path_dirname("/x/y.z") == "/x"
+    assert path_ext("y.z") == ".z"
+}

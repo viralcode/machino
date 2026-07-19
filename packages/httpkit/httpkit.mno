@@ -1,0 +1,68 @@
+# httpkit — HTTP request parsing and response building
+
+struct HttpReq {
+    method: str
+    path: str
+    query: str
+    body: str
+}
+
+fn http_parse_request(raw: str) -> HttpReq {
+    let parts = split(raw, "\r\n\r\n")
+    let head = parts[0]
+    let body = ""
+    if len(parts) > 1 {
+        body = parts[1]
+    }
+    let lines = split(head, "\r\n")
+    let method = "GET"
+    let path = "/"
+    let query = ""
+    if len(lines) > 0 {
+        let req = split(lines[0], " ")
+        if len(req) >= 1 {
+            method = req[0]
+        }
+        if len(req) >= 2 {
+            let full = req[1]
+            let qat = find(full, "?")
+            if qat < 0 {
+                path = full
+            } else {
+                path = substr(full, 0, qat)
+                query = substr(full, qat + 1, len(full))
+            }
+        }
+    }
+    return HttpReq(method, path, query, body)
+}
+
+fn http_response(status: str, content_type: str, body: str) -> str {
+    return ("HTTP/1.1 " + status + "\r\n"
+        + "Content-Type: " + content_type + "\r\n"
+        + "Content-Length: " + str_of_int(len(body)) + "\r\n"
+        + "Connection: close\r\n"
+        + "\r\n"
+        + body)
+}
+
+fn http_ok(body: str) -> str {
+    return http_response("200 OK", "text/plain; charset=utf-8", body)
+}
+
+fn http_not_found(msg: str) -> str {
+    return http_response("404 Not Found", "text/plain; charset=utf-8", msg)
+}
+
+fn http_json(body: str) -> str {
+    return http_response("200 OK", "application/json", body)
+}
+
+test "httpkit" {
+    let r = http_parse_request("GET /hi?x=1 HTTP/1.1\r\nHost: a\r\n\r\nbody")
+    assert r.method == "GET"
+    assert r.path == "/hi"
+    assert r.query == "x=1"
+    assert r.body == "body"
+    assert starts_with(http_ok("x"), "HTTP/1.1 200 OK")
+}
