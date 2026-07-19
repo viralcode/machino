@@ -2,30 +2,30 @@
 
 # This function has contracts that can be verified with Z3
 fn safe_div(a: int, b: int) -> int
-    requires b != 0
-    requires a >= 0
-    ensures result >= 0
-    ensures result * b <= a
+requires b != 0
+requires a >= 0
+ensures result >= 0
+ensures result * b <= a
 {
     return a / b
 }
 
 # Verified: the result is always non-negative when inputs are non-negative
 fn abs(x: int) -> int
-    ensures result >= 0
-    ensures (x >= 0 && result == x) || (x < 0 && result == -x)
+ensures result >= 0
+ensures(x >= 0 && result == x) || (x < 0 && result == - x)
 {
     if x < 0 {
-        return -x
+        return - x
     }
     return x
 }
 
 # Verified: output is bounded by inputs
 fn max(a: int, b: int) -> int
-    ensures result >= a
-    ensures result >= b
-    ensures result == a || result == b
+ensures result >= a
+ensures result >= b
+ensures result == a || result == b
 {
     if a > b {
         return a
@@ -34,9 +34,9 @@ fn max(a: int, b: int) -> int
 }
 
 fn min(a: int, b: int) -> int
-    ensures result <= a
-    ensures result <= b
-    ensures result == a || result == b
+ensures result <= a
+ensures result <= b
+ensures result == a || result == b
 {
     if a < b {
         return a
@@ -46,9 +46,9 @@ fn min(a: int, b: int) -> int
 
 # Verified: clamps value to range
 fn clamp(x: int, lo: int, hi: int) -> int
-    requires lo <= hi
-    ensures result >= lo
-    ensures result <= hi
+requires lo <= hi
+ensures result >= lo
+ensures result <= hi
 {
     if x < lo {
         return lo
@@ -62,27 +62,27 @@ fn clamp(x: int, lo: int, hi: int) -> int
 fn main() {
     print("safe_div(10, 2) = ")
     print(safe_div(10, 2))
-    
+
     print("abs(-42) = ")
-    print(abs(-42))
-    
+    print(abs(- 42))
+
     print("max(5, 10) = ")
     print(max(5, 10))
-    
+
     print("min(5, 10) = ")
     print(min(5, 10))
-    
+
     print("clamp(15, 0, 10) = ")
     print(clamp(15, 0, 10))
 }
 
 test "contracts hold" {
     assert safe_div(10, 2) == 5
-    assert abs(-5) == 5
+    assert abs(- 5) == 5
     assert abs(5) == 5
     assert max(3, 7) == 7
     assert min(3, 7) == 3
     assert clamp(15, 0, 10) == 10
     assert clamp(5, 0, 10) == 5
-    assert clamp(-5, 0, 10) == 0
+    assert clamp(- 5, 0, 10) == 0
 }

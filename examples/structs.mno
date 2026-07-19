@@ -19,8 +19,8 @@ fn dist(a: Point, b: Point) -> float {
 
 # Newton's method; machino has no float stdlib yet, so we write one.
 fn sqrt_approx(v: float) -> float
-    requires v >= 0.0
-    ensures result >= 0.0
+requires v >= 0.0
+ensures result >= 0.0
 {
     if v == 0.0 {
         return 0.0
@@ -38,8 +38,8 @@ fn contains_point(c: Circle, p: Point) -> bool {
 
 fn main() {
     let c = Circle(Point(0.0, 0.0), 5.0)
-    print(contains_point(c, Point(3.0, 4.0)))   # on the edge: true
-    print(contains_point(c, Point(4.0, 4.0)))   # outside: false
+    print(contains_point(c, Point(3.0, 4.0)))  # on the edge: true
+    print(contains_point(c, Point(4.0, 4.0)))  # outside: false
 
     # structs are references: mutation is visible through aliases
     let p = c.center
@@ -51,7 +51,7 @@ test "geometry" {
     let c = Circle(Point(0.0, 0.0), 5.0)
     assert contains_point(c, Point(0.0, 0.0))
     assert contains_point(c, Point(3.0, 4.0))
-    assert !contains_point(c, Point(5.1, 0.0))
+    assert!contains_point(c, Point(5.1, 0.0))
 }
 
 test "sqrt" {

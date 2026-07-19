@@ -1,0 +1,32 @@
+# Namespaced imports: run with `machino run examples/namespaces/main.mno`.
+# Everything geometry.mno defines lives behind the geo:: prefix, so this
+# file can define its own dist() without a collision.
+
+import "geometry.mno" as geo
+
+fn dist(a: int, b: int) -> int {
+    return abs_int(a - b)
+}
+
+fn main() {
+    let a: geo::Point = geo::origin()
+    let b = geo::Point(3.0, 4.0)
+    print(str_of_float(geo::dist(a, b), 1))
+    print(dist(10, 4))
+
+    let q = geo::quadrant(geo::Point(- 1.0, 2.5))
+    let label = match q {
+        geo::Quadrant::First => "I"
+        geo::Quadrant::Second => "II"
+        geo::Quadrant::Third => "III"
+        geo::Quadrant::Fourth => "IV"
+        geo::Quadrant::Origin => "origin"
+    }
+    print(label)
+}
+
+test "namespaced calls" {
+    let d = geo::dist(geo::origin(), geo::Point(0.0, 2.0))
+    assert d == 2.0
+    assert dist(1, 5) == 4
+}

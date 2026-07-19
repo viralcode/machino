@@ -1,0 +1,104 @@
+(* ============================================================
+   machino grammar, EBNF (v0.7)
+
+   Notation: ISO-style EBNF. Terminals are quoted. NEWLINE is a
+   significant token: it terminates statements. Inside ( ) and [ ]
+   the lexer discards newlines, so expressions may wrap there.
+   Comments run from '#' to end of line and may follow any line.
+   ============================================================ *)
+
+program        = { top-level } ;
+top-level      = function | extern-fn | struct-def | enum-def | test-block | import-decl ;
+
+(* ---- items ---- *)
+
+import-decl    = "import" string [ "as" ident ] NEWLINE ;
+
+function       = "fn" [ type-params ] ident "(" [ params ] ")" [ "->" type ]
+                 { contract } block ;
+extern-fn      = "extern" "fn" ident "(" [ params ] ")" [ "->" type ]
+                 { contract } NEWLINE ;
+contract       = ( "requires" | "ensures" ) expr ;
+                 (* in an ensures clause, 'result' names the return value *)
+
+type-params    = "<" type-param { "," type-param } ">" ;
+type-param     = ident [ ":" bound ] ;
+bound          = "Eq" | "Ord" | "Num" ;
+
+struct-def     = "struct" [ type-params ] ident "{" { field } "}" ;
+field          = ident ":" type NEWLINE ;
+
+enum-def       = "enum" [ type-params ] ident "{" { variant } "}" ;
+variant        = ident [ "(" type ")" ] NEWLINE ;
+
+test-block     = "test" string [ "expects" string ] block ;
+                 (* with 'expects', the test passes only if its print output,
+                    lines joined with "\n", equals the string *)
+
+params         = param { "," param } ;
+param          = ident ":" type ;
+
+(* ---- types ---- *)
+
+type           = "int" | "float" | "bool" | "str"
+               | "[" type "]"
+               | "fn" "(" [ type { "," type } ] ")" [ "->" type ]
+               | qualified-ident ;      (* struct, enum, or type parameter *)
+qualified-ident= ident { "::" ident } ; (* alias::Name from namespaced imports *)
+
+(* ---- statements ---- *)
+
+block          = "{" { statement } "}" ;
+statement      = let-stmt | assign-stmt | index-assign | field-assign
+               | if-stmt | while-stmt | for-stmt
+               | "break" NEWLINE | "continue" NEWLINE
+               | return-stmt | assert-stmt | expr-stmt ;
+
+let-stmt       = "let" ident [ ":" type ] "=" expr NEWLINE ;
+assign-stmt    = ident "=" expr NEWLINE ;
+index-assign   = postfix-expr "[" expr "]" "=" expr NEWLINE ;
+field-assign   = postfix-expr "." ident "=" expr NEWLINE ;
+if-stmt        = "if" expr block [ "else" ( block | if-stmt ) ] ;
+while-stmt     = "while" expr block ;
+for-stmt       = "for" ident "in" expr ".." expr block ;
+return-stmt    = "return" [ expr ] NEWLINE ;
+assert-stmt    = "assert" expr NEWLINE ;
+expr-stmt      = expr NEWLINE ;
+
+(* ---- expressions (highest row binds loosest) ---- *)
+
+expr           = or-expr ;
+or-expr        = and-expr { "||" and-expr } ;
+and-expr       = cmp-expr { "&&" cmp-expr } ;
+cmp-expr       = add-expr [ ( "==" | "!=" | "<" | "<=" | ">" | ">=" ) add-expr ] ;
+add-expr       = mul-expr { ( "+" | "-" ) mul-expr } ;
+mul-expr       = unary-expr { ( "*" | "/" | "%" ) unary-expr } ;
+unary-expr     = ( "-" | "!" ) unary-expr | postfix-expr ;
+postfix-expr   = primary { "[" expr "]" | "." ident } ;
+
+primary        = int-lit | float-lit | string | "true" | "false"
+               | qualified-ident [ call-args ]      (* var, call, ctor, variant *)
+               | "[" [ expr { "," expr } ] "]"      (* array literal *)
+               | "(" expr ")"
+               | lambda
+               | match-expr ;
+call-args      = "(" [ expr { "," expr } ] ")" ;
+
+lambda         = "fn" "(" [ params ] ")" [ "->" type ] block ;
+
+match-expr     = "match" expr "{" { match-arm } "}" ;
+match-arm      = pattern "=>" expr NEWLINE ;
+pattern        = "_" | ident | int-lit | "true" | "false" | string
+               | qualified-ident "::" ident [ "(" pattern ")" ] ;
+
+(* ---- lexical ---- *)
+
+ident          = letter , { letter | digit | "_" } ;
+int-lit        = [ "-" ] digit { digit } ;
+float-lit      = [ "-" ] digit { digit } "." digit { digit } ;
+string         = '"' { character | escape } '"' ;
+escape         = "\" ( "n" | "t" | "r" | "\" | '"' ) ;
+
+(* ---- builtins (not keywords, but reserved names) ----
+   print len push to_float to_int char_at substr chr
+   spawn join_int join_float join_bool join_str          *)

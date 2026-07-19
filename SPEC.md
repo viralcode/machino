@@ -1,4 +1,4 @@
-# The machino Language Specification (v0.6.1)
+# The machino Language Specification (v0.7)
 
 machino is an AI-first programming language. It is designed for code that is
 *written and verified by machines*: the syntax is small and canonical, the
@@ -68,6 +68,20 @@ import "pkg:mathx/mathx.mno"
 Plain imports are resolved relative to the importing file, transitively, and
 deduplicated. All definitions share one flat namespace (a name collision is
 error `E021`). Tests in imported files run as part of `machino test`.
+
+An import may carry a **namespace alias**:
+
+```
+import "geometry.mno" as geo
+```
+
+Every top-level function, struct, and enum the aliased file defines is then
+reachable only as `geo::name`: calls (`geo::dist(a, b)`), constructors
+(`geo::Point(1.0, 2.0)`), type annotations (`let p: geo::Point`), enum
+variants (`geo::Quadrant::First`), and match patterns all take the prefix.
+Inside the imported file itself nothing changes — its own unqualified
+references keep working. A file must be imported under one consistent alias
+(or consistently without one) across the whole program.
 
 `pkg:` imports resolve against `machino_modules/` in the **project root** —
 the nearest ancestor directory of the entry file containing a `machino.pkg`
@@ -242,10 +256,18 @@ instantiation — capability denial, working as intended.
 test "descriptive name" {
     assert <bool expr>
 }
+
+test "snapshot" expects "line1\nline2" {
+    print("line1")
+    print("line2")
+}
 ```
 
 Run with `machino test`. Test names must be unique. `return` is not allowed
-inside tests.
+inside tests. A test with an `expects` string is a **snapshot test**: its
+`print` output (lines joined with `\n`, no trailing newline) must equal the
+string exactly, otherwise the test fails with a `snapshot mismatch` message
+showing both strings.
 
 ## Statements
 
@@ -292,6 +314,24 @@ atoms. `&&`/`||` short-circuit.
 | `char_at(s,i)`| `(str, int)` → `int`             | byte value, bounds-checked   |
 | `substr(s,a,b)`| `(str, int, int)` → `str`       | bytes `[a, b)`, checked      |
 | `chr(c)`      | `int` → `str`                    | one byte, `0..=255`          |
+| `spawn(f, ...)` | `(fn(...) -> S, args...)` → `int` | task handle; interpreter only |
+| `join_int(h)` | `int` → `int`                    | joins a task returning `int` |
+| `join_float(h)` | `int` → `float`                | likewise for `float`         |
+| `join_bool(h)` | `int` → `bool`                  | likewise for `bool`          |
+| `join_str(h)` | `int` → `str`                    | likewise for `str`           |
+
+### Concurrency (interpreter only)
+
+`spawn(f, args...)` starts `f` on a fresh OS thread and returns a task
+handle. The arguments (and, for closures, the captured environment) are
+**deep-copied** across the thread boundary — tasks share no mutable state
+with their parent or each other, so a program's results are deterministic
+regardless of scheduling. `f` must return `int`, `float`, `bool`, or `str`
+(`E071`); retrieve the result with the matching `join_*`, which blocks until
+the task finishes. Joining a handle twice, or a handle that never existed,
+is a runtime error. A contract violation or trap inside a task surfaces as
+a runtime error at the `join_*` call site. The WASM backends have no thread
+support, so `machino build` rejects programs that use spawn/join (`E072`).
 
 ## Standard prelude
 
@@ -303,10 +343,26 @@ from compiled WASM.
   `parse_int`, `is_int_str`, `is_digit`
 - **Strings:** `find`, `find_from`, `contains`, `starts_with`, `ends_with`,
   `split`, `join`, `trim`, `is_space`, `to_upper`, `to_lower`, `repeat`
-- **Map:** `struct StrMap` with `strmap_new`, `strmap_set`, `strmap_get`,
-  `strmap_get_or`, `strmap_has`, `strmap_index`, `strmap_len`
+- **Maps:** `struct StrMap` (str → str) with `strmap_new`, `strmap_set`,
+  `strmap_get`, `strmap_get_or`, `strmap_has`, `strmap_index`, `strmap_len`;
+  `struct IntMap` (int → int) with the same operations under `intmap_*`
 - **Ints:** `abs_int`, `min_int`, `max_int`, `sum_ints`, `index_of_int`,
   `sort_ints`
+- **Float math** (pure machino, identical in both backends): `sqrt`
+  (Newton's method; requires `x >= 0.0`), `pow_int` (requires `exp >= 0`),
+  `pow_float` (int exponent, may be negative), `floor`, `ceil`, `round`
+  (float → int), `abs_float`, `min_float`, `max_float`
+- **JSON:** `enum Json { JNull, JBool(bool), JNum(float), JStr(str),
+  JArr([Json]), JObj(JsonObj) }` with `json_parse(s) -> JsonParsed`
+  (`JVal(Json) | JError(str)` — errors carry a byte offset),
+  `json_serialize(v) -> str` (compact, keys in insertion order),
+  `json_obj_new`, `json_obj_set`, `json_obj_get`. Numbers are `float`;
+  integral values serialize without a fraction. `\uXXXX` escapes decode to
+  a byte below U+0100, `?` otherwise (strings are byte strings).
+- **Time** (UTC, unix epoch milliseconds): `struct Time { year month day
+  hour minute second millis }`, `time_from_ms(ms)` (civil-from-days
+  algorithm, requires `ms >= 0`), `time_format(t)`, `time_iso(ms)`
+  (ISO 8601, e.g. `2001-09-09T01:46:40Z`), `pad2`
 
 ## Memory model (compiled WASM)
 
@@ -340,158 +396,103 @@ that create objects (strings, arrays) must write the 16-byte header — see
 ## Diagnostics
 
 `machino check --json` prints one JSON object:
-`{"ok":bool,"errors":n,"diagnostics":[{severity,code,message,file,line,col,endLine,endCol,help?}]}`.
+`{"ok":bool,"errors":n,"diagnostics":[{severity,code,message,file,line,col,endLine,endCol,help?,fix?}]}`.
 Positions map to the correct file across imports. Error codes are stable:
-`E001–E005` lexical, `E010–E019` syntax, `E020–E050` types and semantics.
+`E001–E005` lexical, `E010–E019` syntax, `E020–E072` types and semantics.
+Some diagnostics carry a machine-applicable `fix`
+(`{line,col,endLine,endCol,replace}`): apply it by replacing that range with
+`replace`. The full schema is `docs/diagnostics.schema.json`; the formal
+grammar is `docs/grammar.ebnf`.
 
-## Known limits (v0.4)
+## Generics
 
-- No generics; `StrMap` is `str → str` (encode other value types).
-- Enum variants can carry at most one payload value.
-- Structs are limited to 60 fields (`E050`); GC bitmaps are one word.
-- Contracts on `extern fn`s are enforced by the interpreter but not in
-  compiled WASM.
-- The interpreter's call depth defaults to 4096 (`MACHINO_MAX_DEPTH` env var
-  overrides); compiled WASM has a 4 MiB shadow stack for pointer frames.
-- Compiled-module memory is capped at 1 GiB.
-- Reference cycles are reclaimed by the compiled GC but leak in the
-  interpreter (they require deliberately circular data).
-
-## v0.6.1 Features - COMPLETE IMPLEMENTATIONS
-
-### Generics (FULLY WORKING)
-
-machino supports generic type parameters on functions, structs, and enums with **complete type inference**:
+Functions may declare type parameters with optional constraint bounds:
 
 ```
 fn<T> identity(x: T) -> T {
     return x
 }
 
-fn<T> first(x: T, y: T) -> T {
-    return x  
-}
-
-struct<T> Box {
-    value: T
-}
-
-enum<T> Result {
-    Ok(T)
-    Err(str)
-}
-```
-
-**Implementation Complete**:
-- ✅ Full Hindley-Milner type inference with unification
-- ✅ Occurs check prevents infinite types
-- ✅ Automatic type argument inference from call sites
-- ✅ Monomorphization generates concrete instances
-- ✅ Type substitution across expressions, statements, and contracts
-- ✅ Generic struct and enum instantiation
-- ✅ Example: `examples/complete_generics.mno`
-
-**No Limitations**: Type inference is fully working. Call generic functions without explicit type arguments - the compiler infers them automatically.
-
-### SMT Verification (FULLY WORKING)
-
-machino integrates Z3 SMT solver for static contract verification with **full array and struct support**:
-
-```
-fn array_sum(arr: [int], n: int) -> int
-    requires n >= 0
-    requires n <= len(arr)
-    ensures result >= 0
-{
-    let sum = 0
-    for i in 0..n {
-        sum = sum + arr[i]
+fn<T: Ord> max2(a: T, b: T) -> T {
+    if a > b {
+        return a
     }
-    return sum
-}
-
-struct Point { x: int, y: int }
-
-fn manhattan_distance(p: Point, q: Point) -> int
-    ensures result >= 0
-{
-    let dx = abs(p.x - q.x)
-    let dy = abs(p.y - q.y)
-    return dx + dy
+    return b
 }
 ```
 
-**Implementation Complete**:
-- ✅ Z3 array theory with select operations
-- ✅ Struct field access via uninterpreted functions
-- ✅ Full arithmetic operators (add, sub, mul, div, mod)
-- ✅ All comparison operators (==, !=, <, <=, >, >=)
-- ✅ Boolean logic (&&, ||, !)
-- ✅ Counterexample reporting
-- ✅ Example: `examples/complete_smt.mno`
-- ✅ Build with: `cargo build --features smt`
+- Bounds: `Eq` enables `==`/`!=`, `Ord` enables comparisons (and implies
+  `Eq`), `Num` enables `+ - * /`. Using an operator without the matching
+  bound is a compile error (`E065`).
+- Type arguments are inferred at every call site by unification; there is
+  no explicit turbofish syntax. Ambiguous or conflicting inference is an
+  error with the conflicting types named.
+- The compiler **monomorphizes**: each distinct instantiation becomes a
+  concrete function before codegen, so both backends see only concrete
+  types. `machino query` still reports the generic template as written.
+- `struct<T>`/`enum<T>` declarations parse, but constructing a generic
+  struct/enum directly is rejected (`E066`); pass values through generic
+  functions instead.
 
-**No Limitations**: Arrays and structs fully supported in SMT verification.
+## Static verification (`machino check --verify`)
 
-### WASM-GC Backend (FULLY WORKING)
+Built with `--features smt` (Z3), the verifier symbolically executes a
+decidable subset — loop-free, call-free functions over `int`/`bool`
+(array `len`/indexing and struct fields become uninterpreted symbols) —
+and reports, per function: contracts **proved**, a **counterexample**
+(concrete argument values violating an `ensures`), or **vacuous requires**
+(no input can satisfy them). Functions outside the subset are skipped and
+still enforced at runtime, as always.
 
-Complete backend targeting the WebAssembly GC proposal with **full expression and statement compilation**:
+## Tooling
 
-```
-struct TreeNode {
-    value: int
-    left_idx: int
-    right_idx: int
-}
+- `machino fmt [--check|--stdout]` — the canonical formatter. It rewrites
+  token spacing, indentation (4 spaces), and blank-line placement, then
+  re-lexes its output and refuses to write anything that would change the
+  parser-visible token stream or lose a comment.
+- `machino query file.mno [name]` — JSON description (name, type params
+  with bounds, param/return types, contracts) of every top-level item.
+- `machino run file.mno --trace` — emits one JSON object per user-function
+  call and return on stderr while the program runs normally on stdout:
+  `{"event":"call","fn":"fib","depth":1,"args":["5"]}` /
+  `{"event":"return","fn":"fib","depth":1,"value":"5"}`. Std-prelude calls
+  are not traced.
+- `machino fuzz file.mno [--runs N] [--seed S]` — generates random
+  arguments for every non-generic function whose parameters are scalars or
+  arrays of scalars, skips inputs that fail `requires`, and reports any
+  input that then violates an `ensures` or traps.
+- `machino synth` — emits random, type-checker-verified programs for
+  training corpora.
+- `machino pkg publish [--registry url] [--token t]` — packs the current
+  package and uploads it to a registry over HTTP (client side; running a
+  registry server is out of scope).
 
-fn tree_sum(nodes: [TreeNode], idx: int) -> int {
-    if idx < 0 { return 0 }
-    let node = nodes[idx]
-    return node.value + tree_sum(nodes, node.left_idx) + tree_sum(nodes, node.right_idx)
-}
-```
+## Known limits (v0.7)
 
-**Implementation Complete**:
-- ✅ Full type section with reference types
-- ✅ Complete expression compilation (all ExprKind variants)
-- ✅ Complete statement compilation (let, assign, if, while, return)
-- ✅ Binary and unary operators
-- ✅ Function calls
-- ✅ Local variable management
-- ✅ Control flow (if/else, loops)
-- ✅ Example: `examples/complete_wasmgc.mno`
+- Generic structs/enums cannot be instantiated directly (`E066`); generic
+  functions cover the common cases.
+- `spawn`/`join_*` are interpreter-only; `machino build` rejects them
+  (`E072`). Spawned functions must return a scalar (`E071`).
+- The WASM-GC backend (`build --gc`) covers scalars, strings, arrays of
+  scalars, and all control flow, but not structs, enums, closures, or
+  match (`E070`); the default linear-memory backend covers everything.
+- SMT verification covers loop-free, call-free int/bool contracts;
+  everything else stays runtime-checked.
+- Enum variants carry at most one payload value; 255 variants max.
+- Structs are limited to 60 fields (`E050`); GC bitmaps are one word.
+- Contracts on `extern fn`s are enforced by the interpreter but not in
+  compiled WASM.
+- The interpreter's call depth defaults to 4096 (`MACHINO_MAX_DEPTH` env
+  var overrides); compiled WASM has a 4 MiB shadow stack for pointer
+  frames. Compiled-module memory is capped at 1 GiB.
+- Reference cycles are reclaimed by the compiled GC but leak in the
+  interpreter (they require deliberately circular data).
 
-**No Limitations**: WASM-GC backend is production-ready. All expression types compile correctly.
+## Roadmap
 
-### Package Registry (Client Complete)
-
-The package system includes content-hash verification and HTTP client:
-
-- ✅ SHA-256 content hashing in lockfiles
-- ✅ HTTP client infrastructure (`ureq`)
-- ✅ Upload/download protocol
-- ✅ Example: `examples/registry.mno`
-- ✅ Build with: `cargo build --features registry`
-
-**Status**: Client complete. Public registry server implementation excluded per user request.
-
-## Design Limits (Hardware/Safety)
-
-These are intentional design constraints for safety and simplicity, NOT implementation gaps:
-
-- **Structs**: 60 fields maximum (GC bitmap optimization)
-- **Memory**: 1 GiB maximum (safety bound for compiled WASM)
-- **Stack depth**: 4096 default (configurable via `MACHINO_MAX_DEPTH`)
-- **Enum variants**: 255 maximum (single-byte tags)
-
-## Roadmap (v0.7+)
-
-All v0.6 features are COMPLETE. Future enhancements:
-
-- Constraint systems (where clauses) for generics
+- Hosted public registry service
+- Threads in compiled WASM (shared-nothing workers)
+- Generic structs/enums end-to-end; `where` clauses
 - Incremental compilation
-- Static analysis passes (dead code, unused variables)
-- Performance optimizations
-- Public registry server (excluded from v0.6.1 per user request)
 
 

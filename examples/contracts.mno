@@ -1,19 +1,19 @@
 # Strings, floats, explicit conversions, and contract-guarded math.
 
 fn safe_div(a: int, b: int) -> int
-    requires b != 0
+requires b != 0
 {
     return a / b
 }
 
 fn average(total: float, count: float) -> float
-    requires count > 0.0
+requires count > 0.0
 {
     return total / count
 }
 
 fn greet(name: str) -> str
-    ensures len(result) > len(name)
+ensures len(result) > len(name)
 {
     return "hello, " + name + "!"
 }
@@ -28,7 +28,7 @@ fn main() {
 
 test "division respects contract" {
     assert safe_div(10, 2) == 5
-    assert safe_div(-9, 3) == -3
+    assert safe_div(- 9, 3) == - 3
 }
 
 test "greeting" {

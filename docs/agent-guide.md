@@ -29,6 +29,7 @@ the exact fix. Trust `help`.
 # comment (to end of line)
 import "lib/util.mno"        # imports at the top; paths relative to this file
 import "pkg:mathx/mathx.mno" # package import (machino_modules/, see below)
+import "geometry.mno" as geo # namespaced: use geo::fn_name, geo::TypeName
 
 struct Point {               # structs: nominal record types
     x: float
@@ -58,6 +59,15 @@ fn safe_div(a: int, b: int) -> int
     ensures result * b <= a
 {
     return a / b
+}
+
+# generics: constraints are Eq (== !=), Ord (< <= > >=), Num (+ - * /);
+# type arguments are inferred at each call site
+fn<T: Ord> max2(a: T, b: T) -> T {
+    if a > b {
+        return a
+    }
+    return b
 }
 
 # first-class functions and capturing lambdas
@@ -106,6 +116,12 @@ fn main() {
 test "math" {
     assert safe_div(10, 2) == 5
 }
+
+# snapshot test: passes only if print output equals the string exactly
+test "output" expects "hello\n5" {
+    print("hello")
+    print(5)
+}
 ```
 
 ## Types and rules that trip models up
@@ -139,19 +155,36 @@ test "math" {
 ## Builtins (the only ones)
 
 `print(x)`, `len(x)`, `push(xs, v)`, `to_float(i)`, `to_int(f)`,
-`char_at(s, i)` (byte as int), `substr(s, a, b)`, `chr(byte)`
+`char_at(s, i)` (byte as int), `substr(s, a, b)`, `chr(byte)`,
+`spawn(f, args...)` -> task handle, `join_int(h)` / `join_float(h)` /
+`join_bool(h)` / `join_str(h)` (concurrency; interpreter only — `machino
+build` rejects them)
 
 ## Standard prelude (always available, names reserved)
 
 - numbers: `str_of_int`, `str_of_bool`, `str_of_float(f, decimals)`,
   `parse_int(s)` (requires `is_int_str(s)`), `is_int_str`, `is_digit`,
   `abs_int`, `min_int`, `max_int`, `sum_ints`, `index_of_int`, `sort_ints`
+- float math: `sqrt(x)` (requires `x >= 0.0`), `pow_int(base, exp)`
+  (requires `exp >= 0`), `pow_float(base, exp)` (int exp, may be negative),
+  `floor(f)`/`ceil(f)`/`round(f)` (-> int), `abs_float`, `min_float`,
+  `max_float`
 - strings: `find`, `find_from`, `contains`, `starts_with`, `ends_with`,
   `split(s, sep)`, `join(parts, sep)`, `trim`, `is_space`, `to_upper`,
   `to_lower`, `repeat`
-- map: `StrMap` (str → str): `strmap_new()`, `strmap_set(m, k, v)`,
+- maps: `StrMap` (str → str): `strmap_new()`, `strmap_set(m, k, v)`,
   `strmap_get(m, k)` (requires key present), `strmap_get_or(m, k, default)`,
-  `strmap_has`, `strmap_len`
+  `strmap_has`, `strmap_len`; `IntMap` (int → int) with the same shape:
+  `intmap_new`, `intmap_set`, `intmap_get`, `intmap_get_or`, `intmap_has`,
+  `intmap_len`
+- JSON: enum `Json` (`JNull | JBool(bool) | JNum(float) | JStr(str) |
+  JArr([Json]) | JObj(JsonObj)`); `json_parse(s) -> JsonParsed`
+  (`JVal(Json) | JError(str)`), `json_serialize(v) -> str`,
+  `json_obj_new()`, `json_obj_set(o, k, v)`, `json_obj_get(o, k)`
+  (returns `Json::JNull` when absent)
+- time (UTC, unix epoch ms): `time_iso(ms) -> str` ("1970-01-01T00:00:00Z"),
+  `time_from_ms(ms) -> Time` (fields `year month day hour minute second
+  millis`), `time_format(t)`, `pad2`
 
 ## Host externs (declare what you need with `extern fn`)
 
@@ -191,6 +224,26 @@ Then import with the `pkg:` prefix: `import "pkg:mathx/mathx.mno"`.
 Dependencies land in `machino_modules/` (commit machino.pkg and
 machino.lock; ignore machino_modules). Transitive deps are flattened —
 one source per package name.
+
+Any import can be namespaced: `import "lib.mno" as lib` renames every
+top-level item lib.mno defines to `lib::name` — call `lib::helper(...)`,
+annotate `let p: lib::Point`, match `lib::Verdict::Yes`. Without `as`,
+imported names stay global (collisions are errors).
+
+## Other tools
+
+- `machino fmt file.mno [--check|--stdout]` — canonical formatter (safe:
+  refuses any edit that changes the token stream)
+- `machino query file.mno [name]` — JSON signatures/contracts/generics of
+  every top-level item; use it to look up an unfamiliar file's API
+- `machino run file.mno --trace` — one JSON object per user-function
+  call/return on stderr: `{"event":"call","fn":"fib","depth":1,"args":["5"]}`
+- `machino fuzz file.mno [--runs N]` — random-input testing driven by
+  contracts; reports the failing input when a contract or trap fires
+- `machino check file.mno --verify` — static contract proofs with Z3 for
+  loop-free, call-free int/bool functions (build with `--features smt`)
+- `machino build file.mno --gc` — experimental WASM-GC backend (scalars,
+  strings, arrays; no structs/enums/closures yet, E070)
 
 ## Error codes you will see most
 

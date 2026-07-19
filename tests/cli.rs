@@ -35,6 +35,12 @@ fn check_passes_on_examples() {
         "higher_order",
         "closures",
         "http_server",
+        "enums",
+        "generics",
+        "json",
+        "stdlib_tour",
+        "concurrency",
+        "namespaces/main",
     ] {
         let out = machino(&["check", &format!("examples/{}.mno", ex)]);
         assert!(out.status.success(), "check failed for {}: {:?}", ex, out);
@@ -52,6 +58,11 @@ fn tests_pass_on_examples() {
         "higher_order",
         "closures",
         "http_server",
+        "enums",
+        "json",
+        "stdlib_tour",
+        "concurrency",
+        "namespaces/main",
     ] {
         let out = machino(&["test", &format!("examples/{}.mno", ex)]);
         assert!(out.status.success(), "tests failed for {}: {:?}", ex, out);
@@ -608,6 +619,310 @@ fn pkg_transitive_deps_are_flattened() {
     let run = run_in(&app, &["run", "main.mno"]);
     assert!(run.status.success(), "{:?}", run);
     assert_eq!(stdout(&run).trim(), "20");
+}
+
+// ---- v0.7 features ----
+
+#[test]
+fn stdlib_math_parity() {
+    let out = assert_parity(
+        "stdmath",
+        r#"fn main() {
+    print(str_of_float(sqrt(2.0), 6))
+    print(pow_int(3, 7))
+    print(str_of_float(pow_float(2.0, -3), 5))
+    print(floor(-1.5))
+    print(ceil(-1.5))
+    print(round(0.5))
+    print(str_of_float(abs_float(-2.25), 2))
+    print(min_float(0.5, -0.5))
+    print(max_float(0.5, -0.5))
+}
+"#,
+    );
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "1.414214");
+    assert_eq!(lines[1], "2187");
+    assert_eq!(lines[2], "0.12500");
+    assert_eq!(lines[3], "-2");
+    assert_eq!(lines[4], "-1");
+    assert_eq!(lines[5], "1");
+}
+
+#[test]
+fn stdlib_json_round_trip_parity() {
+    let out = assert_parity(
+        "stdjson",
+        r#"fn main() {
+    let src = "{\"a\": [1, 2.5, \"x\\ny\"], \"b\": {\"c\": null}, \"d\": -1e2, \"e\": true}"
+    let result = match json_parse(src) {
+        JsonParsed::JVal(v) => json_serialize(v)
+        JsonParsed::JError(e) => "error: " + e
+    }
+    print(result)
+    let bad = match json_parse("[1,") {
+        JsonParsed::JVal(v) => "parsed"
+        JsonParsed::JError(e) => "rejected"
+    }
+    print(bad)
+}
+"#,
+    );
+    assert_eq!(
+        out.lines().next().unwrap(),
+        r#"{"a":[1,2.5,"x\ny"],"b":{"c":null},"d":-100,"e":true}"#
+    );
+    assert_eq!(out.lines().nth(1).unwrap(), "rejected");
+}
+
+#[test]
+fn stdlib_time_and_intmap_parity() {
+    let out = assert_parity(
+        "stdtime",
+        r#"fn main() {
+    print(time_iso(0))
+    print(time_iso(1000000000000))
+    let m = intmap_new()
+    intmap_set(m, 7, 1)
+    intmap_set(m, 7, 2)
+    print(intmap_get(m, 7))
+    print(intmap_get_or(m, 8, -1))
+    print(intmap_len(m))
+}
+"#,
+    );
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "1970-01-01T00:00:00Z");
+    assert_eq!(lines[1], "2001-09-09T01:46:40Z");
+    assert_eq!(lines[2], "2");
+    assert_eq!(lines[3], "-1");
+    assert_eq!(lines[4], "1");
+}
+
+#[test]
+fn match_payload_bindings_work_in_wasm() {
+    // regression: the wasm backend used to panic computing arm body types
+    // that referenced a pattern binding
+    let out = assert_parity(
+        "matchbind",
+        r#"enum E {
+    A(str)
+    B(int)
+    C
+}
+
+fn show(e: E) -> str {
+    return match e {
+        E::A(s) => s
+        E::B(n) => str_of_int(n)
+        E::C => "c"
+    }
+}
+
+fn main() {
+    print(show(E::A("hi")))
+    print(show(E::B(42)))
+    print(show(E::C))
+}
+"#,
+    );
+    assert_eq!(out, "hi\n42\nc\n");
+}
+
+#[test]
+fn namespaced_imports_work() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nstest");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("lib.mno"),
+        r#"struct Pair {
+    a: int
+    b: int
+}
+
+enum Verdict {
+    Yes
+    No
+}
+
+fn sum(p: Pair) -> int {
+    return p.a + p.b
+}
+
+fn judge(n: int) -> Verdict {
+    if n > 0 {
+        return Verdict::Yes
+    }
+    return Verdict::No
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.mno"),
+        r#"import "lib.mno" as lib
+
+fn sum(a: int, b: int) -> int {
+    return a + b
+}
+
+fn main() {
+    let p: lib::Pair = lib::Pair(2, 3)
+    print(lib::sum(p))
+    print(sum(10, 20))
+    let v = lib::judge(5)
+    let s = match v {
+        lib::Verdict::Yes => "yes"
+        lib::Verdict::No => "no"
+    }
+    print(s)
+}
+"#,
+    )
+    .unwrap();
+    let out = machino(&["run", dir.join("main.mno").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout(&out), "5\n30\nyes\n");
+}
+
+#[test]
+fn snapshot_tests_compare_output() {
+    let path = write_temp(
+        "snapshot.mno",
+        "fn main() {\n}\n\ntest \"good\" expects \"1\\n2\" {\n    print(1)\n    print(2)\n}\n\ntest \"bad\" expects \"3\" {\n    print(4)\n}\n",
+    );
+    let out = machino(&["test", path.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let text = stdout(&out);
+    assert!(text.contains("PASS  good"), "{}", text);
+    assert!(text.contains("FAIL  bad"), "{}", text);
+    assert!(text.contains("snapshot mismatch"), "{}", text);
+}
+
+#[test]
+fn spawn_join_runs_in_parallel_threads() {
+    let path = write_temp(
+        "spawn.mno",
+        r#"fn work(n: int) -> int {
+    let acc = 0
+    for i in 0..n {
+        acc = acc + i
+    }
+    return acc
+}
+
+fn shout(s: str) -> str {
+    return to_upper(s)
+}
+
+fn main() {
+    let h1 = spawn(work, 1000)
+    let h2 = spawn(work, 2000)
+    let h3 = spawn(shout, "done")
+    print(join_int(h1) + join_int(h2))
+    print(join_str(h3))
+}
+"#,
+    );
+    let out = machino(&["run", path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout(&out), "2498500\nDONE\n");
+}
+
+#[test]
+fn build_rejects_concurrency() {
+    let path = write_temp(
+        "spawnbuild.mno",
+        "fn f(n: int) -> int {\n    return n\n}\n\nfn main() {\n    let h = spawn(f, 1)\n    print(join_int(h))\n}\n",
+    );
+    let wasm = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("spawnbuild.wasm");
+    let out = machino(&["build", path.to_str().unwrap(), "-o", wasm.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(err.contains("E072"), "{}", err);
+}
+
+#[test]
+fn run_trace_emits_json_events() {
+    let path = write_temp(
+        "trace.mno",
+        "fn inc(n: int) -> int {\n    return n + 1\n}\n\nfn main() {\n    print(inc(41))\n}\n",
+    );
+    let out = machino(&["run", path.to_str().unwrap(), "--trace"]);
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "42\n");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains(r#"{"event":"call","fn":"inc","depth":1,"args":["41"]}"#),
+        "{}",
+        err
+    );
+    assert!(
+        err.contains(r#"{"event":"return","fn":"inc","depth":1,"value":"42"}"#),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn fmt_is_canonical_and_idempotent() {
+    let path = write_temp(
+        "fmt.mno",
+        "fn main(){let x=1+2\nif x>2{print(x)}else{print(0)}}\n",
+    );
+    let out = machino(&["fmt", path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let formatted = std::fs::read_to_string(&path).unwrap();
+    assert!(formatted.contains("    let x = 1 + 2\n"), "{}", formatted);
+    // formatting a second time changes nothing
+    let check = machino(&["fmt", path.to_str().unwrap(), "--check"]);
+    assert!(check.status.success());
+    // and the formatted program still runs
+    let run = machino(&["run", path.to_str().unwrap()]);
+    assert!(run.status.success());
+    assert_eq!(stdout(&run), "3\n");
+}
+
+#[test]
+fn query_reports_generic_templates() {
+    let path = write_temp(
+        "query.mno",
+        "fn<T: Ord> max2(a: T, b: T) -> T {\n    if a > b {\n        return a\n    }\n    return b\n}\n\nfn main() {\n    print(max2(1, 2))\n}\n",
+    );
+    let out = machino(&["query", path.to_str().unwrap()]);
+    assert!(out.status.success());
+    let text = stdout(&out);
+    assert!(text.contains("\"name\":\"max2\""), "{}", text);
+    assert!(text.contains("\"bounds\":[\"Ord\"]"), "{}", text);
+    // monomorphized copies must not leak into query output
+    assert!(!text.contains("max2$"), "{}", text);
+}
+
+#[test]
+fn fuzz_finds_contract_violations() {
+    let path = write_temp(
+        "fuzzable.mno",
+        "fn bad(n: int) -> int\n    ensures result > n\n{\n    return n\n}\n\nfn main() {\n}\n",
+    );
+    let out = machino(&["fuzz", path.to_str().unwrap(), "--runs", "50"]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("bad") && (text.contains("FAIL") || text.contains("violation")),
+        "fuzz did not surface the ensures violation: {}",
+        text
+    );
 }
 
 #[test]

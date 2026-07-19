@@ -1,0 +1,43 @@
+# A small geometry library, meant to be imported with a namespace:
+#   import "geometry.mno" as geo
+
+struct Point {
+    x: float
+    y: float
+}
+
+enum Quadrant {
+    First
+    Second
+    Third
+    Fourth
+    Origin
+}
+
+fn origin() -> Point {
+    return Point(0.0, 0.0)
+}
+
+fn dist(a: Point, b: Point) -> float
+ensures result >= 0.0
+{
+    let dx = a.x - b.x
+    let dy = a.y - b.y
+    return sqrt(dx * dx + dy * dy)
+}
+
+fn quadrant(p: Point) -> Quadrant {
+    if p.x > 0.0 && p.y > 0.0 {
+        return Quadrant::First
+    }
+    if p.x < 0.0 && p.y > 0.0 {
+        return Quadrant::Second
+    }
+    if p.x < 0.0 && p.y < 0.0 {
+        return Quadrant::Third
+    }
+    if p.x > 0.0 && p.y < 0.0 {
+        return Quadrant::Fourth
+    }
+    return Quadrant::Origin
+}

@@ -25,20 +25,11 @@ fn request_path(request: str) -> str {
 
 fn html_page(counter: int) -> str {
     # a statement continues across lines only inside parentheses
-    return ("<!DOCTYPE html><html><body style=\"font-family: sans-serif\">"
-        + "<h1>machino http server</h1>"
-        + "<p>request number " + str_of_int(counter) + "</p>"
-        + "<p>try <a href=\"/hello/you\">/hello/you</a> or <a href=\"/quit\">/quit</a></p>"
-        + "</body></html>")
+    return ("<!DOCTYPE html><html><body style=\"font-family: sans-serif\">" + "<h1>machino http server</h1>" + "<p>request number " + str_of_int(counter) + "</p>" + "<p>try <a href=\"/hello/you\">/hello/you</a> or <a href=\"/quit\">/quit</a></p>" + "</body></html>")
 }
 
 fn respond(conn: int, status: str, content_type: str, body: str) {
-    let response = ("HTTP/1.1 " + status + "\r\n"
-        + "Content-Type: " + content_type + "\r\n"
-        + "Content-Length: " + str_of_int(len(body)) + "\r\n"
-        + "Connection: close\r\n"
-        + "\r\n"
-        + body)
+    let response = ("HTTP/1.1 " + status + "\r\n" + "Content-Type: " + content_type + "\r\n" + "Content-Length: " + str_of_int(len(body)) + "\r\n" + "Connection: close\r\n" + "\r\n" + body)
     tcp_write(conn, response)
 }
 

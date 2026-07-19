@@ -1,0 +1,8 @@
+# Z3 location for `--features smt` (Homebrew on macOS).
+# On Linux, install libz3-dev and adjust/remove these if z3.h is on the
+# default include path.
+[env]
+Z3_SYS_Z3_HEADER = "/opt/homebrew/include/z3.h"
+
+[build]
+rustflags = ["-L", "/opt/homebrew/lib"]

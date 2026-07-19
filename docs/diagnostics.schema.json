@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/machino-lang/machino/docs/diagnostics.schema.json",
+  "title": "machino check --json output",
+  "description": "Every machino CLI command that accepts --json emits exactly one JSON object on stdout. This schema covers `machino check --json` (also produced on failed loads by `test --json` and `query`). Positions are 1-based lines and columns.",
+  "type": "object",
+  "required": ["ok", "errors"],
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "description": "true when the program lexes, parses and type-checks."
+    },
+    "errors": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of diagnostics reported."
+    },
+    "functions": {
+      "type": "integer",
+      "description": "Present on success: number of user (non-std) functions."
+    },
+    "structs": {
+      "type": "integer",
+      "description": "Present on success: number of user structs."
+    },
+    "tests": {
+      "type": "integer",
+      "description": "Present on success: number of test blocks."
+    },
+    "diagnostics": {
+      "type": "array",
+      "description": "Present on failure: one entry per diagnostic.",
+      "items": { "$ref": "#/$defs/diagnostic" }
+    }
+  },
+  "$defs": {
+    "diagnostic": {
+      "type": "object",
+      "required": ["severity", "code", "message", "file", "line", "col", "endLine", "endCol"],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "enum": ["error"],
+          "description": "machino reports only hard errors; there are no warnings."
+        },
+        "code": {
+          "type": "string",
+          "pattern": "^E[0-9]{3}$",
+          "description": "Stable error code (e.g. E035). Agents can key repair strategies on it; codes are never reused for a different meaning."
+        },
+        "message": {
+          "type": "string",
+          "description": "One-line human-readable description of the problem."
+        },
+        "file": {
+          "type": "string",
+          "description": "Path of the file the span points into (import-aware: spans are mapped back from the compiled bundle to the source file)."
+        },
+        "line": { "type": "integer", "minimum": 1 },
+        "col": { "type": "integer", "minimum": 1 },
+        "endLine": { "type": "integer", "minimum": 1 },
+        "endCol": { "type": "integer", "minimum": 1 },
+        "help": {
+          "type": "string",
+          "description": "Optional actionable suggestion in prose."
+        },
+        "fix": {
+          "type": "object",
+          "description": "Optional machine-applicable edit that resolves the diagnostic: replace the text between (line,col) and (endLine,endCol) with `replace`.",
+          "required": ["line", "col", "endLine", "endCol", "replace"],
+          "properties": {
+            "line": { "type": "integer", "minimum": 1 },
+            "col": { "type": "integer", "minimum": 1 },
+            "endLine": { "type": "integer", "minimum": 1 },
+            "endCol": { "type": "integer", "minimum": 1 },
+            "replace": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

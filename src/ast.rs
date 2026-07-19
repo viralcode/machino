@@ -341,11 +341,21 @@ pub struct Contract {
     pub text: String,
 }
 
+/// A generic type parameter with optional constraint bounds.
+/// `fn<T: Ord> max2(a: T, b: T) -> T` declares one param with one bound.
+/// Built-in bounds: Eq (== !=), Ord (< <= > >=, implies Eq), Num (+ - * /).
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub bounds: Vec<String>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
-    /// Generic type parameters (e.g., ["T", "U"] for fn<T, U>).
-    pub type_params: Vec<String>,
+    /// Generic type parameters (e.g., [T, U] for fn<T, U>).
+    pub type_params: Vec<TypeParam>,
     pub params: Vec<Param>,
     pub ret: Type,
     pub requires: Vec<Contract>,
@@ -360,8 +370,8 @@ pub struct Function {
 #[derive(Debug, Clone)]
 pub struct StructDef {
     pub name: String,
-    /// Generic type parameters (e.g., ["T"] for struct<T>).
-    pub type_params: Vec<String>,
+    /// Generic type parameters (e.g., [T] for struct<T>).
+    pub type_params: Vec<TypeParam>,
     pub fields: Vec<Param>,
     pub is_std: bool,
     pub span: Span,
@@ -370,8 +380,8 @@ pub struct StructDef {
 #[derive(Debug, Clone)]
 pub struct EnumDef {
     pub name: String,
-    /// Generic type parameters (e.g., ["T"] for enum<T>).
-    pub type_params: Vec<String>,
+    /// Generic type parameters (e.g., [T] for enum<T>).
+    pub type_params: Vec<TypeParam>,
     pub variants: Vec<EnumVariant>,
     pub is_std: bool,
     pub span: Span,
@@ -387,6 +397,9 @@ pub struct EnumVariant {
 #[derive(Debug, Clone)]
 pub struct TestBlock {
     pub name: String,
+    /// Snapshot expectation: `test "x" expects "out" { ... }` passes only if
+    /// the test's print output equals this string (lines joined with '\n').
+    pub expects: Option<String>,
     pub body: Vec<Stmt>,
     pub span: Span,
 }
@@ -397,7 +410,8 @@ pub struct Program {
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
     pub tests: Vec<TestBlock>,
-    /// Import paths declared with `import "..."`; resolved by the loader,
+    /// Imports declared with `import "..."` or `import "..." as alias`;
+    /// (path, optional namespace alias, span). Resolved by the loader,
     /// ignored when the bundled source is re-parsed.
-    pub imports: Vec<(String, Span)>,
+    pub imports: Vec<(String, Option<String>, Span)>,
 }

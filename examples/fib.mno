@@ -2,8 +2,8 @@
 # interpreter and the compiled WebAssembly.
 
 fn fib(n: int) -> int
-    requires n >= 0
-    ensures result >= 0
+requires n >= 0
+ensures result >= 0
 {
     if n < 2 {
         return n

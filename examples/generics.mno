@@ -1,0 +1,66 @@
+# Generic functions with inferred type arguments and constraint bounds.
+# Constraints: Eq (== !=), Ord (< <= > >=), Num (+ - * /).
+
+fn<T> identity(x: T) -> T {
+    return x
+}
+
+fn<T: Ord> max2(a: T, b: T) -> T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn<T: Num> triple(x: T) -> T {
+    return x + x + x
+}
+
+fn<T> first_of(xs: [T]) -> T
+requires len(xs) > 0
+{
+    return xs[0]
+}
+
+fn<T: Ord> largest(xs: [T]) -> T
+requires len(xs) > 0
+{
+    let best = xs[0]
+    let i = 1
+    while i < len(xs) {
+        if xs[i] > best {
+            best = xs[i]
+        }
+        i = i + 1
+    }
+    return best
+}
+
+# generic functions can call other generic functions
+fn<T: Ord> max3(a: T, b: T, c: T) -> T {
+    return max2(max2(a, b), c)
+}
+
+fn main() {
+    print(identity(42))
+    print(identity("hello"))
+    print(max2(3, 7))
+    print(max2(2.5, 1.5))
+    print(triple(5))
+    print(triple(1.5))
+    print(first_of([10, 20, 30]))
+    print(largest([3, 9, 4]))
+    print(largest([0.5, 2.5, 1.0]))
+    print(max3(1, 5, 3))
+}
+
+test "generic identity preserves values" {
+    assert identity(1) == 1
+    assert identity(true) == true
+}
+
+test "generic max with constraints" {
+    assert max2(3, 7) == 7
+    assert max3(9, 2, 5) == 9
+    assert largest([1, 8, 3]) == 8
+}

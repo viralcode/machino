@@ -1,491 +1,337 @@
-//! Monomorphization pass: converts generic functions into concrete instances.
+//! Monomorphization. The checker infers type arguments for every call to a
+//! generic function and records them keyed by call span. This pass stamps out
+//! a concrete copy of each generic function per distinct type-argument list,
+//! rewrites the call sites to target the concrete copies, and drops the
+//! generic templates. The result is a fully concrete program that the
+//! interpreter and both WASM backends run unchanged.
 
 use crate::ast::*;
+use crate::checker::apply_subst;
 use crate::diag::{Diagnostic, Span};
-use crate::infer::InferCtx;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-/// Information about a call to a generic function.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct GenericCall {
-    function_name: String,
-    type_args: Vec<Type>,
+/// The checker's record of one generic call: (call span, callee, type args).
+/// Type args recorded inside a generic body may themselves contain the
+/// enclosing template's type variables; they are resolved when that body is
+/// instantiated.
+pub type Instantiation = (Span, String, Vec<Type>);
+
+struct Mono<'a> {
+    /// call span -> (callee, recorded type args)
+    call_map: HashMap<(u32, u32), (String, Vec<Type>)>,
+    templates: HashMap<&'a str, &'a Function>,
+    /// (name, concrete type args) still to instantiate
+    queue: Vec<(String, Vec<Type>)>,
+    /// mangled names already emitted
+    done: HashSet<String>,
+    /// fresh lambda ids for instantiated bodies (ids must stay unique
+    /// program-wide; clones of a template would otherwise collide)
+    next_lambda_id: usize,
 }
 
-/// Monomorphize a program: replace generic functions with concrete instances.
-pub fn monomorphize(program: &Program) -> Result<Program, Diagnostic> {
-    let mut mono = Monomorphizer {
-        program,
-        instantiations: HashMap::new(),
-        struct_instantiations: HashMap::new(),
-        enum_instantiations: HashMap::new(),
-        to_generate: Vec::new(),
+/// Canonical mangled name for one instantiation, e.g. `max2$int`.
+pub fn mangle(name: &str, type_args: &[Type]) -> String {
+    let mut out = String::from(name);
+    for ta in type_args {
+        out.push('$');
+        mangle_type(ta, &mut out);
+    }
+    out
+}
+
+fn mangle_type(ty: &Type, out: &mut String) {
+    match ty {
+        Type::Int => out.push_str("int"),
+        Type::Float => out.push_str("float"),
+        Type::Bool => out.push_str("bool"),
+        Type::Str => out.push_str("str"),
+        Type::Unit => out.push_str("unit"),
+        Type::Array(inner) => {
+            out.push_str("arr_");
+            mangle_type(inner, out);
+        }
+        Type::Struct(n) | Type::Enum(n) | Type::TypeVar(n) => out.push_str(n),
+        Type::Fn(params, ret) => {
+            out.push_str("fn");
+            for p in params {
+                out.push('_');
+                mangle_type(p, out);
+            }
+            out.push_str("_to_");
+            mangle_type(ret, out);
+        }
+    }
+}
+
+/// Monomorphizes `program` given the checker-recorded instantiations.
+pub fn monomorphize_with(
+    program: &Program,
+    instantiations: &[Instantiation],
+) -> Result<Program, Diagnostic> {
+    let call_map: HashMap<(u32, u32), (String, Vec<Type>)> = instantiations
+        .iter()
+        .map(|(sp, name, tas)| ((sp.start, sp.end), (name.clone(), tas.clone())))
+        .collect();
+    let templates: HashMap<&str, &Function> = program
+        .functions
+        .iter()
+        .filter(|f| !f.type_params.is_empty())
+        .map(|f| (f.name.as_str(), f))
+        .collect();
+    let next_lambda_id = max_lambda_id(program) + 1;
+
+    let mut mono = Mono {
+        call_map,
+        templates,
+        queue: Vec::new(),
+        done: HashSet::new(),
+        next_lambda_id,
     };
-    
-    // Find all generic function calls and type usages
-    mono.collect_instantiations()?;
-    
-    // Generate concrete versions of functions
-    let mut new_functions = Vec::new();
-    for (call, _) in &mono.instantiations {
-        let concrete_fn = mono.instantiate_function(call)?;
-        new_functions.push(concrete_fn);
-    }
-    
-    // Generate concrete versions of structs
-    let mut new_structs = Vec::new();
-    for (call, _) in &mono.struct_instantiations {
-        let concrete_struct = mono.instantiate_struct(call)?;
-        new_structs.push(concrete_struct);
-    }
-    
-    // Generate concrete versions of enums
-    let mut new_enums = Vec::new();
-    for (call, _) in &mono.enum_instantiations {
-        let concrete_enum = mono.instantiate_enum(call)?;
-        new_enums.push(concrete_enum);
-    }
-    
-    // Build new program with monomorphized definitions
-    let mut functions = program.functions.clone();
-    let mut structs = program.structs.clone();
-    let mut enums = program.enums.clone();
-    
-    // Remove generic definitions that have been instantiated
-    functions.retain(|f| f.type_params.is_empty());
-    structs.retain(|s| s.type_params.is_empty());
-    enums.retain(|e| e.type_params.is_empty());
-    
-    // Add concrete instances
-    functions.extend(new_functions);
-    structs.extend(new_structs);
-    enums.extend(new_enums);
-    
-    Ok(Program {
+
+    let mut out = Program {
+        functions: Vec::new(),
+        structs: program.structs.clone(),
+        enums: program.enums.clone(),
+        tests: Vec::new(),
         imports: program.imports.clone(),
-        functions,
-        structs,
-        enums,
-        tests: program.tests.clone(),
-    })
-}
+    };
 
-struct Monomorphizer<'a> {
-    program: &'a Program,
-    instantiations: HashMap<GenericCall, usize>,
-    struct_instantiations: HashMap<GenericCall, usize>,
-    enum_instantiations: HashMap<GenericCall, usize>,
-    to_generate: Vec<GenericCall>,
-}
+    // rewrite the concrete world; generic calls found there seed the worklist
+    let empty: HashMap<String, Type> = HashMap::new();
+    for f in program.functions.iter().filter(|f| f.type_params.is_empty()) {
+        let mut f2 = f.clone();
+        mono.rewrite_function(&mut f2, &empty);
+        out.functions.push(f2);
+    }
+    for t in &program.tests {
+        let mut t2 = t.clone();
+        for s in &mut t2.body {
+            mono.rewrite_stmt(s, &empty);
+        }
+        out.tests.push(t2);
+    }
 
-impl<'a> Monomorphizer<'a> {
-    fn collect_instantiations(&mut self) -> Result<(), Diagnostic> {
-        // Scan all function bodies for generic calls
-        for func in &self.program.functions {
-            for stmt in &func.body {
-                self.collect_from_stmt(stmt)?;
-            }
+    // instantiate templates transitively
+    while let Some((name, type_args)) = mono.queue.pop() {
+        let mangled = mangle(&name, &type_args);
+        if !mono.done.insert(mangled.clone()) {
+            continue;
         }
-        Ok(())
-    }
-    
-    fn collect_from_stmt(&mut self, stmt: &Stmt) -> Result<(), Diagnostic> {
-        match &stmt.kind {
-            StmtKind::Let { value, .. } => self.collect_from_expr(value),
-            StmtKind::Assign { value, .. } => self.collect_from_expr(value),
-            StmtKind::IndexAssign { base, index, value } => {
-                self.collect_from_expr(base)?;
-                self.collect_from_expr(index)?;
-                self.collect_from_expr(value)
-            }
-            StmtKind::FieldAssign { base, value, .. } => {
-                self.collect_from_expr(base)?;
-                self.collect_from_expr(value)
-            }
-            StmtKind::If { cond, then_body, else_body } => {
-                self.collect_from_expr(cond)?;
-                for s in then_body {
-                    self.collect_from_stmt(s)?;
-                }
-                for s in else_body {
-                    self.collect_from_stmt(s)?;
-                }
-                Ok(())
-            }
-            StmtKind::While { cond, body } => {
-                self.collect_from_expr(cond)?;
-                for s in body {
-                    self.collect_from_stmt(s)?;
-                }
-                Ok(())
-            }
-            StmtKind::For { start, end, body, .. } => {
-                self.collect_from_expr(start)?;
-                self.collect_from_expr(end)?;
-                for s in body {
-                    self.collect_from_stmt(s)?;
-                }
-                Ok(())
-            }
-            StmtKind::Return(Some(e)) => self.collect_from_expr(e),
-            StmtKind::Assert(e) => self.collect_from_expr(e),
-            StmtKind::Expr(e) => self.collect_from_expr(e),
-            _ => Ok(()),
-        }
-    }
-    
-    fn collect_from_expr(&mut self, expr: &Expr) -> Result<(), Diagnostic> {
-        match &expr.kind {
-            ExprKind::Call(name, args) => {
-                // Check if this is a generic function call
-                if let Some(func) = self.program.functions.iter().find(|f| f.name == *name) {
-                    if !func.type_params.is_empty() {
-                        // Infer type arguments from call site
-                        let type_args = self.infer_type_args(func, args, expr.span)?;
-                        
-                        let call = GenericCall {
-                            function_name: name.clone(),
-                            type_args,
-                        };
-                        
-                        if !self.instantiations.contains_key(&call) {
-                            let idx = self.instantiations.len();
-                            self.instantiations.insert(call.clone(), idx);
-                            self.to_generate.push(call);
-                        }
-                    }
-                }
-                for arg in args {
-                    self.collect_from_expr(arg)?;
-                }
-                Ok(())
-            }
-            ExprKind::Bin(_, l, r) => {
-                self.collect_from_expr(l)?;
-                self.collect_from_expr(r)
-            }
-            ExprKind::Un(_, e) => self.collect_from_expr(e),
-            ExprKind::Index(base, idx) => {
-                self.collect_from_expr(base)?;
-                self.collect_from_expr(idx)
-            }
-            ExprKind::Field(base, _) => self.collect_from_expr(base),
-            ExprKind::Array(elems) => {
-                for e in elems {
-                    self.collect_from_expr(e)?;
-                }
-                Ok(())
-            }
-            ExprKind::Match(m) => {
-                self.collect_from_expr(&m.scrutinee)?;
-                for arm in &m.arms {
-                    self.collect_from_expr(&arm.body)?;
-                }
-                Ok(())
-            }
-            ExprKind::Lambda(l) => {
-                for s in &l.body {
-                    self.collect_from_stmt(s)?;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-    
-    fn instantiate_function(&self, call: &GenericCall) -> Result<Function, Diagnostic> {
-        let template = self.program.functions
-            .iter()
-            .find(|f| f.name == call.function_name)
-            .ok_or_else(|| Diagnostic::new(
-                "E999",
-                format!("generic function '{}' not found", call.function_name),
+        let template = *mono.templates.get(name.as_str()).ok_or_else(|| {
+            Diagnostic::new(
+                "E064",
+                format!("internal error: no generic template named '{}'", name),
                 Span::new(0, 0),
-            ))?;
-        
-        // Create substitution map
-        let mut subst = HashMap::new();
-        for (param, arg) in template.type_params.iter().zip(&call.type_args) {
-            subst.insert(param.clone(), arg.clone());
-        }
-        
-        // Generate new function name
-        let mut type_suffix = String::new();
-        for ty in &call.type_args {
-            type_suffix.push('_');
-            type_suffix.push_str(&format!("{}", ty).replace(|c: char| !c.is_alphanumeric(), "_"));
-        }
-        let new_name = format!("{}{}", template.name, type_suffix);
-        
-        // Substitute types in params and return type
-        let params = template.params.iter().map(|p| Param {
-            name: p.name.clone(),
-            ty: self.substitute_type(&p.ty, &subst),
-            span: p.span,
-        }).collect();
-        
-        let ret = self.substitute_type(&template.ret, &subst);
-        
-        // Substitute in contracts
-        let requires = template.requires.iter()
-            .map(|c| self.substitute_contract(c, &subst))
+            )
+        })?;
+        let subst: HashMap<String, Type> = template
+            .type_params
+            .iter()
+            .map(|tp| tp.name.clone())
+            .zip(type_args.iter().cloned())
             .collect();
-        let ensures = template.ensures.iter()
-            .map(|c| self.substitute_contract(c, &subst))
-            .collect();
-        
-        // Substitute in body
-        let body = template.body.iter()
-            .map(|s| self.substitute_stmt(s, &subst))
-            .collect();
-        
-        Ok(Function {
-            name: new_name,
-            type_params: vec![], // concrete version has no type params
-            params,
-            ret,
-            requires,
-            ensures,
-            body,
-            is_extern: false,
-            is_std: template.is_std,
-            span: template.span,
-        })
-    }
-    
-    fn substitute_type(&self, ty: &Type, subst: &HashMap<String, Type>) -> Type {
-        match ty {
-            Type::TypeVar(name) => subst.get(name).cloned().unwrap_or(ty.clone()),
-            Type::Array(inner) => Type::Array(Box::new(self.substitute_type(inner, subst))),
-            Type::Fn(params, ret) => Type::Fn(
-                params.iter().map(|p| self.substitute_type(p, subst)).collect(),
-                Box::new(self.substitute_type(ret, subst)),
-            ),
-            _ => ty.clone(),
+        let mut inst = template.clone();
+        inst.name = mangled;
+        inst.type_params = Vec::new();
+        for p in &mut inst.params {
+            p.ty = apply_subst(&p.ty, &subst);
         }
+        inst.ret = apply_subst(&inst.ret, &subst);
+        mono.rewrite_function(&mut inst, &subst);
+        out.functions.push(inst);
     }
-    
-    fn infer_type_args(&self, func: &Function, args: &[Expr], span: Span) -> Result<Vec<Type>, Diagnostic> {
-        // Simple type inference: we need type information from the checker
-        // For now, return an error saying we can't infer types yet
-        // In a full implementation, we would get type info from the checker
-        Err(Diagnostic::new(
-            "E999",
-            format!("type inference for generic function '{}' not yet implemented; explicit type arguments required", func.name),
-            span,
-        ).with_help("generics support is in development; use concrete types for now"))
-    }
-    
-    fn substitute_expr(&self, expr: &Expr, subst: &HashMap<String, Type>) -> Expr {
-        Expr {
-            kind: match &expr.kind {
-                ExprKind::Call(name, args) => {
-                    ExprKind::Call(name.clone(), args.iter().map(|a| self.substitute_expr(a, subst)).collect())
-                }
-                ExprKind::Bin(op, l, r) => {
-                    ExprKind::Bin(*op, Box::new(self.substitute_expr(l, subst)), Box::new(self.substitute_expr(r, subst)))
-                }
-                ExprKind::Un(op, e) => {
-                    ExprKind::Un(*op, Box::new(self.substitute_expr(e, subst)))
-                }
-                ExprKind::Index(base, idx) => {
-                    ExprKind::Index(Box::new(self.substitute_expr(base, subst)), Box::new(self.substitute_expr(idx, subst)))
-                }
-                ExprKind::Field(base, field) => {
-                    ExprKind::Field(Box::new(self.substitute_expr(base, subst)), field.clone())
-                }
-                ExprKind::Array(elems) => {
-                    ExprKind::Array(elems.iter().map(|e| self.substitute_expr(e, subst)).collect())
-                }
-                ExprKind::Match(m) => {
-                    ExprKind::Match(Box::new(Match {
-                        scrutinee: self.substitute_expr(&m.scrutinee, subst),
-                        arms: m.arms.iter().map(|arm| MatchArm {
-                            pattern: arm.pattern.clone(), // Patterns don't need substitution
-                            body: self.substitute_expr(&arm.body, subst),
-                            span: arm.span,
-                        }).collect(),
-                    }))
-                }
-                ExprKind::Lambda(l) => {
-                    ExprKind::Lambda(Box::new(Lambda {
-                        id: l.id,
-                        params: l.params.iter().map(|p| Param {
-                            name: p.name.clone(),
-                            ty: self.substitute_type(&p.ty, subst),
-                            span: p.span,
-                        }).collect(),
-                        ret: self.substitute_type(&l.ret, subst),
-                        body: l.body.iter().map(|s| self.substitute_stmt(s, subst)).collect(),
-                    }))
-                }
-                _ => expr.kind.clone(),
-            },
-            span: expr.span,
-        }
-    }
-    
-    fn substitute_stmt(&self, stmt: &Stmt, subst: &HashMap<String, Type>) -> Stmt {
-        Stmt {
-            kind: match &stmt.kind {
-                StmtKind::Let { name, ty, value } => {
-                    StmtKind::Let {
-                        name: name.clone(),
-                        ty: ty.as_ref().map(|t| self.substitute_type(t, subst)),
-                        value: self.substitute_expr(value, subst),
-                    }
-                }
-                StmtKind::Assign { name, value } => {
-                    StmtKind::Assign {
-                        name: name.clone(),
-                        value: self.substitute_expr(value, subst),
-                    }
-                }
+
+    Ok(out)
+}
+
+fn max_lambda_id(program: &Program) -> usize {
+    let mut max = 0usize;
+    fn walk_stmts(stmts: &[Stmt], max: &mut usize) {
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Let { value, .. }
+                | StmtKind::Assign { value, .. }
+                | StmtKind::Assert(value)
+                | StmtKind::Expr(value)
+                | StmtKind::Return(Some(value)) => walk_expr(value, max),
                 StmtKind::IndexAssign { base, index, value } => {
-                    StmtKind::IndexAssign {
-                        base: self.substitute_expr(base, subst),
-                        index: self.substitute_expr(index, subst),
-                        value: self.substitute_expr(value, subst),
-                    }
+                    walk_expr(base, max);
+                    walk_expr(index, max);
+                    walk_expr(value, max);
                 }
-                StmtKind::FieldAssign { base, field, value } => {
-                    StmtKind::FieldAssign {
-                        base: self.substitute_expr(base, subst),
-                        field: field.clone(),
-                        value: self.substitute_expr(value, subst),
-                    }
+                StmtKind::FieldAssign { base, value, .. } => {
+                    walk_expr(base, max);
+                    walk_expr(value, max);
                 }
-                StmtKind::If { cond, then_body, else_body } => {
-                    StmtKind::If {
-                        cond: self.substitute_expr(cond, subst),
-                        then_body: then_body.iter().map(|s| self.substitute_stmt(s, subst)).collect(),
-                        else_body: else_body.iter().map(|s| self.substitute_stmt(s, subst)).collect(),
-                    }
+                StmtKind::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    walk_expr(cond, max);
+                    walk_stmts(then_body, max);
+                    walk_stmts(else_body, max);
                 }
                 StmtKind::While { cond, body } => {
-                    StmtKind::While {
-                        cond: self.substitute_expr(cond, subst),
-                        body: body.iter().map(|s| self.substitute_stmt(s, subst)).collect(),
-                    }
+                    walk_expr(cond, max);
+                    walk_stmts(body, max);
                 }
-                StmtKind::For { var, start, end, body } => {
-                    StmtKind::For {
-                        var: var.clone(),
-                        start: self.substitute_expr(start, subst),
-                        end: self.substitute_expr(end, subst),
-                        body: body.iter().map(|s| self.substitute_stmt(s, subst)).collect(),
-                    }
+                StmtKind::For {
+                    start, end, body, ..
+                } => {
+                    walk_expr(start, max);
+                    walk_expr(end, max);
+                    walk_stmts(body, max);
                 }
-                StmtKind::Return(Some(e)) => StmtKind::Return(Some(self.substitute_expr(e, subst))),
-                StmtKind::Assert(e) => StmtKind::Assert(self.substitute_expr(e, subst)),
-                StmtKind::Expr(e) => StmtKind::Expr(self.substitute_expr(e, subst)),
-                _ => stmt.kind.clone(),
-            },
-            span: stmt.span,
+                _ => {}
+            }
         }
     }
-    
-    fn substitute_contract(&self, contract: &Contract, subst: &HashMap<String, Type>) -> Contract {
-        Contract {
-            expr: self.substitute_expr(&contract.expr, subst),
-            text: contract.text.clone(),
+    fn walk_expr(e: &Expr, max: &mut usize) {
+        match &e.kind {
+            ExprKind::Array(elems) => elems.iter().for_each(|e| walk_expr(e, max)),
+            ExprKind::Index(a, b) | ExprKind::Bin(_, a, b) => {
+                walk_expr(a, max);
+                walk_expr(b, max);
+            }
+            ExprKind::Field(a, _) | ExprKind::Un(_, a) => walk_expr(a, max),
+            ExprKind::Call(_, args) => args.iter().for_each(|a| walk_expr(a, max)),
+            ExprKind::Lambda(l) => {
+                *max = (*max).max(l.id);
+                walk_stmts(&l.body, max);
+            }
+            ExprKind::Match(m) => {
+                walk_expr(&m.scrutinee, max);
+                for arm in &m.arms {
+                    walk_expr(&arm.body, max);
+                }
+            }
+            _ => {}
+        }
+    }
+    for f in &program.functions {
+        walk_stmts(&f.body, &mut max);
+        for c in f.requires.iter().chain(f.ensures.iter()) {
+            walk_expr(&c.expr, &mut max);
+        }
+    }
+    for t in &program.tests {
+        walk_stmts(&t.body, &mut max);
+    }
+    max
+}
+
+impl<'a> Mono<'a> {
+    fn rewrite_function(&mut self, f: &mut Function, subst: &HashMap<String, Type>) {
+        for c in f.requires.iter_mut().chain(f.ensures.iter_mut()) {
+            self.rewrite_expr(&mut c.expr, subst);
+        }
+        for s in &mut f.body {
+            self.rewrite_stmt(s, subst);
         }
     }
 
-fn instantiate_struct(&self, call: &GenericCall) -> Result<StructDef, Diagnostic> {
-    let template = self.program.structs
-        .iter()
-        .find(|s| s.name == call.function_name)
-        .ok_or_else(|| Diagnostic::new(
-            "E999",
-            format!("generic struct '{}' not found", call.function_name),
-            Span::new(0, 0),
-        ))?;
-    
-    // Create substitution map
-    let mut subst = HashMap::new();
-    for (param, arg) in template.type_params.iter().zip(&call.type_args) {
-        subst.insert(param.clone(), arg.clone());
-    }
-    
-    // Generate new struct name
-    let new_name = self.mangle_name(&template.name, &call.type_args);
-    
-    // Substitute types in fields
-    let fields = template.fields.iter().map(|f| Param {
-        name: f.name.clone(),
-        ty: self.substitute_type(&f.ty, &subst),
-        span: f.span,
-    }).collect();
-    
-    Ok(StructDef {
-        name: new_name,
-        type_params: vec![],
-        fields,
-        is_std: template.is_std,
-        span: template.span,
-    })
-}
-
-fn instantiate_enum(&self, call: &GenericCall) -> Result<EnumDef, Diagnostic> {
-    let template = self.program.enums
-        .iter()
-        .find(|e| e.name == call.function_name)
-        .ok_or_else(|| Diagnostic::new(
-            "E999",
-            format!("generic enum '{}' not found", call.function_name),
-            Span::new(0, 0),
-        ))?;
-    
-    // Create substitution map
-    let mut subst = HashMap::new();
-    for (param, arg) in template.type_params.iter().zip(&call.type_args) {
-        subst.insert(param.clone(), arg.clone());
-    }
-    
-    // Generate new enum name
-    let new_name = self.mangle_name(&template.name, &call.type_args);
-    
-    // Substitute types in variants
-    let variants = template.variants.iter().map(|v| EnumVariant {
-        name: v.name.clone(),
-        payload: v.payload.as_ref().map(|ty| self.substitute_type(ty, &subst)),
-        span: v.span,
-    }).collect();
-    
-    Ok(EnumDef {
-        name: new_name,
-        type_params: vec![],
-        variants,
-        is_std: template.is_std,
-        span: template.span,
-    })
-}
-
-fn mangle_name(&self, base: &str, type_args: &[Type]) -> String {
-    let mut name = base.to_string();
-    for ty in type_args {
-        name.push('_');
-        name.push_str(&self.type_to_string(ty));
-    }
-    name
-}
-
-fn type_to_string(&self, ty: &Type) -> String {
-    match ty {
-        Type::Int => "int".to_string(),
-        Type::Float => "float".to_string(),
-        Type::Bool => "bool".to_string(),
-        Type::Str => "str".to_string(),
-        Type::Unit => "unit".to_string(),
-        Type::Array(inner) => format!("arr_{}", self.type_to_string(inner)),
-        Type::Struct(name) => name.replace("::", "_"),
-        Type::Enum(name) => name.replace("::", "_"),
-        Type::Fn(params, ret) => {
-            let ps: Vec<_> = params.iter().map(|p| self.type_to_string(p)).collect();
-            format!("fn_{}_{}", ps.join("_"), self.type_to_string(ret))
+    fn rewrite_stmt(&mut self, stmt: &mut Stmt, subst: &HashMap<String, Type>) {
+        match &mut stmt.kind {
+            StmtKind::Let { ty, value, .. } => {
+                if let Some(t) = ty {
+                    *t = apply_subst(t, subst);
+                }
+                self.rewrite_expr(value, subst);
+            }
+            StmtKind::Assign { value, .. } => self.rewrite_expr(value, subst),
+            StmtKind::IndexAssign { base, index, value } => {
+                self.rewrite_expr(base, subst);
+                self.rewrite_expr(index, subst);
+                self.rewrite_expr(value, subst);
+            }
+            StmtKind::FieldAssign { base, value, .. } => {
+                self.rewrite_expr(base, subst);
+                self.rewrite_expr(value, subst);
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                self.rewrite_expr(cond, subst);
+                for s in then_body {
+                    self.rewrite_stmt(s, subst);
+                }
+                for s in else_body {
+                    self.rewrite_stmt(s, subst);
+                }
+            }
+            StmtKind::While { cond, body } => {
+                self.rewrite_expr(cond, subst);
+                for s in body {
+                    self.rewrite_stmt(s, subst);
+                }
+            }
+            StmtKind::For {
+                start, end, body, ..
+            } => {
+                self.rewrite_expr(start, subst);
+                self.rewrite_expr(end, subst);
+                for s in body {
+                    self.rewrite_stmt(s, subst);
+                }
+            }
+            StmtKind::Return(Some(e)) | StmtKind::Assert(e) | StmtKind::Expr(e) => {
+                self.rewrite_expr(e, subst)
+            }
+            _ => {}
         }
-        Type::TypeVar(name) => name.clone(),
     }
-}
+
+    fn rewrite_expr(&mut self, expr: &mut Expr, subst: &HashMap<String, Type>) {
+        // rewrite children first, then this call site
+        match &mut expr.kind {
+            ExprKind::Array(elems) => {
+                for e in elems {
+                    self.rewrite_expr(e, subst);
+                }
+            }
+            ExprKind::Index(a, b) | ExprKind::Bin(_, a, b) => {
+                self.rewrite_expr(a, subst);
+                self.rewrite_expr(b, subst);
+            }
+            ExprKind::Field(a, _) | ExprKind::Un(_, a) => self.rewrite_expr(a, subst),
+            ExprKind::Call(_, args) => {
+                for a in args {
+                    self.rewrite_expr(a, subst);
+                }
+            }
+            ExprKind::Lambda(l) => {
+                l.id = self.next_lambda_id;
+                self.next_lambda_id += 1;
+                for p in &mut l.params {
+                    p.ty = apply_subst(&p.ty, subst);
+                }
+                l.ret = apply_subst(&l.ret, subst);
+                for s in &mut l.body {
+                    self.rewrite_stmt(s, subst);
+                }
+            }
+            ExprKind::Match(m) => {
+                self.rewrite_expr(&mut m.scrutinee, subst);
+                for arm in &mut m.arms {
+                    self.rewrite_expr(&mut arm.body, subst);
+                }
+            }
+            _ => {}
+        }
+        if let ExprKind::Call(name, _) = &mut expr.kind {
+            if let Some((callee, recorded_args)) =
+                self.call_map.get(&(expr.span.start, expr.span.end)).cloned()
+            {
+                if &callee == name {
+                    let concrete: Vec<Type> =
+                        recorded_args.iter().map(|t| apply_subst(t, subst)).collect();
+                    *name = mangle(&callee, &concrete);
+                    self.queue.push((callee, concrete));
+                }
+            }
+        }
+    }
 }

@@ -2849,7 +2849,7 @@ impl<'a> WasmCompiler<'a> {
             ExprKind::Var(name) => {
                 if let Some((idx, _)) = lookup(scope, name) {
                     ctx.b.local_get(idx);
-                } else if let Some(colon_pos) = name.find("::") {
+                } else if let Some(colon_pos) = name.rfind("::") {
                     // enum variant without payload (Enum::Variant)
                     let enum_name = &name[..colon_pos];
                     let variant_name = &name[colon_pos + 2..];
@@ -2864,7 +2864,10 @@ impl<'a> WasmCompiler<'a> {
                         ctx.b.call(self.h_alloc);
                         let tmp = ctx.b.new_local(VT_I64);
                         ctx.b.local_tee(tmp);
-                        
+                        // root it (consumes the teed copy from the stack)
+                        let root = ctx.alloc_temp();
+                        self.frame_store(ctx, root);
+
                         // write header
                         ctx.b.local_get(tmp);
                         ctx.b.i32_wrap_i64();
@@ -3036,7 +3039,15 @@ impl<'a> WasmCompiler<'a> {
                 ctx.b.local_set(scrut_local);
                 
                 let result_ty = expected.cloned().or_else(|| {
-                    m.arms.first().map(|arm| self.type_of(&arm.body, scope))
+                    m.arms.first().map(|arm| {
+                        // arm bodies may reference pattern bindings; give the
+                        // type computation a scope that knows their types
+                        let mut probe = scope.clone();
+                        let mut frame = HashMap::new();
+                        self.pattern_types(&arm.pattern, &scrut_ty, &mut frame);
+                        probe.push(frame);
+                        self.type_of(&arm.body, &probe)
+                    })
                 }).unwrap_or(Type::Unit);
                 
                 // Generate nested if-else for each arm
@@ -3128,6 +3139,32 @@ impl<'a> WasmCompiler<'a> {
     }
 
     /// Bind pattern variables to the scope
+    /// Records the types of a pattern's bindings into `frame` (with a dummy
+    /// local index). Used to type-check arm bodies before code for the
+    /// bindings is emitted.
+    fn pattern_types(
+        &self,
+        pattern: &Pattern,
+        scrut_ty: &Type,
+        frame: &mut HashMap<String, (u32, Type)>,
+    ) {
+        match pattern {
+            Pattern::Var(name) => {
+                frame.insert(name.clone(), (u32::MAX, scrut_ty.clone()));
+            }
+            Pattern::VariantPayload(enum_name, variant_name, inner) => {
+                if let Some(variants) = self.enum_variants.get(enum_name.as_str()) {
+                    if let Some(v) = variants.iter().find(|v| v.name == *variant_name) {
+                        if let Some(ref payload_ty) = v.payload {
+                            self.pattern_types(inner, payload_ty, frame);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn bind_pattern_vars(
         &mut self,
         ctx: &mut FnCtx,
@@ -3396,7 +3433,7 @@ impl<'a> WasmCompiler<'a> {
             }
             _ => {
                 // check if this is an enum variant constructor (Enum::Variant)
-                if let Some(colon_pos) = name.find("::") {
+                if let Some(colon_pos) = name.rfind("::") {
                     let enum_name = &name[..colon_pos];
                     let variant_name = &name[colon_pos + 2..];
                     if let Some(variants) = self.enum_variants.get(enum_name) {
@@ -3506,7 +3543,7 @@ impl<'a> WasmCompiler<'a> {
             ExprKind::Var(name) => match lookup(scope, name) {
                 Some((_, t)) => t,
                 None => {
-                    if let Some(colon_pos) = name.find("::") {
+                    if let Some(colon_pos) = name.rfind("::") {
                         let enum_name = &name[..colon_pos];
                         if self.enum_variants.contains_key(enum_name) {
                             return Type::Enum(enum_name.to_string());
@@ -3558,7 +3595,7 @@ impl<'a> WasmCompiler<'a> {
                         _ => Type::Array(Box::new(Type::Int)),
                     },
                     other => {
-                        if let Some(colon_pos) = other.find("::") {
+                        if let Some(colon_pos) = other.rfind("::") {
                             let enum_name = &other[..colon_pos];
                             if self.enum_variants.contains_key(enum_name) {
                                 return Type::Enum(enum_name.to_string());
@@ -3576,7 +3613,12 @@ impl<'a> WasmCompiler<'a> {
                 // match expression type is the type of the first arm body
                 // (checker ensures all arms have the same type)
                 if let Some(arm) = m.arms.first() {
-                    self.type_of(&arm.body, scope)
+                    let scrut_ty = self.type_of(&m.scrutinee, scope);
+                    let mut probe = scope.clone();
+                    let mut frame = HashMap::new();
+                    self.pattern_types(&arm.pattern, &scrut_ty, &mut frame);
+                    probe.push(frame);
+                    self.type_of(&arm.body, &probe)
                 } else {
                     Type::Unit
                 }

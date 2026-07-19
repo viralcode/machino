@@ -23,25 +23,25 @@ fn format_lockfile_entry(pkg: Package) -> str {
 
 fn main() {
     print("=== Package Registry Example ===")
-    
+
     let pkg1 = create_package("mathx", "1.0.0")
     let pkg2 = create_package("strkit", "2.1.0")
-    
+
     print("Package 1:")
     print("  Name: " + pkg1.name)
     print("  Version: " + pkg1.version)
     print("  Hash: " + pkg1.hash)
-    
+
     print("Package 2:")
     print("  Name: " + pkg2.name)
     print("  Version: " + pkg2.version)
     print("  Hash: " + pkg2.hash)
-    
+
     print("")
     print("Lockfile format:")
     print(format_lockfile_entry(pkg1))
     print(format_lockfile_entry(pkg2))
-    
+
     print("")
     print("Verifying pkg1...")
     if verify_package(pkg1, "sha256:mathx:1.0.0") {
@@ -54,7 +54,7 @@ fn main() {
 test "package verification" {
     let pkg = create_package("test", "1.0.0")
     assert verify_package(pkg, "sha256:test:1.0.0")
-    assert !verify_package(pkg, "sha256:wrong:1.0.0")
+    assert!verify_package(pkg, "sha256:wrong:1.0.0")
 }
 
 test "lockfile format" {

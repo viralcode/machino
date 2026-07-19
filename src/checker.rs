@@ -14,17 +14,94 @@ pub struct Signature {
 
 pub struct Checker<'a> {
     pub program: &'a Program,
+    /// Full bundle source; used to quote operand text in machine-applicable fixes.
+    pub source: &'a str,
     pub signatures: HashMap<String, Signature>,
     pub structs: HashMap<String, Vec<Param>>,
     pub enums: HashMap<String, Vec<EnumVariant>>,
     /// Type parameters in scope (for generic functions/structs).
     pub type_params: Vec<String>,
+    /// Constraint bounds of the type parameters currently in scope.
+    pub type_param_bounds: HashMap<String, Vec<String>>,
+    /// Names of generic (templated) functions in the program.
+    pub generic_fns: HashMap<String, usize>,
+    /// Generic call instantiations discovered during checking:
+    /// call span -> (function name, inferred type arguments).
+    pub instantiations: std::cell::RefCell<Vec<(Span, String, Vec<Type>)>>,
     diags: Vec<Diagnostic>,
     loop_depth: u32,
 }
 
+/// Levenshtein edit distance, used for did-you-mean suggestions.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Substitutes type variables in `ty` using `subst`. Shared with the
+/// monomorphizer, which uses it to stamp out concrete instantiations.
+pub fn apply_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
+    match ty {
+        Type::TypeVar(n) => subst.get(n).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Array(inner) => Type::Array(Box::new(apply_subst(inner, subst))),
+        Type::Fn(ps, r) => Type::Fn(
+            ps.iter().map(|p| apply_subst(p, subst)).collect(),
+            Box::new(apply_subst(r, subst)),
+        ),
+        _ => ty.clone(),
+    }
+}
+
+/// One-way unification: matches a parameter type (which may contain the
+/// substitutable type variables in `tps`) against a concrete argument type,
+/// extending `subst`. Type variables NOT in `tps` are rigid (they belong to
+/// an enclosing generic function) and only match themselves.
+fn unify_ty(param: &Type, arg: &Type, tps: &[&str], subst: &mut HashMap<String, Type>) -> bool {
+    match (param, arg) {
+        (Type::TypeVar(n), a) if tps.contains(&n.as_str()) => match subst.get(n) {
+            Some(bound) => bound == a,
+            None => {
+                subst.insert(n.clone(), a.clone());
+                true
+            }
+        },
+        (Type::TypeVar(n), Type::TypeVar(m)) => n == m,
+        (Type::Array(p), Type::Array(a)) => unify_ty(p, a, tps, subst),
+        (Type::Fn(pp, pr), Type::Fn(ap, ar)) => {
+            pp.len() == ap.len()
+                && pp.iter().zip(ap).all(|(p, a)| unify_ty(p, a, tps, subst))
+                && unify_ty(pr, ar, tps, subst)
+        }
+        _ => param == arg,
+    }
+}
+
+/// Returns the closest candidate within a sane edit distance, for suggestions.
+fn closest<'x>(name: &str, candidates: impl Iterator<Item = &'x str>) -> Option<&'x str> {
+    let mut best: Option<(&str, usize)> = None;
+    for c in candidates {
+        let d = edit_distance(name, c);
+        if d <= 2.max(name.len() / 3) && best.map_or(true, |(_, bd)| d < bd) {
+            best = Some((c, d));
+        }
+    }
+    best.filter(|&(_, d)| d > 0).map(|(c, _)| c)
+}
+
 pub const BUILTINS: &[&str] = &[
     "print", "len", "push", "to_float", "to_int", "char_at", "substr", "chr",
+    "spawn", "join_int", "join_float", "join_bool", "join_str",
 ];
 
 struct Scope {
@@ -57,6 +134,17 @@ impl Scope {
     fn lookup(&self, name: &str) -> Option<&Type> {
         self.vars.iter().rev().find_map(|m| m.get(name))
     }
+    /// All names currently in scope, for did-you-mean suggestions.
+    fn all_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .vars
+            .iter()
+            .flat_map(|m| m.keys().cloned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
     /// True if `name` resolves to a variable declared outside the innermost
     /// enclosing lambda (i.e. it would be captured by value).
     fn is_captured(&self, name: &str) -> bool {
@@ -73,19 +161,67 @@ impl Scope {
 }
 
 impl<'a> Checker<'a> {
-    pub fn new(program: &'a Program) -> Self {
+    pub fn new(program: &'a Program, source: &'a str) -> Self {
         Checker {
             program,
+            source,
             signatures: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
             type_params: Vec::new(),
+            type_param_bounds: HashMap::new(),
+            generic_fns: HashMap::new(),
+            instantiations: std::cell::RefCell::new(Vec::new()),
             diags: Vec::new(),
             loop_depth: 0,
         }
     }
 
-    pub fn check(mut self) -> Result<(), Vec<Diagnostic>> {
+    /// Puts a function/struct/enum's type parameters (and bounds) in scope.
+    fn enter_type_params(&mut self, tps: &[TypeParam]) {
+        self.type_params = tps.iter().map(|tp| tp.name.clone()).collect();
+        self.type_param_bounds = tps
+            .iter()
+            .map(|tp| (tp.name.clone(), tp.bounds.clone()))
+            .collect();
+    }
+
+    fn exit_type_params(&mut self) {
+        self.type_params.clear();
+        self.type_param_bounds.clear();
+    }
+
+    /// Does `ty` satisfy the named constraint bound?
+    fn satisfies_bound(&self, ty: &Type, bound: &str) -> bool {
+        // a type variable satisfies a bound if it declares an implying bound
+        if let Type::TypeVar(n) = ty {
+            let bounds = self.type_param_bounds.get(n).cloned().unwrap_or_default();
+            return match bound {
+                "Eq" => bounds.iter().any(|b| b == "Eq" || b == "Ord"),
+                other => bounds.iter().any(|b| b == other),
+            };
+        }
+        match bound {
+            "Eq" => matches!(ty, Type::Int | Type::Float | Type::Bool | Type::Str),
+            "Ord" => matches!(ty, Type::Int | Type::Float),
+            "Num" => matches!(ty, Type::Int | Type::Float),
+            _ => false,
+        }
+    }
+
+    /// True if the type parameter (by name) declares a bound implying `bound`.
+    fn typevar_allows(&self, name: &str, bound: &str) -> bool {
+        self.satisfies_bound(&Type::TypeVar(name.to_string()), bound)
+    }
+
+    /// Source text under a span (for quoting operands in fixes).
+    fn snippet(&self, span: Span) -> &str {
+        let start = (span.start as usize).min(self.source.len());
+        let end = (span.end as usize).min(self.source.len());
+        &self.source[start..end]
+    }
+
+    pub fn check(mut self) -> Result<Vec<(Span, String, Vec<Type>)>, Vec<Diagnostic>> {
         // pass 0: collect structs
         for s in &self.program.structs {
             if BUILTINS.contains(&s.name.as_str()) || s.name == "result" || s.name == "memory" {
@@ -130,12 +266,6 @@ impl<'a> Checker<'a> {
                 }
             }
             self.structs.insert(s.name.clone(), s.fields.clone());
-        }
-        // validate field types now that all struct names are known
-        for s in &self.program.structs {
-            for f in &s.fields {
-                self.validate_type(&f.ty, f.span);
-            }
         }
 
         // pass 0b: collect enums
@@ -191,13 +321,23 @@ impl<'a> Checker<'a> {
             }
             self.enums.insert(e.name.clone(), e.variants.clone());
         }
-        // validate variant payload types now that all type names are known
+        // validate field and payload types now that ALL type names (structs
+        // and enums, in any declaration order) are known
+        for s in &self.program.structs {
+            self.enter_type_params(&s.type_params);
+            for f in &s.fields {
+                self.validate_type(&f.ty, f.span);
+            }
+            self.exit_type_params();
+        }
         for e in &self.program.enums {
+            self.enter_type_params(&e.type_params);
             for v in &e.variants {
                 if let Some(ref ty) = v.payload {
                     self.validate_type(ty, v.span);
                 }
             }
+            self.exit_type_params();
         }
 
         // pass 1: collect function signatures
@@ -265,10 +405,29 @@ impl<'a> Checker<'a> {
                 continue;
             }
             first_def.insert(f.name.clone(), (f.span, f.is_std));
+            if !f.type_params.is_empty() {
+                if f.is_extern {
+                    self.diags.push(Diagnostic::new(
+                        "E068",
+                        format!("extern function '{}' cannot be generic", f.name),
+                        f.span,
+                    ));
+                    continue;
+                }
+                let idx = self
+                    .program
+                    .functions
+                    .iter()
+                    .position(|g| std::ptr::eq(g, f))
+                    .unwrap();
+                self.generic_fns.insert(f.name.clone(), idx);
+            }
+            self.enter_type_params(&f.type_params);
             for p in &f.params {
                 self.validate_type(&p.ty, p.span);
             }
             self.validate_type(&f.ret, f.span);
+            self.exit_type_params();
             if f.is_extern {
                 self.validate_extern_types(f);
             }
@@ -299,7 +458,7 @@ impl<'a> Checker<'a> {
         }
 
         if self.diags.is_empty() {
-            Ok(())
+            Ok(self.instantiations.into_inner())
         } else {
             Err(self.diags)
         }
@@ -374,6 +533,14 @@ impl<'a> Checker<'a> {
     }
 
     fn check_function(&mut self, f: &Function) {
+        // generic bodies are checked polymorphically: T is a rigid type that
+        // supports only what its constraint bounds allow
+        self.enter_type_params(&f.type_params);
+        self.check_function_inner(f);
+        self.exit_type_params();
+    }
+
+    fn check_function_inner(&mut self, f: &Function) {
         let mut scope = Scope::new();
         for p in &f.params {
             if !scope.declare(&p.name, p.ty.clone()) {
@@ -474,19 +641,21 @@ impl<'a> Checker<'a> {
                 let inferred = self.infer(value, scope, ty.as_ref());
                 let final_ty = match (ty, inferred) {
                     (Some(annotated), Some(actual)) => {
-                        if annotated != &actual {
+                        if !self.types_equal(annotated, &actual) {
                             self.diags.push(
                                 Diagnostic::new(
                                     "E030",
                                     format!(
                                         "type mismatch: '{}' is declared as '{}' but the value has type '{}'",
-                                        name, annotated, actual
+                                        name,
+                                        self.normalize_type(annotated),
+                                        self.normalize_type(&actual)
                                     ),
                                     value.span,
                                 ),
                             );
                         }
-                        annotated.clone()
+                        self.normalize_type(annotated)
                     }
                     (Some(annotated), None) => annotated.clone(),
                     (None, Some(actual)) => actual,
@@ -521,12 +690,14 @@ impl<'a> Checker<'a> {
                 match var_ty {
                     Some(t) => {
                         if let Some(actual) = self.infer(value, scope, Some(&t)) {
-                            if actual != t {
+                            if !self.types_equal(&actual, &t) {
                                 self.diags.push(Diagnostic::new(
                                     "E030",
                                     format!(
                                         "type mismatch: '{}' has type '{}' but the value has type '{}'",
-                                        name, t, actual
+                                        name,
+                                        self.normalize_type(&t),
+                                        self.normalize_type(&actual)
                                     ),
                                     value.span,
                                 ));
@@ -559,12 +730,13 @@ impl<'a> Checker<'a> {
                 match base_ty {
                     Some(Type::Array(elem)) => {
                         if let Some(vty) = self.infer(value, scope, Some(&elem)) {
-                            if vty != *elem {
+                            if !self.types_equal(&vty, &elem) {
                                 self.diags.push(Diagnostic::new(
                                     "E030",
                                     format!(
                                         "type mismatch: array elements are '{}' but the value has type '{}'",
-                                        elem, vty
+                                        self.normalize_type(&elem),
+                                        self.normalize_type(&vty)
                                     ),
                                     value.span,
                                 ));
@@ -588,12 +760,15 @@ impl<'a> Checker<'a> {
                         match self.field_type(&sname, field) {
                             Some(fty) => {
                                 if let Some(vty) = self.infer(value, scope, Some(&fty)) {
-                                    if vty != fty {
+                                    if !self.types_equal(&vty, &fty) {
                                         self.diags.push(Diagnostic::new(
                                             "E030",
                                             format!(
                                                 "type mismatch: field '{}.{}' is '{}' but the value has type '{}'",
-                                                sname, field, fty, vty
+                                                sname,
+                                                field,
+                                                self.normalize_type(&fty),
+                                                self.normalize_type(&vty)
                                             ),
                                             value.span,
                                         ));
@@ -754,12 +929,23 @@ impl<'a> Checker<'a> {
                     .join(", ")
             })
             .unwrap_or_default();
-        Diagnostic::new(
+        let mut d = Diagnostic::new(
             "E048",
             format!("struct '{}' has no field '{}'", struct_name, field),
             span,
         )
-        .with_help(format!("fields of {}: {}", struct_name, fields))
+        .with_help(format!("fields of {}: {}", struct_name, fields));
+        if let Some(fs) = self.structs.get(struct_name) {
+            if let Some(suggestion) = closest(field, fs.iter().map(|f| f.name.as_str())) {
+                // the field name sits at the end of the base.field span
+                let fspan = Span::new(
+                    span.end.saturating_sub(field.len() as u32),
+                    span.end,
+                );
+                d = d.with_fix(fspan, suggestion.to_string());
+            }
+        }
+        d
     }
 
     /// Infers an expression type. Returns None if an error was already
@@ -776,10 +962,24 @@ impl<'a> Checker<'a> {
                 }
                 // a bare function name is a first-class function value
                 if let Some(sig) = self.signatures.get(name) {
+                    if self.generic_fns.contains_key(name) {
+                        self.diags.push(
+                            Diagnostic::new(
+                                "E065",
+                                format!(
+                                    "generic function '{}' cannot be used as a value",
+                                    name
+                                ),
+                                expr.span,
+                            )
+                            .with_help("call it directly so its type arguments can be inferred"),
+                        );
+                        return None;
+                    }
                     return Some(Type::Fn(sig.params.clone(), Box::new(sig.ret.clone())));
                 }
                 // check if this is an enum variant without payload (Enum::Variant)
-                if let Some(colon_pos) = name.find("::") {
+                if let Some(colon_pos) = name.rfind("::") {
                     let enum_name = &name[..colon_pos];
                     let variant_name = &name[colon_pos + 2..];
                     if let Some(variants) = self.enums.get(enum_name) {
@@ -806,6 +1006,14 @@ impl<'a> Checker<'a> {
                         "'{}' is a struct; construct it: {}(...)",
                         name, name
                     ));
+                } else {
+                    let names = scope.all_names();
+                    if let Some(suggestion) = closest(name, names.iter().map(|s| s.as_str())) {
+                        let suggestion = suggestion.to_string();
+                        d = d
+                            .with_help(format!("did you mean '{}'?", suggestion))
+                            .with_fix(expr.span, suggestion);
+                    }
                 }
                 self.diags.push(d);
                 None
@@ -925,13 +1133,47 @@ impl<'a> Checker<'a> {
                 let lt = self.infer(lhs, scope, None)?;
                 let rt = self.infer(rhs, scope, Some(&lt))?;
                 use BinOp::*;
+                // operations on a constrained type variable (inside a generic
+                // function body): what the bounds permit is well-typed
+                if let (Type::TypeVar(a), Type::TypeVar(b)) = (&lt, &rt) {
+                    if a == b {
+                        let (needed, result) = match op {
+                            Add | Sub | Mul | Div => ("Num", lt.clone()),
+                            Lt | Le | Gt | Ge => ("Ord", Type::Bool),
+                            Eq | Ne => ("Eq", Type::Bool),
+                            _ => ("", Type::Unit),
+                        };
+                        if !needed.is_empty() {
+                            if self.typevar_allows(a, needed) {
+                                return Some(result);
+                            }
+                            self.diags.push(
+                                Diagnostic::new(
+                                    "E069",
+                                    format!(
+                                        "'{}' on values of type parameter '{}' requires the '{}' constraint",
+                                        op_name(*op), a, needed
+                                    ),
+                                    expr.span,
+                                )
+                                .with_help(format!(
+                                    "declare the bound in the signature: fn<{}: {}> ...",
+                                    a, needed
+                                )),
+                            );
+                            return None;
+                        }
+                    }
+                }
                 match op {
                     Add => match (&lt, &rt) {
                         (Type::Int, Type::Int) => Some(Type::Int),
                         (Type::Float, Type::Float) => Some(Type::Float),
                         (Type::Str, Type::Str) => Some(Type::Str),
                         _ => {
-                            self.diags.push(self.numeric_mismatch("+", &lt, &rt, expr.span));
+                            self.diags.push(self.numeric_mismatch(
+                                "+", &lt, &rt, lhs.span, rhs.span, expr.span,
+                            ));
                             None
                         }
                     },
@@ -939,8 +1181,9 @@ impl<'a> Checker<'a> {
                         (Type::Int, Type::Int) => Some(Type::Int),
                         (Type::Float, Type::Float) => Some(Type::Float),
                         _ => {
-                            self.diags
-                                .push(self.numeric_mismatch(op_name(*op), &lt, &rt, expr.span));
+                            self.diags.push(self.numeric_mismatch(
+                                op_name(*op), &lt, &rt, lhs.span, rhs.span, expr.span,
+                            ));
                             None
                         }
                     },
@@ -960,8 +1203,9 @@ impl<'a> Checker<'a> {
                     Lt | Le | Gt | Ge => match (&lt, &rt) {
                         (Type::Int, Type::Int) | (Type::Float, Type::Float) => Some(Type::Bool),
                         _ => {
-                            self.diags
-                                .push(self.numeric_mismatch(op_name(*op), &lt, &rt, expr.span));
+                            self.diags.push(self.numeric_mismatch(
+                                op_name(*op), &lt, &rt, lhs.span, rhs.span, expr.span,
+                            ));
                             None
                         }
                     },
@@ -977,14 +1221,17 @@ impl<'a> Checker<'a> {
                             ));
                             return None;
                         }
-                        if matches!(lt, Type::Array(_) | Type::Struct(_) | Type::Fn(_, _)) {
+                        if matches!(
+                            lt,
+                            Type::Array(_) | Type::Struct(_) | Type::Fn(_, _) | Type::TypeVar(_)
+                        ) {
                             self.diags.push(
                                 Diagnostic::new(
                                     "E044",
                                     format!("values of type '{}' cannot be compared with '==' or '!='", lt),
                                     expr.span,
                                 )
-                                .with_help("compare field-by-field or element-by-element"),
+                                .with_help("compare field-by-field or element-by-element (for type parameters, add an Eq constraint)"),
                             );
                             return None;
                         }
@@ -1359,12 +1606,13 @@ impl<'a> Checker<'a> {
                 match arr_ty {
                     Type::Array(elem) => {
                         if let Some(vty) = self.infer(&args[1], scope, Some(&elem)) {
-                            if vty != *elem {
+                            if !self.types_equal(&vty, &elem) {
                                 self.diags.push(Diagnostic::new(
                                     "E030",
                                     format!(
                                         "type mismatch: pushing '{}' into an array of '{}'",
-                                        vty, elem
+                                        self.normalize_type(&vty),
+                                        self.normalize_type(&elem)
                                     ),
                                     args[1].span,
                                 ));
@@ -1408,12 +1656,105 @@ impl<'a> Checker<'a> {
                 "substr",
             ),
             "chr" => self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Str, "chr"),
+            "spawn" => {
+                // spawn(f, args...) -> int (task handle). Runs f on its own
+                // OS thread with deep-copied arguments (interpreter only).
+                if args.is_empty() {
+                    self.diags.push(
+                        Diagnostic::new(
+                            "E045",
+                            "spawn takes a function value plus its arguments",
+                            span,
+                        )
+                        .with_help("spawn(worker, 42) then join_int(handle)"),
+                    );
+                    return Some(Type::Int);
+                }
+                let fty = self.infer(&args[0], scope, None)?;
+                let Type::Fn(params, ret) = fty else {
+                    self.diags.push(Diagnostic::new(
+                        "E046",
+                        format!(
+                            "spawn requires a function value as its first argument, found '{}'",
+                            fty
+                        ),
+                        args[0].span,
+                    ));
+                    return Some(Type::Int);
+                };
+                if !matches!(*ret, Type::Int | Type::Float | Type::Bool | Type::Str) {
+                    self.diags.push(
+                        Diagnostic::new(
+                            "E071",
+                            format!(
+                                "spawned functions must return int, float, bool or str, found '{}'",
+                                ret
+                            ),
+                            args[0].span,
+                        )
+                        .with_help("join_int/join_float/join_bool/join_str retrieve the result"),
+                    );
+                }
+                if args.len() - 1 != params.len() {
+                    self.diags.push(Diagnostic::new(
+                        "E045",
+                        format!(
+                            "spawned function takes {} argument{}, found {}",
+                            params.len(),
+                            if params.len() == 1 { "" } else { "s" },
+                            args.len() - 1
+                        ),
+                        span,
+                    ));
+                    return Some(Type::Int);
+                }
+                for (a, want) in args[1..].iter().zip(&params) {
+                    if let Some(ty) = self.infer(a, scope, Some(want)) {
+                        if !self.types_equal(&ty, want) {
+                            self.diags.push(Diagnostic::new(
+                                "E030",
+                                format!("spawn argument requires '{}', found '{}'", want, ty),
+                                a.span,
+                            ));
+                        }
+                    }
+                }
+                Some(Type::Int)
+            }
+            "join_int" => {
+                self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Int, "join_int")
+            }
+            "join_float" => {
+                self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Float, "join_float")
+            }
+            "join_bool" => {
+                self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Bool, "join_bool")
+            }
+            "join_str" => {
+                self.check_builtin_sig(args, span, scope, &[Type::Int], Type::Str, "join_str")
+            }
             _ => {
                 // check if this is an enum variant constructor (Enum::Variant)
-                if let Some(colon_pos) = name.find("::") {
+                if let Some(colon_pos) = name.rfind("::") {
                     let enum_name = &name[..colon_pos];
                     let variant_name = &name[colon_pos + 2..];
                     if let Some(variants) = self.enums.get(enum_name).cloned() {
+                        if let Some(ed) = self.program.enums.iter().find(|e| e.name == enum_name) {
+                            if !ed.type_params.is_empty() {
+                                self.diags.push(
+                                    Diagnostic::new(
+                                        "E066",
+                                        format!(
+                                            "generic enum '{}' cannot be constructed: only functions support generics in this version",
+                                            enum_name
+                                        ),
+                                        span,
+                                    )
+                                    .with_help("declare a concrete enum per payload type, or pass values through generic functions"),
+                                );
+                                return None;
+                            }
+                        }
                         if let Some(variant) = variants.iter().find(|v| v.name == variant_name) {
                             if let Some(ref payload_ty) = variant.payload {
                                 if args.len() != 1 {
@@ -1455,22 +1796,60 @@ impl<'a> Checker<'a> {
                 }
                 // 2. struct constructor
                 if let Some(fields) = self.structs.get(name).cloned() {
+                    if let Some(sd) = self.program.structs.iter().find(|s| s.name == *name) {
+                        if !sd.type_params.is_empty() {
+                            self.diags.push(
+                                Diagnostic::new(
+                                    "E066",
+                                    format!(
+                                        "generic struct '{}' cannot be constructed: only functions support generics in this version",
+                                        name
+                                    ),
+                                    span,
+                                )
+                                .with_help("declare a concrete struct per element type, or pass values through generic functions"),
+                            );
+                            return None;
+                        }
+                    }
                     let params: Vec<Type> = fields.iter().map(|f| f.ty.clone()).collect();
                     self.check_args(name, &params, args, span, scope);
                     return Some(Type::Struct(name.to_string()));
+                }
+                // 3a. generic function: infer type arguments by unification
+                if let Some(&idx) = self.generic_fns.get(name) {
+                    let f = &self.program.functions[idx];
+                    return self.check_generic_call(f, args, span, scope);
                 }
                 // 3. named function or extern
                 let (params, ret) = match self.signatures.get(name) {
                     Some(sig) => (sig.params.clone(), sig.ret.clone()),
                     None => {
-                        self.diags.push(
-                            Diagnostic::new(
-                                "E047",
-                                format!("unknown function '{}'", name),
-                                span,
-                            )
-                            .with_help(format!("builtins: {}", BUILTINS.join(", "))),
+                        let mut d = Diagnostic::new(
+                            "E047",
+                            format!("unknown function '{}'", name),
+                            span,
                         );
+                        let candidates: Vec<&str> = self
+                            .signatures
+                            .keys()
+                            .map(|s| s.as_str())
+                            .chain(BUILTINS.iter().copied())
+                            .collect();
+                        if let Some(suggestion) = closest(name, candidates.into_iter()) {
+                            let suggestion = suggestion.to_string();
+                            // the call expr's span starts at the callee name
+                            let name_span = Span::new(
+                                span.start,
+                                span.start + name.len() as u32,
+                            );
+                            d = d
+                                .with_help(format!("did you mean '{}'?", suggestion))
+                                .with_fix(name_span, suggestion);
+                        } else {
+                            d = d.with_help(format!("builtins: {}", BUILTINS.join(", ")));
+                        }
+                        self.diags.push(d);
                         return None;
                     }
                 };
@@ -1478,6 +1857,109 @@ impl<'a> Checker<'a> {
                 Some(ret)
             }
         }
+    }
+
+    /// Checks a call to a generic function: infers the type arguments from the
+    /// argument types by unification, verifies constraint bounds, records the
+    /// instantiation for the monomorphizer, and returns the substituted
+    /// return type.
+    fn check_generic_call(
+        &mut self,
+        f: &'a Function,
+        args: &[Expr],
+        span: Span,
+        scope: &mut Scope,
+    ) -> Option<Type> {
+        if args.len() != f.params.len() {
+            self.diags.push(Diagnostic::new(
+                "E045",
+                format!(
+                    "'{}' takes {} argument(s), found {}",
+                    f.name,
+                    f.params.len(),
+                    args.len()
+                ),
+                span,
+            ));
+            return None;
+        }
+        let tp_names: Vec<&str> = f.type_params.iter().map(|tp| tp.name.as_str()).collect();
+        let mut subst: HashMap<String, Type> = HashMap::new();
+        let mut ok = true;
+        for (i, (p, a)) in f.params.iter().zip(args.iter()).enumerate() {
+            let Some(aty) = self.infer(a, scope, None) else {
+                ok = false;
+                continue;
+            };
+            let aty = self.normalize_type(&aty);
+            let pty = self.normalize_type(&p.ty);
+            if !unify_ty(&pty, &aty, &tp_names, &mut subst) {
+                self.diags.push(Diagnostic::new(
+                    "E030",
+                    format!(
+                        "type mismatch: argument {} of '{}' expects '{}', found '{}'",
+                        i + 1,
+                        f.name,
+                        apply_subst(&pty, &subst),
+                        aty
+                    ),
+                    a.span,
+                ));
+                ok = false;
+            }
+        }
+        if !ok {
+            return None;
+        }
+        // every type parameter must be fixed by the arguments
+        let mut type_args = Vec::new();
+        for tp in &f.type_params {
+            match subst.get(&tp.name) {
+                Some(t) => type_args.push(t.clone()),
+                None => {
+                    self.diags.push(
+                        Diagnostic::new(
+                            "E064",
+                            format!(
+                                "cannot infer type parameter '{}' of '{}' from the arguments",
+                                tp.name, f.name
+                            ),
+                            span,
+                        )
+                        .with_help(
+                            "every type parameter must appear in at least one parameter type",
+                        ),
+                    );
+                    return None;
+                }
+            }
+        }
+        // inferred types must satisfy the declared constraint bounds
+        for (tp, ta) in f.type_params.iter().zip(type_args.iter()) {
+            for b in &tp.bounds {
+                if !self.satisfies_bound(ta, b) {
+                    self.diags.push(
+                        Diagnostic::new(
+                            "E069",
+                            format!(
+                                "type '{}' does not satisfy the constraint '{}: {}' of '{}'",
+                                ta, tp.name, b, f.name
+                            ),
+                            span,
+                        )
+                        .with_help(match b.as_str() {
+                            "Num" | "Ord" => "satisfied by: int, float",
+                            _ => "satisfied by: int, float, bool, str",
+                        }),
+                    );
+                    return None;
+                }
+            }
+        }
+        self.instantiations
+            .borrow_mut()
+            .push((span, f.name.clone(), type_args));
+        Some(apply_subst(&self.normalize_type(&f.ret), &subst))
     }
 
     fn check_builtin_sig(
@@ -1516,7 +1998,15 @@ impl<'a> Checker<'a> {
         Some(ret)
     }
 
-    fn numeric_mismatch(&self, op: &str, lt: &Type, rt: &Type, span: Span) -> Diagnostic {
+    fn numeric_mismatch(
+        &self,
+        op: &str,
+        lt: &Type,
+        rt: &Type,
+        lspan: Span,
+        rspan: Span,
+        span: Span,
+    ) -> Diagnostic {
         let mut d = Diagnostic::new(
             "E043",
             format!(
@@ -1529,6 +2019,12 @@ impl<'a> Checker<'a> {
             d = d.with_help(
                 "machino has no implicit numeric conversion; use to_float(x) or to_int(x)",
             );
+            // machine-applicable fix: wrap the int-typed operand in to_float(...)
+            let (int_span, _) = if lt == &Type::Int { (lspan, rspan) } else { (rspan, lspan) };
+            let text = self.snippet(int_span);
+            if !text.is_empty() {
+                d = d.with_fix(int_span, format!("to_float({})", text));
+            }
         }
         d
     }

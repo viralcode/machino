@@ -20,6 +20,14 @@ impl Span {
     }
 }
 
+/// A machine-applicable fix: replace the bytes in `span` with `replacement`.
+/// Agents can apply this mechanically without re-deriving the edit.
+#[derive(Debug, Clone)]
+pub struct Fix {
+    pub span: Span,
+    pub replacement: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     /// Stable error code, e.g. "E003". Agents can key repair strategies on it.
@@ -28,6 +36,8 @@ pub struct Diagnostic {
     pub span: Span,
     /// Actionable fix suggestion.
     pub help: Option<String>,
+    /// Optional machine-applicable edit that resolves the diagnostic.
+    pub fix: Option<Fix>,
 }
 
 impl Diagnostic {
@@ -37,11 +47,21 @@ impl Diagnostic {
             message: message.into(),
             span,
             help: None,
+            fix: None,
         }
     }
 
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help = Some(help.into());
+        self
+    }
+
+    /// Attach a machine-applicable fix that replaces `span` with `replacement`.
+    pub fn with_fix(mut self, span: Span, replacement: impl Into<String>) -> Self {
+        self.fix = Some(Fix {
+            span,
+            replacement: replacement.into(),
+        });
         self
     }
 }
@@ -89,8 +109,23 @@ impl Diagnostic {
             Some(h) => format!(",\"help\":\"{}\"", json_escape(h)),
             None => String::new(),
         };
+        let fix = match &self.fix {
+            Some(f) => {
+                let (fl, fc) = line_col(source, f.span.start);
+                let (fel, fec) = line_col(source, f.span.end);
+                format!(
+                    ",\"fix\":{{\"line\":{},\"col\":{},\"endLine\":{},\"endCol\":{},\"replace\":\"{}\"}}",
+                    fl,
+                    fc,
+                    fel,
+                    fec,
+                    json_escape(&f.replacement)
+                )
+            }
+            None => String::new(),
+        };
         format!(
-            "{{\"severity\":\"error\",\"code\":\"{}\",\"message\":\"{}\",\"file\":\"{}\",\"line\":{},\"col\":{},\"endLine\":{},\"endCol\":{}{}}}",
+            "{{\"severity\":\"error\",\"code\":\"{}\",\"message\":\"{}\",\"file\":\"{}\",\"line\":{},\"col\":{},\"endLine\":{},\"endCol\":{}{}{}}}",
             self.code,
             json_escape(&self.message),
             json_escape(path),
@@ -98,7 +133,8 @@ impl Diagnostic {
             col,
             end_line,
             end_col,
-            help
+            help,
+            fix
         )
     }
 

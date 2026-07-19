@@ -39,6 +39,94 @@ pub struct ClosureData {
     pub captured: Vec<(String, Value)>,
 }
 
+// ---- concurrency (spawn / join_*) ----
+
+/// The program spawned threads execute against. Set once per process by the
+/// CLI before running user code; spawn fails cleanly if unset.
+static SPAWN_PROGRAM: std::sync::OnceLock<Program> = std::sync::OnceLock::new();
+
+pub fn set_spawn_program(p: Program) {
+    let _ = SPAWN_PROGRAM.set(p);
+}
+
+/// A Send-able deep copy of a Value. Machino values use Rc internally, so
+/// crossing a thread boundary copies the whole object graph — spawned tasks
+/// share nothing with their parent.
+#[derive(Debug, Clone)]
+enum SendVal {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(Vec<u8>),
+    Array(Vec<SendVal>),
+    Struct(Vec<(String, SendVal)>),
+    EnumVariant(String, String, Option<Box<SendVal>>),
+    Fn(String),
+    Closure(usize, Vec<(String, SendVal)>),
+    Unit,
+}
+
+fn to_sendval(v: &Value) -> SendVal {
+    match v {
+        Value::Int(i) => SendVal::Int(*i),
+        Value::Float(f) => SendVal::Float(*f),
+        Value::Bool(b) => SendVal::Bool(*b),
+        Value::Str(s) => SendVal::Str(s.as_ref().clone()),
+        Value::Array(cells) => SendVal::Array(cells.borrow().iter().map(to_sendval).collect()),
+        Value::Struct(fields) => SendVal::Struct(
+            fields
+                .borrow()
+                .iter()
+                .map(|(k, v)| (k.clone(), to_sendval(v)))
+                .collect(),
+        ),
+        Value::EnumVariant(e, n, payload) => SendVal::EnumVariant(
+            e.clone(),
+            n.clone(),
+            payload.as_ref().map(|p| Box::new(to_sendval(p))),
+        ),
+        Value::Fn(name) => SendVal::Fn(name.clone()),
+        Value::Closure(c) => SendVal::Closure(
+            c.lambda_id,
+            c.captured
+                .iter()
+                .map(|(k, v)| (k.clone(), to_sendval(v)))
+                .collect(),
+        ),
+        Value::Unit => SendVal::Unit,
+    }
+}
+
+fn from_sendval(v: SendVal) -> Value {
+    match v {
+        SendVal::Int(i) => Value::Int(i),
+        SendVal::Float(f) => Value::Float(f),
+        SendVal::Bool(b) => Value::Bool(b),
+        SendVal::Str(s) => Value::Str(Rc::new(s)),
+        SendVal::Array(xs) => Value::Array(Rc::new(RefCell::new(
+            xs.into_iter().map(from_sendval).collect(),
+        ))),
+        SendVal::Struct(fields) => Value::Struct(Rc::new(RefCell::new(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k, from_sendval(v)))
+                .collect(),
+        ))),
+        SendVal::EnumVariant(e, n, payload) => {
+            Value::EnumVariant(e, n, payload.map(|p| Box::new(from_sendval(*p))))
+        }
+        SendVal::Fn(name) => Value::Fn(name),
+        SendVal::Closure(id, captured) => Value::Closure(Rc::new(ClosureData {
+            lambda_id: id,
+            captured: captured
+                .into_iter()
+                .map(|(k, v)| (k, from_sendval(v)))
+                .collect(),
+        })),
+        SendVal::Unit => Value::Unit,
+    }
+}
+
 impl Value {
     pub fn display(&self) -> String {
         match self {
@@ -79,7 +167,7 @@ pub struct RuntimeError {
 }
 
 impl RuntimeError {
-    fn new(message: impl Into<String>, span: Span) -> Self {
+    pub fn new(message: impl Into<String>, span: Span) -> Self {
         RuntimeError {
             message: message.into(),
             span,
@@ -109,11 +197,17 @@ pub struct Interp<'a> {
     depth: usize,
     max_depth: usize,
     pub output: Box<dyn FnMut(&str) + 'a>,
+    /// When set, receives one JSON object per call/return of a user-defined
+    /// (non-std) function. Enabled by `machino run --trace`.
+    pub trace: Option<Box<dyn FnMut(&str) + 'a>>,
     /// Program arguments exposed through the args() extern.
     pub args: Vec<String>,
     listeners: HashMap<i64, TcpListener>,
     conns: HashMap<i64, TcpStream>,
     next_handle: i64,
+    /// Running spawned tasks, keyed by the handle spawn returned.
+    tasks: HashMap<i64, std::thread::JoinHandle<Result<SendVal, String>>>,
+    next_task: i64,
 }
 
 type RResult<T> = Result<T, RuntimeError>;
@@ -150,10 +244,13 @@ impl<'a> Interp<'a> {
             depth: 0,
             max_depth: max_call_depth(),
             output: Box::new(|line| println!("{}", line)),
+            trace: None,
             args: Vec::new(),
             listeners: HashMap::new(),
             conns: HashMap::new(),
             next_handle: 1,
+            tasks: HashMap::new(),
+            next_task: 1,
         }
     }
 
@@ -172,6 +269,28 @@ impl<'a> Interp<'a> {
         let mut env: Vec<HashMap<String, Value>> = vec![HashMap::new()];
         self.exec_block(stmts, &mut env)?;
         Ok(())
+    }
+
+    /// Calls a named function with already-constructed values. Used by
+    /// `machino fuzz` to drive contract-based property testing.
+    pub fn call_by_name(&mut self, name: &str, args: Vec<Value>) -> RResult<Value> {
+        let f = self.functions.get(name).copied().ok_or_else(|| {
+            RuntimeError::new(format!("no function named '{}'", name), Span::new(0, 0))
+        })?;
+        self.call_function(f, args, Span::new(0, 0))
+    }
+
+    /// Calls a first-class function value (named function or closure).
+    /// Used by spawned tasks.
+    pub fn call_value(&mut self, callee: &Value, args: Vec<Value>) -> RResult<Value> {
+        match callee {
+            Value::Fn(name) => self.call_by_name(name, args),
+            Value::Closure(c) => self.call_closure(c, args, Span::new(0, 0)),
+            _ => Err(RuntimeError::new(
+                "spawn requires a function value",
+                Span::new(0, 0),
+            )),
+        }
     }
 
     fn call_function(&mut self, f: &'a Function, args: Vec<Value>, call_span: Span) -> RResult<Value> {
@@ -202,6 +321,23 @@ impl<'a> Interp<'a> {
                         call_span,
                     ));
                 }
+            }
+        }
+
+        let tracing = self.trace.is_some() && !f.is_std;
+        if tracing {
+            let arg_strs: Vec<String> = args
+                .iter()
+                .map(|v| format!("\"{}\"", crate::diag::json_escape(&v.display())))
+                .collect();
+            let line = format!(
+                "{{\"event\":\"call\",\"fn\":\"{}\",\"depth\":{},\"args\":[{}]}}",
+                crate::diag::json_escape(&f.name),
+                self.depth,
+                arg_strs.join(",")
+            );
+            if let Some(t) = self.trace.as_mut() {
+                t(&line);
             }
         }
 
@@ -239,6 +375,18 @@ impl<'a> Interp<'a> {
                         f.span,
                     ));
                 }
+            }
+        }
+
+        if tracing {
+            let line = format!(
+                "{{\"event\":\"return\",\"fn\":\"{}\",\"depth\":{},\"value\":\"{}\"}}",
+                crate::diag::json_escape(&f.name),
+                self.depth,
+                crate::diag::json_escape(&result.display())
+            );
+            if let Some(t) = self.trace.as_mut() {
+                t(&line);
             }
         }
 
@@ -661,7 +809,7 @@ impl<'a> Interp<'a> {
             return Ok(Value::Fn(name.to_string()));
         }
         // check if this is an enum variant without payload (Enum::Variant)
-        if let Some(colon_pos) = name.find("::") {
+        if let Some(colon_pos) = name.rfind("::") {
             let enum_name = &name[..colon_pos];
             let variant_name = &name[colon_pos + 2..];
             if let Some(variants) = self.enum_variants.get(enum_name) {
@@ -889,9 +1037,68 @@ impl<'a> Interp<'a> {
                         }
                         _ => unreachable!(),
                     },
+                    "spawn" => {
+                        let Some(program) = SPAWN_PROGRAM.get() else {
+                            return Err(RuntimeError::new(
+                                "spawn is only available under 'machino run' and 'machino test'",
+                                expr.span,
+                            ));
+                        };
+                        let func = to_sendval(&vals[0]);
+                        let send_args: Vec<SendVal> = vals[1..].iter().map(to_sendval).collect();
+                        let handle = std::thread::spawn(move || {
+                            let mut interp = Interp::new(program);
+                            let args: Vec<Value> = send_args.into_iter().map(from_sendval).collect();
+                            let callee = from_sendval(func);
+                            let result = interp
+                                .call_value(&callee, args)
+                                .map_err(|e| e.message)?;
+                            Ok(to_sendval(&result))
+                        });
+                        let id = self.next_task;
+                        self.next_task += 1;
+                        self.tasks.insert(id, handle);
+                        Ok(Value::Int(id))
+                    }
+                    "join_int" | "join_float" | "join_bool" | "join_str" => {
+                        let Value::Int(id) = vals[0] else { unreachable!() };
+                        let handle = self.tasks.remove(&id).ok_or_else(|| {
+                            RuntimeError::new(
+                                format!("no running task with handle {}", id),
+                                expr.span,
+                            )
+                        })?;
+                        let joined = handle.join().map_err(|_| {
+                            RuntimeError::new("spawned task panicked", expr.span)
+                        })?;
+                        let val = from_sendval(joined.map_err(|msg| {
+                            RuntimeError::new(
+                                format!("spawned task failed: {}", msg),
+                                expr.span,
+                            )
+                        })?);
+                        let ok = matches!(
+                            (name.as_str(), &val),
+                            ("join_int", Value::Int(_))
+                                | ("join_float", Value::Float(_))
+                                | ("join_bool", Value::Bool(_))
+                                | ("join_str", Value::Str(_))
+                        );
+                        if !ok {
+                            return Err(RuntimeError::new(
+                                format!(
+                                    "{}: task returned a value of a different type ({})",
+                                    name,
+                                    val.display()
+                                ),
+                                expr.span,
+                            ));
+                        }
+                        Ok(val)
+                    }
                     other => {
                         // check if this is an enum variant constructor (Enum::Variant)
-                        if let Some(colon_pos) = other.find("::") {
+                        if let Some(colon_pos) = other.rfind("::") {
                             let enum_name = &other[..colon_pos];
                             let variant_name = &other[colon_pos + 2..];
                             if let Some(variants) = self.enum_variants.get(enum_name) {

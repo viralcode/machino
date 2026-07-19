@@ -7,11 +7,15 @@ struct Counter {
 }
 
 fn make_adder(n: int) -> fn(int) -> int {
-    return fn(x: int) -> int { return x + n }
+    return fn(x: int) -> int {
+        return x + n
+    }
 }
 
 fn compose(f: fn(int) -> int, g: fn(int) -> int) -> fn(int) -> int {
-    return fn(x: int) -> int { return g(f(x)) }
+    return fn(x: int) -> int {
+        return g(f(x))
+    }
 }
 
 fn map_ints(xs: [int], f: fn(int) -> int) -> [int] {
@@ -39,7 +43,10 @@ fn main() {
     let add10 = compose(add3, add7)
     print(add10(5))
 
-    let doubled = map_ints([1, 2, 3, 4], fn(x: int) -> int { return x * 2 })
+    let doubled = map_ints([1, 2, 3, 4], fn(x: int) -> int {
+        return x * 2
+    }
+    )
     for i in 0..len(doubled) {
         print(doubled[i])
     }

@@ -15,7 +15,7 @@ impl Rng {
     pub fn new(seed: u64) -> Self {
         Rng(seed.max(1))
     }
-    fn next(&mut self) -> u64 {
+    pub fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -23,7 +23,7 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
-    fn range(&mut self, n: u64) -> u64 {
+    pub fn range(&mut self, n: u64) -> u64 {
         self.next() % n
     }
     fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {

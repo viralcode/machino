@@ -10,9 +10,15 @@ pub struct Parser<'a> {
     pos: usize,
     source: &'a str,
     lambda_counter: usize,
+    /// Type parameters of the item currently being parsed. Identifiers in
+    /// type position that match one of these become Type::TypeVar.
+    current_type_params: Vec<String>,
 }
 
 type PResult<T> = Result<T, Diagnostic>;
+
+/// Constraint bounds a type parameter may declare.
+const VALID_BOUNDS: &[&str] = &["Eq", "Ord", "Num"];
 
 impl<'a> Parser<'a> {
     pub fn new(tokens: &'a [Token], source: &'a str) -> Self {
@@ -21,7 +27,46 @@ impl<'a> Parser<'a> {
             pos: 0,
             source,
             lambda_counter: 0,
+            current_type_params: Vec::new(),
         }
+    }
+
+    /// Parses `<T, U: Ord, ...>` after a fn/struct/enum name, registering the
+    /// names so parse_type resolves them as type variables.
+    fn parse_type_params(&mut self) -> PResult<Vec<TypeParam>> {
+        self.current_type_params.clear();
+        let mut type_params = Vec::new();
+        if self.eat(&Tok::Lt) {
+            loop {
+                let tspan = self.peek_span();
+                let tname = self.parse_ident("type parameter")?;
+                let mut bounds = Vec::new();
+                if self.eat(&Tok::Colon) {
+                    let bspan = self.peek_span();
+                    let bound = self.parse_ident("constraint name")?;
+                    if !VALID_BOUNDS.contains(&bound.as_str()) {
+                        return Err(Diagnostic::new(
+                            "E067",
+                            format!("unknown constraint '{}'", bound),
+                            bspan,
+                        )
+                        .with_help("valid constraints: Eq (== !=), Ord (< <= > >=), Num (+ - * /)"));
+                    }
+                    bounds.push(bound);
+                }
+                self.current_type_params.push(tname.clone());
+                type_params.push(TypeParam {
+                    name: tname,
+                    bounds,
+                    span: tspan,
+                });
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::Gt, "'>' after type parameters")?;
+        }
+        Ok(type_params)
     }
 
     fn peek(&self) -> &Tok {
@@ -109,7 +154,13 @@ impl<'a> Parser<'a> {
                             tok: Tok::Str(path),
                             span,
                         } => {
-                            imports.push((path, tok.span.merge(span)));
+                            // optional namespace: import "path" as alias
+                            let mut alias = None;
+                            if matches!(self.peek(), Tok::Ident(w) if w == "as") {
+                                self.advance();
+                                alias = Some(self.parse_ident("namespace alias after 'as'")?);
+                            }
+                            imports.push((path, alias, tok.span.merge(span)));
                             self.expect_stmt_end()?;
                         }
                         t => {
@@ -146,21 +197,8 @@ impl<'a> Parser<'a> {
 
     fn parse_struct(&mut self) -> PResult<StructDef> {
         let struct_tok = self.expect(Tok::Struct, "'struct'")?;
+        let type_params = self.parse_type_params()?;
         let name = self.parse_ident("struct name")?;
-        
-        // Parse optional type parameters: struct<T, U>
-        let mut type_params = Vec::new();
-        if self.eat(&Tok::Lt) {
-            loop {
-                let tparam = self.parse_ident("type parameter")?;
-                type_params.push(tparam);
-                if !self.eat(&Tok::Comma) {
-                    break;
-                }
-            }
-            self.expect(Tok::Gt, "'>' after type parameters")?;
-        }
-        
         self.skip_newlines();
         self.expect(Tok::LBrace, "'{' to open struct body")?;
         let mut fields = Vec::new();
@@ -201,21 +239,8 @@ impl<'a> Parser<'a> {
 
     fn parse_enum(&mut self) -> PResult<EnumDef> {
         let enum_tok = self.expect(Tok::Enum, "'enum'")?;
+        let type_params = self.parse_type_params()?;
         let name = self.parse_ident("enum name")?;
-        
-        // Parse optional type parameters: enum<T>
-        let mut type_params = Vec::new();
-        if self.eat(&Tok::Lt) {
-            loop {
-                let tparam = self.parse_ident("type parameter")?;
-                type_params.push(tparam);
-                if !self.eat(&Tok::Comma) {
-                    break;
-                }
-            }
-            self.expect(Tok::Gt, "'>' after type parameters")?;
-        }
-        
         self.skip_newlines();
         self.expect(Tok::LBrace, "'{' to open enum body")?;
         let mut variants = Vec::new();
@@ -261,21 +286,8 @@ impl<'a> Parser<'a> {
 
     fn parse_function(&mut self, is_extern: bool) -> PResult<Function> {
         let fn_tok = self.expect(Tok::Fn, "'fn'")?;
+        let type_params = self.parse_type_params()?;
         let name = self.parse_ident("function name")?;
-        
-        // Parse optional type parameters: fn<T, U>
-        let mut type_params = Vec::new();
-        if self.eat(&Tok::Lt) {
-            loop {
-                let tparam = self.parse_ident("type parameter")?;
-                type_params.push(tparam);
-                if !self.eat(&Tok::Comma) {
-                    break;
-                }
-            }
-            self.expect(Tok::Gt, "'>' after type parameters")?;
-        }
-        
         self.expect(Tok::LParen, "'(' after function name")?;
         let mut params = Vec::new();
         if !matches!(self.peek(), Tok::RParen) {
@@ -373,6 +385,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_test(&mut self) -> PResult<TestBlock> {
+        self.current_type_params.clear();
         let test_tok = self.expect(Tok::Test, "'test'")?;
         let name = match self.advance() {
             Token {
@@ -387,10 +400,29 @@ impl<'a> Parser<'a> {
                 .with_help("tests are written: test \"name\" { ... }"));
             }
         };
+        // snapshot form: test "name" expects "output" { ... }
+        let mut expects = None;
+        if matches!(self.peek(), Tok::Ident(w) if w == "expects") {
+            self.advance();
+            match self.advance() {
+                Token {
+                    tok: Tok::Str(s), ..
+                } => expects = Some(s),
+                t => {
+                    return Err(Diagnostic::new(
+                        "E014",
+                        format!("expected expected-output string, found {}", describe(&t.tok)),
+                        t.span,
+                    )
+                    .with_help("snapshot tests are written: test \"name\" expects \"output\" { ... }"));
+                }
+            }
+        }
         let body = self.parse_block()?;
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         Ok(TestBlock {
             name,
+            expects,
             body,
             span: test_tok.span.merge(end),
         })
@@ -615,20 +647,24 @@ impl<'a> Parser<'a> {
         match t.tok {
             Tok::Ident(ref name) if name == "_" => Ok(Pattern::Wildcard),
             Tok::Ident(name) => {
-                // could be: variable binding, or Enum::Variant
-                if self.eat(&Tok::Colon) && self.eat(&Tok::Colon) {
-                    // Enum::Variant or Enum::Variant(pat)
-                    let variant = self.parse_ident("variant name")?;
-                    if self.eat(&Tok::LParen) {
-                        let inner = Box::new(self.parse_pattern()?);
-                        self.expect(Tok::RParen, "')' after variant payload pattern")?;
-                        Ok(Pattern::VariantPayload(name, variant, inner))
-                    } else {
-                        Ok(Pattern::Variant(name, variant))
-                    }
-                } else {
+                // could be: variable binding, Enum::Variant, or (with a
+                // namespaced import) alias::Enum::Variant
+                let mut segments = vec![name];
+                while self.eat(&Tok::Colon) && self.eat(&Tok::Colon) {
+                    segments.push(self.parse_ident("variant name")?);
+                }
+                if segments.len() == 1 {
                     // variable binding
-                    Ok(Pattern::Var(name))
+                    return Ok(Pattern::Var(segments.pop().unwrap()));
+                }
+                let variant = segments.pop().unwrap();
+                let enum_name = segments.join("::");
+                if self.eat(&Tok::LParen) {
+                    let inner = Box::new(self.parse_pattern()?);
+                    self.expect(Tok::RParen, "')' after variant payload pattern")?;
+                    Ok(Pattern::VariantPayload(enum_name, variant, inner))
+                } else {
+                    Ok(Pattern::Variant(enum_name, variant))
                 }
             }
             Tok::Int(v) => Ok(Pattern::Int(v)),
@@ -652,9 +688,18 @@ impl<'a> Parser<'a> {
                 "float" => Ok(Type::Float),
                 "bool" => Ok(Type::Bool),
                 "str" => Ok(Type::Str),
-                // any other identifier is a struct name; existence is
-                // validated by the type checker
-                _ => Ok(Type::Struct(s)),
+                // a declared type parameter is a type variable; any other
+                // identifier is a struct name validated by the type checker
+                _ if self.current_type_params.contains(&s) => Ok(Type::TypeVar(s)),
+                _ => {
+                    // qualified name from a namespaced import: alias::Type
+                    let mut name = s;
+                    while self.eat(&Tok::Colon) && self.eat(&Tok::Colon) {
+                        let seg = self.parse_ident("type name after '::'")?;
+                        name = format!("{}::{}", name, seg);
+                    }
+                    Ok(Type::Struct(name))
+                }
             },
             Token {
                 tok: Tok::LBracket, ..

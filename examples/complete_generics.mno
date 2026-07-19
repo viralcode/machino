@@ -15,7 +15,7 @@ fn first_int(x: int, y: int) -> int {
 }
 
 fn array_first_int(arr: [int]) -> int
-    requires len(arr) > 0
+requires len(arr) > 0
 {
     return arr[0]
 }
@@ -24,7 +24,7 @@ fn array_first_int(arr: [int]) -> int
 test "identity functions" {
     let a = identity_int(42)
     assert a == 42
-    
+
     let b = identity_bool(true)
     assert b == true
 }
@@ -44,13 +44,13 @@ fn main() {
     print("Monomorphization: WORKING")
     print("Unification with occurs check: WORKING")
     print("")
-    
+
     print("Identity of 100:")
     print(identity_int(100))
-    
+
     print("First of 5 and 10:")
     print(first_int(5, 10))
-    
+
     let values = [42, 7, 13]
     print("First element of array:")
     print(array_first_int(values))

@@ -1,0 +1,55 @@
+# JSON parsing and serialization with the std Json enum.
+# Json is: JNull | JBool(bool) | JNum(float) | JStr(str) | JArr([Json]) | JObj(JsonObj)
+
+fn config_summary(text: str) -> str {
+    let parsed = json_parse(text)
+    return match parsed {
+        JsonParsed::JError(e) => "invalid config: " + e
+        JsonParsed::JVal(v) => describe(v)
+    }
+}
+
+fn describe(v: Json) -> str {
+    return match v {
+        Json::JObj(o) => describe_obj(o)
+        _ => "expected a JSON object"
+    }
+}
+
+fn describe_obj(o: JsonObj) -> str {
+    let name = match json_obj_get(o, "name") {
+        Json::JStr(s) => s
+        _ => "<unnamed>"
+    }
+    let retries = match json_obj_get(o, "retries") {
+        Json::JNum(f) => to_int(f)
+        _ => 0
+    }
+    return name + " retries=" + str_of_int(retries)
+}
+
+fn main() {
+    print(config_summary("{\"name\": \"prod\", \"retries\": 3}"))
+    print(config_summary("{oops"))
+
+    # building JSON programmatically
+    let o = json_obj_new()
+    json_obj_set(o, "service", Json::JStr("machino"))
+    json_obj_set(o, "healthy", Json::JBool(true))
+    let checks: [Json] = [Json::JNum(1.0), Json::JNum(2.5)]
+    json_obj_set(o, "latencies", Json::JArr(checks))
+    print(json_serialize(Json::JObj(o)))
+}
+
+test "json round trip" {
+    let src = "[1, {\"k\": null}, \"x\"]"
+    let out = match json_parse(src) {
+        JsonParsed::JVal(v) => json_serialize(v)
+        JsonParsed::JError(e) => e
+    }
+    assert out == "[1,{\"k\":null},\"x\"]"
+}
+
+test "json output snapshot" expects "prod retries=3" {
+    print(config_summary("{\"name\": \"prod\", \"retries\": 3}"))
+}

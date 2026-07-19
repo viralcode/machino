@@ -43,11 +43,11 @@ fn main() {
     let xs = [1, 2, 3, 4, 5, 6]
     let doubled = map_ints(xs, double)
     let evens = filter_ints(xs, is_even)
-    print(fold_ints(doubled, add, 0))   # 42
-    print(fold_ints(evens, add, 0))     # 12
+    print(fold_ints(doubled, add, 0))  # 42
+    print(fold_ints(evens, add, 0))  # 12
 
     let op = double
-    print(op(21))                       # 42
+    print(op(21))  # 42
 }
 
 test "map filter fold" {

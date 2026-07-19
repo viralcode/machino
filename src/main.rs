@@ -1,10 +1,11 @@
 mod ast;
 mod checker;
 mod diag;
-mod infer;
+mod fmt;
 mod interp;
 mod lexer;
 mod mono;
+mod ns;
 mod parser;
 mod pkg;
 mod registry;
@@ -62,6 +63,9 @@ fn real_main() -> ExitCode {
         "test" => cmd_test(rest),
         "run" => cmd_run(rest),
         "build" => cmd_build(rest),
+        "query" => cmd_query(rest),
+        "fmt" => cmd_fmt(rest),
+        "fuzz" => cmd_fuzz(rest),
         "synth" => cmd_synth(rest),
         "pkg" => cmd_pkg(rest),
         "--help" | "-h" | "help" => {
@@ -81,6 +85,8 @@ struct Segment {
     path: String,
     start: u32,
     len: u32,
+    /// Namespace alias if this file was imported with `import ... as alias`.
+    alias: Option<String>,
 }
 
 struct Loaded {
@@ -105,17 +111,29 @@ impl Loaded {
         ("<unknown>", &self.bundle, span)
     }
 
-    fn render_error(&self, d: &Diagnostic) -> String {
+    /// Remaps a bundle-level diagnostic (including any fix span) into
+    /// file-local coordinates.
+    fn map_diag(&self, d: &Diagnostic) -> (Diagnostic, &str, &str) {
         let (path, src, local) = self.locate(d.span);
         let mut mapped = Diagnostic::new(d.code, d.message.clone(), local);
         mapped.help = d.help.clone();
+        if let Some(fix) = &d.fix {
+            let (_, _, fix_local) = self.locate(fix.span);
+            mapped.fix = Some(diag::Fix {
+                span: fix_local,
+                replacement: fix.replacement.clone(),
+            });
+        }
+        (mapped, path, src)
+    }
+
+    fn render_error(&self, d: &Diagnostic) -> String {
+        let (mapped, path, src) = self.map_diag(d);
         mapped.render_human(src, path)
     }
 
     fn error_json(&self, d: &Diagnostic) -> String {
-        let (path, src, local) = self.locate(d.span);
-        let mut mapped = Diagnostic::new(d.code, d.message.clone(), local);
-        mapped.help = d.help.clone();
+        let (mapped, path, src) = self.map_diag(d);
         mapped.to_json(src, path)
     }
 
@@ -126,36 +144,53 @@ impl Loaded {
     }
 }
 
-/// Parses one file just enough to discover its imports.
-fn discover_imports(source: &str, path: &str) -> Result<Vec<String>, String> {
+/// Parses one file just enough to discover its imports (path, alias).
+fn discover_imports(source: &str, path: &str) -> Result<Vec<(String, Option<String>)>, String> {
     let tokens = lexer::lex(source)
         .map_err(|d| d.render_human(source, path))?;
     let program = parser::Parser::new(&tokens, source)
         .parse_program()
         .map_err(|d| d.render_human(source, path))?;
-    Ok(program.imports.into_iter().map(|(p, _)| p).collect())
+    Ok(program
+        .imports
+        .into_iter()
+        .map(|(p, alias, _)| (p, alias))
+        .collect())
 }
 
 /// Reads the entry file plus its transitive imports and appends the std
 /// prelude, producing a single bundle with a segment map for diagnostics.
 fn bundle_sources(entry: &str) -> Result<(String, Vec<Segment>), String> {
-    let mut ordered: Vec<(String, String)> = Vec::new(); // (display path, source)
-    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    let mut queue: Vec<(PathBuf, String)> = Vec::new();
+    // (display path, source, alias)
+    let mut ordered: Vec<(String, String, Option<String>)> = Vec::new();
+    // canonical path -> alias it was first imported with
+    let mut visited: std::collections::HashMap<PathBuf, Option<String>> =
+        std::collections::HashMap::new();
+    let mut queue: Vec<(PathBuf, String, Option<String>)> = Vec::new();
 
     let entry_path = PathBuf::from(entry);
-    queue.push((entry_path.clone(), entry.to_string()));
+    queue.push((entry_path.clone(), entry.to_string(), None));
 
-    while let Some((path, display)) = queue.pop() {
+    while let Some((path, display, alias)) = queue.pop() {
         let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-        if !visited.insert(canon) {
+        if let Some(prev) = visited.get(&canon) {
+            if *prev != alias {
+                return Err(format!(
+                    "error: '{}' is imported under two different namespaces ({} vs {}); \
+                     use one alias consistently",
+                    display,
+                    prev.as_deref().unwrap_or("<none>"),
+                    alias.as_deref().unwrap_or("<none>")
+                ));
+            }
             continue;
         }
+        visited.insert(canon, alias.clone());
         let source = std::fs::read_to_string(&path)
             .map_err(|e| format!("error: cannot read '{}': {}", display, e))?;
         let imports = discover_imports(&source, &display)?;
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        for imp in imports {
+        for (imp, imp_alias) in imports {
             let ipath = if imp.starts_with("pkg:") {
                 pkg::resolve_pkg_import(&imp, &entry_path)?
             } else {
@@ -170,18 +205,19 @@ fn bundle_sources(entry: &str) -> Result<(String, Vec<Segment>), String> {
                 }
                 p
             };
-            queue.push((ipath.clone(), ipath.display().to_string()));
+            queue.push((ipath.clone(), ipath.display().to_string(), imp_alias));
         }
-        ordered.push((display, source));
+        ordered.push((display, source, alias));
     }
 
     let mut bundle = String::new();
     let mut segments = Vec::new();
-    for (path, source) in &ordered {
+    for (path, source, alias) in &ordered {
         segments.push(Segment {
             path: path.clone(),
             start: bundle.len() as u32,
             len: source.len() as u32 + 1,
+            alias: alias.clone(),
         });
         bundle.push_str(source);
         bundle.push('\n');
@@ -190,25 +226,57 @@ fn bundle_sources(entry: &str) -> Result<(String, Vec<Segment>), String> {
         path: "<machino std>".to_string(),
         start: bundle.len() as u32,
         len: STD_PRELUDE.len() as u32,
+        alias: None,
     });
     bundle.push_str(STD_PRELUDE);
     Ok((bundle, segments))
 }
 
 /// Lex + parse + type-check a bundle. The std segment starts at `std_start`.
-fn compile_bundle(bundle: &str, std_start: u32) -> Result<ast::Program, Vec<Diagnostic>> {
+/// When `mono` is false the checked program keeps its generic templates
+/// (used by `query`, which reports signatures as written).
+fn compile_bundle_opts(
+    bundle: &str,
+    std_start: u32,
+    mono: bool,
+) -> Result<ast::Program, Vec<Diagnostic>> {
+    compile_bundle_full(bundle, std_start, mono, &[])
+}
+
+fn compile_bundle_full(
+    bundle: &str,
+    std_start: u32,
+    mono: bool,
+    aliases: &[ns::AliasedSegment],
+) -> Result<ast::Program, Vec<Diagnostic>> {
     let tokens = lexer::lex(bundle).map_err(|d| vec![d])?;
     let mut program = parser::Parser::new(&tokens, bundle)
         .parse_program()
         .map_err(|d| vec![d])?;
+    ns::apply(&mut program, aliases);
     for f in &mut program.functions {
         f.is_std = f.span.start >= std_start;
     }
     for s in &mut program.structs {
         s.is_std = s.span.start >= std_start;
     }
-    checker::Checker::new(&program).check()?;
+    let instantiations = checker::Checker::new(&program, bundle).check()?;
+    // Generic functions were checked polymorphically; instantiate the concrete
+    // versions every call site needs and rewrite calls to use them.
+    if mono
+        && (!instantiations.is_empty()
+            || program.functions.iter().any(|f| !f.type_params.is_empty()))
+    {
+        program = mono::monomorphize_with(&program, &instantiations)
+            .map_err(|d| vec![d])?;
+        // re-check the fully concrete program (cheap; catches substitution bugs)
+        checker::Checker::new(&program, bundle).check()?;
+    }
     Ok(program)
+}
+
+fn compile_bundle(bundle: &str, std_start: u32) -> Result<ast::Program, Vec<Diagnostic>> {
+    compile_bundle_opts(bundle, std_start, true)
 }
 
 /// Used by synth, where there are no imports: source + prelude.
@@ -222,6 +290,10 @@ fn compile_front(source: &str) -> Result<ast::Program, Vec<Diagnostic>> {
 }
 
 fn load(path: &str, json: bool) -> Option<Loaded> {
+    load_opts(path, json, true)
+}
+
+fn load_opts(path: &str, json: bool, mono: bool) -> Option<Loaded> {
     let (bundle, segments) = match bundle_sources(path) {
         Ok(v) => v,
         Err(msg) => {
@@ -230,7 +302,17 @@ fn load(path: &str, json: bool) -> Option<Loaded> {
         }
     };
     let std_start = segments.last().map(|s| s.start).unwrap_or(0);
-    match compile_bundle(&bundle, std_start) {
+    let aliases: Vec<ns::AliasedSegment> = segments
+        .iter()
+        .filter_map(|s| {
+            s.alias.as_ref().map(|a| ns::AliasedSegment {
+                start: s.start,
+                end: s.start + s.len,
+                alias: a.clone(),
+            })
+        })
+        .collect();
+    match compile_bundle_full(&bundle, std_start, mono, &aliases) {
         Ok(program) => Some(Loaded {
             bundle,
             segments,
@@ -286,6 +368,7 @@ fn parse_file_arg<'a>(rest: &'a [String], cmd: &str) -> Option<&'a str> {
 
 fn cmd_check(rest: &[String]) -> ExitCode {
     let json = rest.iter().any(|a| a == "--json");
+    let verify = rest.iter().any(|a| a == "--verify");
     let Some(path) = parse_file_arg(rest, "check") else {
         return ExitCode::from(2);
     };
@@ -299,10 +382,72 @@ fn cmd_check(rest: &[String]) -> ExitCode {
                 .count();
             let n_structs = loaded.program.structs.iter().filter(|s| !s.is_std).count();
             let n_tests = loaded.program.tests.len();
+            let mut verify_json = String::new();
+            let mut verify_failed = false;
+            if verify {
+                if !smt::smt_available() {
+                    eprintln!(
+                        "error: this machino binary was built without the SMT verifier; rebuild with: cargo build --features smt"
+                    );
+                    return ExitCode::from(2);
+                }
+                let reports = smt::verify_program(&loaded.program);
+                let mut items: Vec<String> = Vec::new();
+                for r in &reports {
+                    if r.vacuous_requires {
+                        verify_failed = true;
+                        if json {
+                            items.push(format!(
+                                "{{\"function\":\"{}\",\"clause\":\"requires\",\"result\":\"vacuous\",\"detail\":\"requires clauses are contradictory: no input can satisfy them\"}}",
+                                diag::json_escape(&r.function)
+                            ));
+                        } else {
+                            println!(
+                                "VERIFY {}: requires clauses are contradictory (no input can call this function)",
+                                r.function
+                            );
+                        }
+                    }
+                    for (clause, result) in &r.clauses {
+                        let (status, detail) = match result {
+                            smt::VerifyResult::Verified => ("proved", String::new()),
+                            smt::VerifyResult::Counterexample(m) => {
+                                verify_failed = true;
+                                ("counterexample", m.clone())
+                            }
+                            smt::VerifyResult::Unknown(m) => ("unknown", m.clone()),
+                        };
+                        if json {
+                            items.push(format!(
+                                "{{\"function\":\"{}\",\"clause\":\"{}\",\"result\":\"{}\",\"detail\":\"{}\"}}",
+                                diag::json_escape(&r.function),
+                                diag::json_escape(clause),
+                                status,
+                                diag::json_escape(&detail)
+                            ));
+                        } else {
+                            match result {
+                                smt::VerifyResult::Verified => {
+                                    println!("VERIFY {}: ensures {}  [proved]", r.function, clause)
+                                }
+                                smt::VerifyResult::Counterexample(m) => println!(
+                                    "VERIFY {}: ensures {}  [COUNTEREXAMPLE {}]",
+                                    r.function, clause, m
+                                ),
+                                smt::VerifyResult::Unknown(m) => println!(
+                                    "VERIFY {}: ensures {}  [unknown: {}] (runtime enforcement still applies)",
+                                    r.function, clause, m
+                                ),
+                            }
+                        }
+                    }
+                }
+                verify_json = format!(",\"verify\":[{}]", items.join(","));
+            }
             if json {
                 println!(
-                    "{{\"ok\":true,\"errors\":0,\"functions\":{},\"structs\":{},\"tests\":{}}}",
-                    n_fns, n_structs, n_tests
+                    "{{\"ok\":{},\"errors\":0,\"functions\":{},\"structs\":{},\"tests\":{}{}}}",
+                    !verify_failed, n_fns, n_structs, n_tests, verify_json
                 );
             } else {
                 println!(
@@ -316,7 +461,11 @@ fn cmd_check(rest: &[String]) -> ExitCode {
                     if n_tests == 1 { "" } else { "s" }
                 );
             }
-            ExitCode::SUCCESS
+            if verify_failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         None => ExitCode::FAILURE,
     }
@@ -339,11 +488,35 @@ fn cmd_test(rest: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    interp::set_spawn_program(loaded.program.clone());
     let mut passed = 0usize;
     let mut results: Vec<String> = Vec::new();
     for t in &loaded.program.tests {
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
         let mut interp = interp::Interp::new(&loaded.program);
-        match interp.run_stmts_as_test(&t.body) {
+        if t.expects.is_some() {
+            let sink = captured.clone();
+            interp.output = Box::new(move |line| sink.borrow_mut().push(line.to_string()));
+        }
+        let run = interp.run_stmts_as_test(&t.body);
+        drop(interp);
+        // snapshot comparison happens only when the body itself succeeded
+        let outcome = run.and_then(|()| {
+            if let Some(want) = &t.expects {
+                let got = captured.borrow().join("\n");
+                if got != want.as_str() {
+                    return Err(interp::RuntimeError::new(
+                        format!(
+                            "snapshot mismatch: expected {:?}, got {:?}",
+                            want, got
+                        ),
+                        t.span,
+                    ));
+                }
+            }
+            Ok(())
+        });
+        match outcome {
             Ok(()) => {
                 passed += 1;
                 if json {
@@ -391,16 +564,27 @@ fn cmd_test(rest: &[String]) -> ExitCode {
 }
 
 fn cmd_run(rest: &[String]) -> ExitCode {
+    let trace = rest.iter().any(|a| a == "--trace");
     let Some(path) = parse_file_arg(rest, "run") else {
         return ExitCode::from(2);
     };
     let file_pos = rest.iter().position(|a| a == path).unwrap_or(0);
-    let program_args: Vec<String> = rest[file_pos + 1..].to_vec();
+    let program_args: Vec<String> = rest[file_pos + 1..]
+        .iter()
+        .filter(|a| *a != "--trace")
+        .cloned()
+        .collect();
     let Some(loaded) = load(path, false) else {
         return ExitCode::FAILURE;
     };
+    // spawned threads execute against their own copy of the program
+    interp::set_spawn_program(loaded.program.clone());
     let mut interp = interp::Interp::new(&loaded.program);
     interp.args = program_args;
+    if trace {
+        // one JSON object per line on stderr, so stdout stays clean
+        interp.trace = Some(Box::new(|line| eprintln!("{}", line)));
+    }
     match interp.run_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -415,6 +599,7 @@ fn cmd_run(rest: &[String]) -> ExitCode {
 }
 
 fn cmd_build(rest: &[String]) -> ExitCode {
+    let use_gc = rest.iter().any(|a| a == "--gc");
     let Some(path) = parse_file_arg(rest, "build") else {
         return ExitCode::from(2);
     };
@@ -442,11 +627,35 @@ fn cmd_build(rest: &[String]) -> ExitCode {
         eprintln!("error: 'machino build' requires a 'fn main()' entry point");
         return ExitCode::FAILURE;
     }
-    let bytes = wasm::compile(&loaded.program, &loaded.bundle);
+    if let Some(span) = find_concurrency_use(&loaded.program) {
+        let d = Diagnostic::new(
+            "E072",
+            "spawn/join are interpreter-only: WebAssembly has no threads in this backend",
+            span,
+        )
+        .with_help("run concurrent programs with 'machino run'; compiled builds must be sequential");
+        eprintln!("{}", loaded.render_error(&d));
+        return ExitCode::FAILURE;
+    }
+    let bytes = if use_gc {
+        match wasmgc::compile(&loaded.program) {
+            Ok(b) => b,
+            Err(d) => {
+                eprintln!("{}", loaded.render_error(&d));
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        wasm::compile(&loaded.program, &loaded.bundle)
+    };
     match std::fs::write(&out_path, &bytes) {
         Ok(()) => {
             println!("wrote {} ({} bytes)", out_path, bytes.len());
-            println!("run it anywhere:  node runners/run.mjs {}", out_path);
+            if use_gc {
+                println!("run it on a WASM-GC host:  node runners/run-gc.mjs {}", out_path);
+            } else {
+                println!("run it anywhere:  node runners/run.mjs {}", out_path);
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -455,6 +664,58 @@ fn cmd_build(rest: &[String]) -> ExitCode {
         }
     }
 }
+
+/// Returns the span of the first spawn/join call, if any. The WASM backends
+/// have no thread support, so `machino build` rejects these programs.
+fn find_concurrency_use(program: &ast::Program) -> Option<Span> {
+    const CONCURRENCY: &[&str] = &["spawn", "join_int", "join_float", "join_bool", "join_str"];
+    fn in_expr(e: &ast::Expr) -> Option<Span> {
+        use ast::ExprKind::*;
+        match &e.kind {
+            Call(name, args) => {
+                if CONCURRENCY.contains(&name.as_str()) {
+                    return Some(e.span);
+                }
+                args.iter().find_map(in_expr)
+            }
+            Array(elems) => elems.iter().find_map(in_expr),
+            Index(a, b) | Bin(_, a, b) => in_expr(a).or_else(|| in_expr(b)),
+            Field(a, _) | Un(_, a) => in_expr(a),
+            Lambda(l) => in_stmts(&l.body),
+            Match(m) => in_expr(&m.scrutinee)
+                .or_else(|| m.arms.iter().find_map(|arm| in_expr(&arm.body))),
+            _ => None,
+        }
+    }
+    fn in_stmts(stmts: &[ast::Stmt]) -> Option<Span> {
+        use ast::StmtKind::*;
+        stmts.iter().find_map(|s| match &s.kind {
+            Let { value, .. } | Assign { value, .. } => in_expr(value),
+            IndexAssign { base, index, value } => in_expr(base)
+                .or_else(|| in_expr(index))
+                .or_else(|| in_expr(value)),
+            FieldAssign { base, value, .. } => in_expr(base).or_else(|| in_expr(value)),
+            If {
+                cond,
+                then_body,
+                else_body,
+            } => in_expr(cond)
+                .or_else(|| in_stmts(then_body))
+                .or_else(|| in_stmts(else_body)),
+            While { cond, body } => in_expr(cond).or_else(|| in_stmts(body)),
+            For {
+                start, end, body, ..
+            } => in_expr(start)
+                .or_else(|| in_expr(end))
+                .or_else(|| in_stmts(body)),
+            Return(Some(e)) | Assert(e) | Expr(e) => in_expr(e),
+            _ => None,
+        })
+    }
+    program.functions.iter().find_map(|f| in_stmts(&f.body))
+}
+
+const PKG_USAGE: &str = "usage:\n  machino pkg init <name>\n  machino pkg add <name> <source> [ref]\n  machino pkg sync\n  machino pkg publish [--registry <url>] [--token <token>]";
 
 fn cmd_pkg(rest: &[String]) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -474,15 +735,36 @@ fn cmd_pkg(rest: &[String]) -> ExitCode {
                     println!("no dependencies to install");
                 }
             }),
-            _ => Err(
-                "usage:\n  machino pkg init <name>\n  machino pkg add <name> <source> [ref]\n  machino pkg sync"
-                    .to_string(),
-            ),
+            ("publish", publish_args) => {
+                let get_flag = |name: &str| -> Option<String> {
+                    publish_args
+                        .iter()
+                        .position(|a| a == name)
+                        .and_then(|i| publish_args.get(i + 1))
+                        .cloned()
+                };
+                let registry_url = get_flag("--registry")
+                    .or_else(|| std::env::var("MACHINO_REGISTRY").ok())
+                    .ok_or_else(|| {
+                        "error: no registry configured; pass --registry <url> or set MACHINO_REGISTRY"
+                            .to_string()
+                    });
+                let token = get_flag("--token")
+                    .or_else(|| std::env::var("MACHINO_TOKEN").ok())
+                    .unwrap_or_default();
+                registry_url.and_then(|url| {
+                    if !cwd.join("machino.pkg").exists() {
+                        return Err(
+                            "error: no machino.pkg here; run 'machino pkg init <name>' first"
+                                .to_string(),
+                        );
+                    }
+                    registry::upload_package(&url, &cwd, &token).map(|msg| println!("{}", msg))
+                })
+            }
+            _ => Err(PKG_USAGE.to_string()),
         },
-        None => Err(
-            "usage:\n  machino pkg init <name>\n  machino pkg add <name> <source> [ref]\n  machino pkg sync"
-                .to_string(),
-        ),
+        None => Err(PKG_USAGE.to_string()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -490,6 +772,428 @@ fn cmd_pkg(rest: &[String]) -> ExitCode {
             eprintln!("{}", msg);
             ExitCode::from(2)
         }
+    }
+}
+
+/// `machino query <file> [name] [--std]` — JSON introspection over the
+/// program's signatures, for agents that need type information without
+/// parsing machino source themselves.
+fn cmd_query(rest: &[String]) -> ExitCode {
+    let include_std = rest.iter().any(|a| a == "--std");
+    let Some(path) = parse_file_arg(rest, "query") else {
+        return ExitCode::from(2);
+    };
+    let filter: Option<&str> = rest
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .map(|s| s.as_str())
+        .find(|s| *s != path);
+    // query reports signatures as written: keep generic templates, don't
+    // replace them with monomorphized copies
+    let Some(loaded) = load_opts(path, true, false) else {
+        return ExitCode::FAILURE;
+    };
+    let p = &loaded.program;
+
+    let type_json = |t: &ast::Type| format!("\"{}\"", diag::json_escape(&t.to_string()));
+    let mut fns: Vec<String> = Vec::new();
+    for f in &p.functions {
+        if (f.is_std && !include_std) || filter.map_or(false, |n| n != f.name) {
+            continue;
+        }
+        let params: Vec<String> = f
+            .params
+            .iter()
+            .map(|pr| {
+                format!(
+                    "{{\"name\":\"{}\",\"type\":{}}}",
+                    diag::json_escape(&pr.name),
+                    type_json(&pr.ty)
+                )
+            })
+            .collect();
+        let tparams: Vec<String> = f
+            .type_params
+            .iter()
+            .map(|tp| {
+                format!(
+                    "{{\"name\":\"{}\",\"bounds\":[{}]}}",
+                    diag::json_escape(&tp.name),
+                    tp.bounds
+                        .iter()
+                        .map(|b| format!("\"{}\"", b))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            })
+            .collect();
+        let requires: Vec<String> = f
+            .requires
+            .iter()
+            .map(|c| format!("\"{}\"", diag::json_escape(&c.text)))
+            .collect();
+        let ensures: Vec<String> = f
+            .ensures
+            .iter()
+            .map(|c| format!("\"{}\"", diag::json_escape(&c.text)))
+            .collect();
+        fns.push(format!(
+            "{{\"name\":\"{}\",\"typeParams\":[{}],\"params\":[{}],\"returns\":{},\"requires\":[{}],\"ensures\":[{}],\"extern\":{},\"std\":{}}}",
+            diag::json_escape(&f.name),
+            tparams.join(","),
+            params.join(","),
+            type_json(&f.ret),
+            requires.join(","),
+            ensures.join(","),
+            f.is_extern,
+            f.is_std
+        ));
+    }
+    let mut structs: Vec<String> = Vec::new();
+    for s in &p.structs {
+        if (s.is_std && !include_std) || filter.map_or(false, |n| n != s.name) {
+            continue;
+        }
+        let fields: Vec<String> = s
+            .fields
+            .iter()
+            .map(|fd| {
+                format!(
+                    "{{\"name\":\"{}\",\"type\":{}}}",
+                    diag::json_escape(&fd.name),
+                    type_json(&fd.ty)
+                )
+            })
+            .collect();
+        structs.push(format!(
+            "{{\"name\":\"{}\",\"fields\":[{}]}}",
+            diag::json_escape(&s.name),
+            fields.join(",")
+        ));
+    }
+    let mut enums: Vec<String> = Vec::new();
+    for e in &p.enums {
+        if filter.map_or(false, |n| n != e.name) {
+            continue;
+        }
+        let variants: Vec<String> = e
+            .variants
+            .iter()
+            .map(|v| match &v.payload {
+                Some(t) => format!(
+                    "{{\"name\":\"{}\",\"payload\":{}}}",
+                    diag::json_escape(&v.name),
+                    type_json(t)
+                ),
+                None => format!("{{\"name\":\"{}\"}}", diag::json_escape(&v.name)),
+            })
+            .collect();
+        enums.push(format!(
+            "{{\"name\":\"{}\",\"variants\":[{}]}}",
+            diag::json_escape(&e.name),
+            variants.join(",")
+        ));
+    }
+    let tests: Vec<String> = p
+        .tests
+        .iter()
+        .filter(|t| filter.map_or(true, |n| n == t.name))
+        .map(|t| format!("\"{}\"", diag::json_escape(&t.name)))
+        .collect();
+    println!(
+        "{{\"functions\":[{}],\"structs\":[{}],\"enums\":[{}],\"tests\":[{}]}}",
+        fns.join(","),
+        structs.join(","),
+        enums.join(","),
+        tests.join(",")
+    );
+    ExitCode::SUCCESS
+}
+
+/// `machino fmt <files...> [--check|--stdout]` — canonical formatter.
+fn cmd_fmt(rest: &[String]) -> ExitCode {
+    let check_only = rest.iter().any(|a| a == "--check");
+    let to_stdout = rest.iter().any(|a| a == "--stdout");
+    let files: Vec<&String> = rest.iter().filter(|a| !a.starts_with("--")).collect();
+    if files.is_empty() {
+        eprintln!("usage: machino fmt <file.mno>... [--check|--stdout]");
+        return ExitCode::from(2);
+    }
+    let mut changed = 0usize;
+    for f in &files {
+        let source = match std::fs::read_to_string(f) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: cannot read '{}': {}", f, e);
+                return ExitCode::FAILURE;
+            }
+        };
+        // formatting requires valid syntax: report real parse errors instead
+        // of a confusing safety-check failure
+        if let Err(d) = lexer::lex(&source)
+            .and_then(|toks| parser::Parser::new(&toks, &source).parse_program())
+        {
+            eprint!("{}", d.render_human(&source, f));
+            return ExitCode::FAILURE;
+        }
+        let formatted = fmt::format_source(&source);
+        if !fmt::tokens_preserved(&source, &formatted) {
+            eprintln!(
+                "error: refusing to format '{}': formatting would change the token stream (please report this)",
+                f
+            );
+            return ExitCode::FAILURE;
+        }
+        if to_stdout {
+            print!("{}", formatted);
+            continue;
+        }
+        if formatted != source {
+            changed += 1;
+            if check_only {
+                println!("would reformat: {}", f);
+            } else {
+                if let Err(e) = std::fs::write(f, &formatted) {
+                    eprintln!("error: cannot write '{}': {}", f, e);
+                    return ExitCode::FAILURE;
+                }
+                println!("formatted: {}", f);
+            }
+        }
+    }
+    if check_only && changed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Generates a random value of the given type for fuzzing. Returns None for
+/// types fuzzing can't construct (functions, enums).
+fn fuzz_value(
+    ty: &ast::Type,
+    structs: &std::collections::HashMap<String, Vec<ast::Param>>,
+    rng: &mut synth::Rng,
+) -> Option<interp::Value> {
+    use interp::Value;
+    Some(match ty {
+        ast::Type::Int => {
+            // biased toward boundary values, where contracts break
+            let picks: [i64; 10] = [0, 1, -1, 2, -2, 7, 100, -100, i64::MAX, i64::MIN];
+            match rng.range(3) {
+                0 => Value::Int(picks[rng.range(picks.len() as u64) as usize]),
+                1 => Value::Int(rng.range(2001) as i64 - 1000),
+                _ => Value::Int(rng.next() as i64),
+            }
+        }
+        ast::Type::Float => {
+            let picks: [f64; 6] = [0.0, 1.0, -1.0, 0.5, 1e9, -1e9];
+            match rng.range(2) {
+                0 => Value::Float(picks[rng.range(picks.len() as u64) as usize]),
+                _ => Value::Float((rng.range(2_000_001) as f64 - 1_000_000.0) / 1000.0),
+            }
+        }
+        ast::Type::Bool => Value::Bool(rng.range(2) == 1),
+        ast::Type::Str => {
+            let n = rng.range(9);
+            let mut s = String::new();
+            for _ in 0..n {
+                s.push((b'a' + rng.range(26) as u8) as char);
+            }
+            Value::Str(std::rc::Rc::new(s.into_bytes()))
+        }
+        ast::Type::Array(elem) => {
+            let n = rng.range(6);
+            let mut items = Vec::new();
+            for _ in 0..n {
+                items.push(fuzz_value(elem, structs, rng)?);
+            }
+            Value::Array(std::rc::Rc::new(std::cell::RefCell::new(items)))
+        }
+        ast::Type::Struct(name) => {
+            let fields = structs.get(name)?;
+            let mut map = std::collections::HashMap::new();
+            for f in fields {
+                map.insert(f.name.clone(), fuzz_value(&f.ty, structs, rng)?);
+            }
+            Value::Struct(std::rc::Rc::new(std::cell::RefCell::new(map)))
+        }
+        _ => return None,
+    })
+}
+
+fn fuzz_display(v: &interp::Value) -> String {
+    use interp::Value;
+    match v {
+        Value::Str(s) => format!("{:?}", String::from_utf8_lossy(s)),
+        Value::Array(items) => {
+            let inner: Vec<String> = items.borrow().iter().map(fuzz_display).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        Value::Struct(fields) => {
+            let mut inner: Vec<String> = fields
+                .borrow()
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, fuzz_display(v)))
+                .collect();
+            inner.sort();
+            format!("{{{}}}", inner.join(", "))
+        }
+        other => other.display(),
+    }
+}
+
+/// `machino fuzz <file.mno> [fn] [--runs N] [--seed S]` — contract-driven
+/// property testing: random inputs are sampled (rejecting ones that violate
+/// `requires`), then the function runs with full contract enforcement. Any
+/// ensures violation, assert failure, or trap is a bug, reported with the
+/// concrete counterexample arguments.
+fn cmd_fuzz(rest: &[String]) -> ExitCode {
+    let json = rest.iter().any(|a| a == "--json");
+    let get_flag = |name: &str| -> Option<String> {
+        rest.iter()
+            .position(|a| a == name)
+            .and_then(|i| rest.get(i + 1))
+            .cloned()
+    };
+    let runs: usize = get_flag("--runs").and_then(|v| v.parse().ok()).unwrap_or(200);
+    let seed: u64 = get_flag("--seed").and_then(|v| v.parse().ok()).unwrap_or(42);
+    let mut positional = rest
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .filter(|a| Some(a.as_str()) != get_flag("--runs").as_deref())
+        .filter(|a| Some(a.as_str()) != get_flag("--seed").as_deref());
+    let Some(path) = positional.next() else {
+        eprintln!("usage: machino fuzz <file.mno> [fn] [--runs N] [--seed S]");
+        return ExitCode::from(2);
+    };
+    let target_fn = positional.next().cloned();
+    let Some(loaded) = load(path, json) else {
+        return ExitCode::FAILURE;
+    };
+    let structs: std::collections::HashMap<String, Vec<ast::Param>> = loaded
+        .program
+        .structs
+        .iter()
+        .map(|s| (s.name.clone(), s.fields.clone()))
+        .collect();
+
+    let targets: Vec<&ast::Function> = loaded
+        .program
+        .functions
+        .iter()
+        .filter(|f| !f.is_std && !f.is_extern && f.name != "main")
+        .filter(|f| match &target_fn {
+            Some(n) => &f.name == n,
+            // by default fuzz every function that declares a contract
+            None => !f.requires.is_empty() || !f.ensures.is_empty(),
+        })
+        .collect();
+    if targets.is_empty() {
+        eprintln!(
+            "nothing to fuzz: {} (no {} found)",
+            path,
+            target_fn
+                .as_deref()
+                .map(|n| format!("function named '{}'", n))
+                .unwrap_or_else(|| "functions with contracts".to_string())
+        );
+        return ExitCode::from(2);
+    }
+
+    let mut rng = synth::Rng::new(seed);
+    let mut failed = 0usize;
+    let mut results: Vec<String> = Vec::new();
+    for f in targets {
+        // functions with un-fuzzable parameter types are skipped explicitly
+        if f.params
+            .iter()
+            .any(|p| fuzz_value(&p.ty, &structs, &mut synth::Rng::new(1)).is_none())
+        {
+            if json {
+                results.push(format!(
+                    "{{\"function\":\"{}\",\"status\":\"skipped\",\"reason\":\"parameter types cannot be fuzzed\"}}",
+                    diag::json_escape(&f.name)
+                ));
+            } else {
+                println!("SKIP  {} (parameter types cannot be fuzzed)", f.name);
+            }
+            continue;
+        }
+        let mut tested = 0usize;
+        let mut rejected = 0usize;
+        let mut failure: Option<(String, String)> = None; // (args, error)
+        let mut attempts = 0usize;
+        while tested < runs && attempts < runs * 50 {
+            attempts += 1;
+            let args: Vec<interp::Value> = f
+                .params
+                .iter()
+                .map(|p| fuzz_value(&p.ty, &structs, &mut rng).unwrap())
+                .collect();
+            let shown: Vec<String> = args.iter().map(fuzz_display).collect();
+            let mut interp = interp::Interp::new(&loaded.program);
+            // suppress program output during fuzzing
+            interp.output = Box::new(|_| {});
+            match interp.call_by_name(&f.name, args) {
+                Ok(_) => tested += 1,
+                Err(e) => {
+                    let is_precondition_reject = e.message.contains("requires")
+                        && e.message.contains(&format!("calling '{}'", f.name));
+                    if is_precondition_reject {
+                        rejected += 1;
+                    } else {
+                        failure = Some((shown.join(", "), e.message));
+                        break;
+                    }
+                }
+            }
+        }
+        match failure {
+            Some((args, error)) => {
+                failed += 1;
+                if json {
+                    results.push(format!(
+                        "{{\"function\":\"{}\",\"status\":\"failed\",\"args\":\"{}\",\"error\":\"{}\",\"passed\":{}}}",
+                        diag::json_escape(&f.name),
+                        diag::json_escape(&args),
+                        diag::json_escape(&error),
+                        tested
+                    ));
+                } else {
+                    println!("FAIL  {}({})", f.name, args);
+                    println!("      {}", error);
+                }
+            }
+            None => {
+                if json {
+                    results.push(format!(
+                        "{{\"function\":\"{}\",\"status\":\"ok\",\"passed\":{},\"rejected\":{}}}",
+                        diag::json_escape(&f.name),
+                        tested,
+                        rejected
+                    ));
+                } else {
+                    println!(
+                        "PASS  {} ({} inputs, {} rejected by requires)",
+                        f.name, tested, rejected
+                    );
+                }
+            }
+        }
+    }
+    if json {
+        println!(
+            "{{\"ok\":{},\"failed\":{},\"results\":[{}]}}",
+            failed == 0,
+            failed,
+            results.join(",")
+        );
+    }
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

@@ -1,0 +1,50 @@
+# spawn/join concurrency (interpreter only: run with `machino run`).
+# spawn(f, args...) copies the arguments onto a fresh OS thread and returns
+# a task handle; join_int/join_float/join_bool/join_str retrieve the result.
+# Tasks share nothing, so results are deterministic.
+
+fn count_primes(lo: int, hi: int) -> int
+requires lo >= 2 && hi >= lo
+{
+    let count = 0
+    for n in lo..hi {
+        let prime = true
+        let d = 2
+        while d * d <= n {
+            if n % d == 0 {
+                prime = false
+                break
+            }
+            d = d + 1
+        }
+        if prime {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+fn main() {
+    # split the range across 4 workers
+    let h1 = spawn(count_primes, 2, 25000)
+    let h2 = spawn(count_primes, 25000, 50000)
+    let h3 = spawn(count_primes, 50000, 75000)
+    let h4 = spawn(count_primes, 75000, 100000)
+    let total = join_int(h1) + join_int(h2) + join_int(h3) + join_int(h4)
+    print(total)
+
+    # closures capture by value; the copy crosses the thread boundary
+    let greeting = "hello from a "
+    let f = fn(who: str) -> str {
+        return greeting + who
+    }
+    let h = spawn(f, "thread")
+    print(join_str(h))
+}
+
+test "parallel prime count matches sequential" {
+    let h1 = spawn(count_primes, 2, 5000)
+    let h2 = spawn(count_primes, 5000, 10000)
+    let par = join_int(h1) + join_int(h2)
+    assert par == count_primes(2, 10000)
+}

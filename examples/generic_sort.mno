@@ -31,13 +31,13 @@ fn main() {
     print("=== Sorting Example ===")
     print("(Generics syntax supported, full implementation in progress)")
     print("")
-    
+
     let nums = [64, 34, 25, 12, 22, 11, 90]
     print("Before sorting:")
     for i in 0..len(nums) {
         print(nums[i])
     }
-    
+
     let sorted = bubble_sort(nums)
     print("After sorting:")
     for i in 0..len(sorted) {
@@ -53,4 +53,3 @@ test "sort works" {
     assert sorted[2] == 2
     assert sorted[len(sorted) - 1] == 9
 }
-

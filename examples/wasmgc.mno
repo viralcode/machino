@@ -38,18 +38,18 @@ fn stress_test(iterations: int) -> int {
 fn main() {
     print("=== WASM-GC Example ===")
     print("Creating linked list...")
-    
+
     let nodes = create_list(5)
     print("Created " + str_of_int(len(nodes)) + " nodes")
-    
+
     print("List values:")
     for i in 0..len(nodes) {
         print("  Node " + str_of_int(i) + ": value=" + str_of_int(nodes[i].value))
     }
-    
+
     let sum = sum_list(nodes, 0)
     print("Sum of values: " + str_of_int(sum))
-    
+
     print("")
     print("Running stress test (100 iterations)...")
     let total = stress_test(100)
