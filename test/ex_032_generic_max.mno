@@ -1,0 +1,16 @@
+# Generic max with Ord.
+fn<T: Ord> max2(a: T, b: T) -> T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn main() {
+    print(max2(3, 9))
+}
+
+test "max2" {
+    assert max2(3, 9) == 9
+    assert max2(9, 3) == 9
+}

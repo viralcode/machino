@@ -1,0 +1,39 @@
+# Tiny RPN evaluator.
+fn rpn(tokens: [str]) -> int {
+    let st: [int] = []
+    for i in 0..len(tokens) {
+        let t = tokens[i]
+        if t == "+" || t == "-" || t == "*" {
+            let b = st[len(st) - 1]
+            let a = st[len(st) - 2]
+            let out: [int] = []
+            for j in 0..(len(st) - 2) {
+                out = push(out, st[j])
+            }
+            let v = 0
+            if t == "+" {
+                v = a + b
+            }
+            if t == "-" {
+                v = a - b
+            }
+            if t == "*" {
+                v = a * b
+            }
+            out = push(out, v)
+            st = out
+        } else {
+            st = push(st, parse_int(t))
+        }
+    }
+    return st[0]
+}
+
+fn main() {
+    print(rpn(["2", "3", "+", "4", "*"]))
+}
+
+test "rpn" {
+    assert rpn(["2", "3", "+", "4", "*"]) == 20
+    assert rpn(["10", "3", "-"]) == 7
+}

@@ -1,0 +1,13 @@
+# Integer arithmetic.
+fn add(a: int, b: int) -> int {
+    return a + b
+}
+
+fn main() {
+    print(add(3, 4))
+}
+
+test "add" {
+    assert add(3, 4) == 7
+    assert add(-2, 5) == 3
+}

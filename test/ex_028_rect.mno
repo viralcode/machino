@@ -1,0 +1,24 @@
+# Rectangle area and perimeter.
+struct Rect {
+    w: int
+    h: int
+}
+
+fn area(r: Rect) -> int {
+    return r.w * r.h
+}
+
+fn perimeter(r: Rect) -> int {
+    return 2 * (r.w + r.h)
+}
+
+fn main() {
+    let r = Rect(3, 4)
+    print(area(r))
+}
+
+test "rect" {
+    let r = Rect(3, 4)
+    assert area(r) == 12
+    assert perimeter(r) == 14
+}

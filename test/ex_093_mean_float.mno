@@ -1,0 +1,18 @@
+# Mean of float samples.
+fn mean(xs: [float]) -> float
+    requires len(xs) > 0
+{
+    let s = 0.0
+    for i in 0..len(xs) {
+        s = s + xs[i]
+    }
+    return s / to_float(len(xs))
+}
+
+fn main() {
+    print(str_of_float(mean([1.0, 2.0, 3.0, 4.0]), 1))
+}
+
+test "mean" {
+    assert abs_float(mean([1.0, 2.0, 3.0, 4.0]) - 2.5) < 0.000001
+}

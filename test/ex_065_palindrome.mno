@@ -1,0 +1,26 @@
+# Integer palindrome check.
+fn is_pal(n: int) -> bool
+    requires n >= 0
+{
+    let s = str_of_int(n)
+    let i = 0
+    let j = len(s) - 1
+    while i < j {
+        if char_at(s, i) != char_at(s, j) {
+            return false
+        }
+        i = i + 1
+        j = j - 1
+    }
+    return true
+}
+
+fn main() {
+    print(is_pal(121))
+}
+
+test "pal" {
+    assert is_pal(121)
+    assert is_pal(7)
+    assert !is_pal(12)
+}

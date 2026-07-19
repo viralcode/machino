@@ -1,0 +1,8 @@
+# split and join.
+fn main() {
+    print(join(split("a,b,c", ","), "-"))
+}
+
+test "split join" {
+    assert join(split("a,b,c", ","), "-") == "a-b-c"
+}

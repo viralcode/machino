@@ -1,0 +1,12 @@
+# Float arithmetic with sqrt.
+fn hypot(a: float, b: float) -> float {
+    return sqrt(a * a + b * b)
+}
+
+fn main() {
+    print(str_of_float(hypot(3.0, 4.0), 1))
+}
+
+test "3-4-5" {
+    assert abs_float(hypot(3.0, 4.0) - 5.0) < 0.000001
+}

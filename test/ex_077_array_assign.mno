@@ -1,0 +1,19 @@
+# In-place array element assignment.
+fn scale(xs: [int], k: int) {
+    for i in 0..len(xs) {
+        xs[i] = xs[i] * k
+    }
+}
+
+fn main() {
+    let xs = [1, 2, 3]
+    scale(xs, 10)
+    print(xs[2])
+}
+
+test "scale" {
+    let xs = [1, 2, 3]
+    scale(xs, 10)
+    assert xs[0] == 10
+    assert xs[2] == 30
+}

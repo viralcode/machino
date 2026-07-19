@@ -1,0 +1,10 @@
+# hash() on int/str/bool.
+fn main() {
+    print(hash(42) == hash(42))
+}
+
+test "hash eq" {
+    assert hash(42) == hash(42)
+    assert hash("a") == hash("a")
+    assert hash(true) == hash(true)
+}

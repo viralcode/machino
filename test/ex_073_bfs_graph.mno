@@ -1,0 +1,43 @@
+# BFS shortest path on adjacency lists.
+fn bfs(adj: [[int]], start: int, goal: int) -> int {
+    let n = len(adj)
+    let dist: [int] = []
+    let seen: [bool] = []
+    for i in 0..n {
+        dist = push(dist, -1)
+        seen = push(seen, false)
+    }
+    let q: [int] = []
+    q = push(q, start)
+    dist[start] = 0
+    seen[start] = true
+    let h = 0
+    while h < len(q) {
+        let u = q[h]
+        h = h + 1
+        if u == goal {
+            return dist[u]
+        }
+        let nbrs = adj[u]
+        for i in 0..len(nbrs) {
+            let v = nbrs[i]
+            if !seen[v] {
+                seen[v] = true
+                dist[v] = dist[u] + 1
+                q = push(q, v)
+            }
+        }
+    }
+    return -1
+}
+
+fn main() {
+    let adj = [[1, 2], [0, 3], [0, 3], [1, 2]]
+    print(bfs(adj, 0, 3))
+}
+
+test "bfs" {
+    let adj = [[1, 2], [0, 3], [0, 3], [1, 2]]
+    assert bfs(adj, 0, 3) == 2
+    assert bfs(adj, 0, 0) == 0
+}

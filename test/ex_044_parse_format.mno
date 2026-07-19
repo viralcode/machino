@@ -1,0 +1,11 @@
+# parse_int and formatting.
+fn main() {
+    print(parse_int("42"))
+}
+
+test "parse format" {
+    assert parse_int("42") == 42
+    assert str_of_int(-3) == "-3"
+    assert str_of_bool(false) == "false"
+    assert is_int_str("99")
+}

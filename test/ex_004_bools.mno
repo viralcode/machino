@@ -1,0 +1,18 @@
+# Boolean logic.
+fn both(a: bool, b: bool) -> bool {
+    return a && b
+}
+
+fn either(a: bool, b: bool) -> bool {
+    return a || b
+}
+
+fn main() {
+    print(both(true, false))
+}
+
+test "logic" {
+    assert both(true, true)
+    assert !both(true, false)
+    assert either(false, true)
+}

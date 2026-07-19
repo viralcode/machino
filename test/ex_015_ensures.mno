@@ -1,0 +1,15 @@
+# Ensures on result.
+fn double_pos(n: int) -> int
+    requires n >= 0
+    ensures result == n * 2
+{
+    return n + n
+}
+
+fn main() {
+    print(double_pos(21))
+}
+
+test "double" {
+    assert double_pos(21) == 42
+}

@@ -1,0 +1,15 @@
+# Generic first element.
+fn<T> first(xs: [T]) -> T
+    requires len(xs) > 0
+{
+    return xs[0]
+}
+
+fn main() {
+    print(first([10, 20, 30]))
+}
+
+test "first" {
+    assert first([10, 20]) == 10
+    assert first(["a", "b"]) == "a"
+}

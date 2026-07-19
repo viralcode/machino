@@ -1,0 +1,14 @@
+# Requires on divisor.
+fn safe_div(a: int, b: int) -> int
+    requires b != 0
+{
+    return a / b
+}
+
+fn main() {
+    print(safe_div(10, 2))
+}
+
+test "safe div" {
+    assert safe_div(10, 2) == 5
+}

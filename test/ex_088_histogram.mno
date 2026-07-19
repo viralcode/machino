@@ -1,0 +1,26 @@
+# Histogram of values 0..9.
+fn hist(xs: [int]) -> [int] {
+    let h: [int] = []
+    for i in 0..10 {
+        h = push(h, 0)
+    }
+    for i in 0..len(xs) {
+        let v = xs[i]
+        if v >= 0 && v <= 9 {
+            h[v] = h[v] + 1
+        }
+    }
+    return h
+}
+
+fn main() {
+    let h = hist([1, 1, 2, 9])
+    print(h[1])
+}
+
+test "hist" {
+    let h = hist([1, 1, 2, 9])
+    assert h[1] == 2
+    assert h[2] == 1
+    assert h[9] == 1
+}

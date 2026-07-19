@@ -1,0 +1,18 @@
+# Linear search with early return.
+fn index_of(xs: [int], v: int) -> int {
+    for i in 0..len(xs) {
+        if xs[i] == v {
+            return i
+        }
+    }
+    return -1
+}
+
+fn main() {
+    print(index_of([4, 5, 6], 5))
+}
+
+test "index_of" {
+    assert index_of([4, 5, 6], 5) == 1
+    assert index_of([4, 5, 6], 9) == -1
+}

@@ -1,0 +1,10 @@
+# Snapshot test with expects.
+fn main() {
+    print(1)
+    print(2)
+}
+
+test "two lines" expects "1\n2" {
+    print(1)
+    print(2)
+}

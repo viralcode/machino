@@ -1,0 +1,11 @@
+# Unicode codepoint APIs.
+fn main() {
+    print(len_cp("A"))
+}
+
+test "codepoints" {
+    assert len_cp("A") == 1
+    assert char_at_cp("A", 0) == 65
+    assert chr_cp(65) == "A"
+    assert substr_cp("ABC", 1, 2) == "B"
+}

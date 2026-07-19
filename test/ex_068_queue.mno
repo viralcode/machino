@@ -1,0 +1,37 @@
+# Queue via head index.
+struct Queue {
+    items: [int]
+    head: int
+}
+
+fn queue_new() -> Queue {
+    let items: [int] = []
+    return Queue(items, 0)
+}
+
+fn enqueue(q: Queue, v: int) {
+    q.items = push(q.items, v)
+}
+
+fn dequeue(q: Queue) -> int
+    requires q.head < len(q.items)
+{
+    let v = q.items[q.head]
+    q.head = q.head + 1
+    return v
+}
+
+fn main() {
+    let q = queue_new()
+    enqueue(q, 10)
+    enqueue(q, 20)
+    print(dequeue(q))
+}
+
+test "queue" {
+    let q = queue_new()
+    enqueue(q, 10)
+    enqueue(q, 20)
+    assert dequeue(q) == 10
+    assert dequeue(q) == 20
+}

@@ -1,0 +1,27 @@
+# Euclid GCD and LCM.
+fn gcd(a: int, b: int) -> int {
+    let x = abs_int(a)
+    let y = abs_int(b)
+    while y != 0 {
+        let t = y
+        y = x % y
+        x = t
+    }
+    return x
+}
+
+fn lcm(a: int, b: int) -> int
+    requires a != 0 && b != 0
+{
+    return abs_int(a * b) / gcd(a, b)
+}
+
+fn main() {
+    print(gcd(48, 18))
+    print(lcm(4, 6))
+}
+
+test "gcd lcm" {
+    assert gcd(48, 18) == 6
+    assert lcm(4, 6) == 12
+}

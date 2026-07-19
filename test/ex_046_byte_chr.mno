@@ -1,0 +1,10 @@
+# Byte chr / char_at.
+fn main() {
+    print(chr(65))
+}
+
+test "bytes" {
+    assert chr(65) == "A"
+    assert char_at("ABC", 1) == 66
+    assert len("ABC") == 3
+}

@@ -1,0 +1,21 @@
+# Option-style enum.
+enum Opt {
+    None
+    Some(int)
+}
+
+fn unwrap_or(o: Opt, d: int) -> int {
+    return match o {
+        Opt::None => d
+        Opt::Some(v) => v
+    }
+}
+
+fn main() {
+    print(unwrap_or(Opt::Some(7), 0))
+}
+
+test "opt" {
+    assert unwrap_or(Opt::None, 3) == 3
+    assert unwrap_or(Opt::Some(7), 0) == 7
+}

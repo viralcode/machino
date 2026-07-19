@@ -1,0 +1,19 @@
+# Arrays, index, push, sum.
+fn sum(xs: [int]) -> int {
+    let s = 0
+    for i in 0..len(xs) {
+        s = s + xs[i]
+    }
+    return s
+}
+
+fn main() {
+    print(sum([1, 2, 3, 4]))
+}
+
+test "sum push" {
+    let xs: [int] = []
+    xs = push(xs, 10)
+    xs = push(xs, 20)
+    assert sum(xs) == 30
+}

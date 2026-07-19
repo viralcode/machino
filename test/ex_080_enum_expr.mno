@@ -1,0 +1,34 @@
+# Match as expression in let.
+enum Sign {
+    Neg
+    Zero
+    Pos
+}
+
+fn sign_of(n: int) -> Sign {
+    if n < 0 {
+        return Sign::Neg
+    }
+    if n == 0 {
+        return Sign::Zero
+    }
+    return Sign::Pos
+}
+
+fn label(s: Sign) -> str {
+    return match s {
+        Sign::Neg => "neg"
+        Sign::Zero => "zero"
+        Sign::Pos => "pos"
+    }
+}
+
+fn main() {
+    print(label(sign_of(-3)))
+}
+
+test "sign" {
+    assert label(sign_of(-3)) == "neg"
+    assert label(sign_of(0)) == "zero"
+    assert label(sign_of(9)) == "pos"
+}

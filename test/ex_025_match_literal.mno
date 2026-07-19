@@ -1,0 +1,18 @@
+# Match on integer literals.
+fn name_of(n: int) -> str {
+    return match n {
+        0 => "zero"
+        1 => "one"
+        2 => "two"
+        _ => "many"
+    }
+}
+
+fn main() {
+    print(name_of(2))
+}
+
+test "match lit" {
+    assert name_of(0) == "zero"
+    assert name_of(9) == "many"
+}

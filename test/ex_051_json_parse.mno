@@ -1,0 +1,15 @@
+# JSON parse and serialize.
+fn show(p: JsonParsed) -> str {
+    return match p {
+        JsonParsed::JVal(v) => json_serialize(v)
+        JsonParsed::JError(e) => e
+    }
+}
+
+fn main() {
+    print(show(json_parse("{\"a\":1}")))
+}
+
+test "json roundtrip number" {
+    assert show(json_parse("42")) == "42"
+}

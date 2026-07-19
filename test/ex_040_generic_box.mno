@@ -1,0 +1,16 @@
+# Generic struct Box constructed directly.
+struct<T> Box {
+    value: T
+}
+
+fn main() {
+    let b = Box(42)
+    print(b.value)
+}
+
+test "box" {
+    let b = Box(42)
+    assert b.value == 42
+    let s = Box("hi")
+    assert s.value == "hi"
+}

@@ -1,0 +1,21 @@
+# Iterative integer power.
+fn pow_i(base: int, exp: int) -> int
+    requires exp >= 0
+{
+    let out = 1
+    let e = exp
+    while e > 0 {
+        out = out * base
+        e = e - 1
+    }
+    return out
+}
+
+fn main() {
+    print(pow_i(2, 10))
+}
+
+test "pow" {
+    assert pow_i(2, 10) == 1024
+    assert pow_i(5, 0) == 1
+}

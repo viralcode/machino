@@ -1,0 +1,15 @@
+# ISO-8601 time formatting.
+fn main() {
+    print(time_iso(0))
+}
+
+test "epoch" {
+    assert time_iso(0) == "1970-01-01T00:00:00Z"
+}
+
+test "fields" {
+    let t = time_from_ms(0)
+    assert t.year == 1970
+    assert t.month == 1
+    assert t.day == 1
+}

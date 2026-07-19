@@ -1,0 +1,26 @@
+# Bottom-up DP Fibonacci.
+fn fib_dp(n: int) -> int
+    requires n >= 0
+{
+    if n < 2 {
+        return n
+    }
+    let a = 0
+    let b = 1
+    for i in 2..(n + 1) {
+        let c = a + b
+        a = b
+        b = c
+    }
+    return b
+}
+
+fn main() {
+    print(fib_dp(20))
+}
+
+test "fib dp" {
+    assert fib_dp(0) == 0
+    assert fib_dp(10) == 55
+    assert fib_dp(20) == 6765
+}

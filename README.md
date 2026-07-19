@@ -169,6 +169,69 @@ Full details in [SPEC.md](SPEC.md), the formal grammar in [docs/grammar.ebnf](do
 | `machino synth` | generate a verified training corpus |
 | `machino pkg init/add/sync/publish` | package manager + registry client |
 
+## Examples
+
+Curated demos live in [`examples/`](examples/). A 100-file language corpus (each with `main` + `test` blocks) lives in [`test/ex_*.mno`](test/). Larger HTTP services also sit under [`test/`](test/).
+
+```sh
+./target/release/machino run examples/neural_net.mno
+./target/release/machino test test/ex_073_bfs_graph.mno
+./target/release/machino run test/weather_api.mno 8092
+```
+
+### `examples/` — curated demos
+
+| File | What it shows |
+|---|---|
+| [`examples/hello.mno`](examples/hello.mno) | Smallest program |
+| [`examples/fib.mno`](examples/fib.mno) | Recursive Fibonacci + contracts + tests |
+| [`examples/sort.mno`](examples/sort.mno) | Arrays, index assignment, sortedness helper |
+| [`examples/structs.mno`](examples/structs.mno) | Nominal structs with reference semantics |
+| [`examples/enums.mno`](examples/enums.mno) | Enums and pattern matching |
+| [`examples/contracts.mno`](examples/contracts.mno) | Strings, floats, conversions, contract-guarded math |
+| [`examples/generics.mno`](examples/generics.mno) | Generic functions, inferred args, constraint bounds |
+| [`examples/generic_sort.mno`](examples/generic_sort.mno) | Generic sort |
+| [`examples/complete_generics.mno`](examples/complete_generics.mno) | Broader generics coverage |
+| [`examples/higher_order.mno`](examples/higher_order.mno) | First-class `fn(...)` values |
+| [`examples/closures.mno`](examples/closures.mno) | Lambdas capturing by value |
+| [`examples/concurrency.mno`](examples/concurrency.mno) | `spawn` / `join_*` |
+| [`examples/json.mno`](examples/json.mno) | `json_parse` / `json_serialize` |
+| [`examples/stdlib_tour.mno`](examples/stdlib_tour.mno) | Prelude tour: math, IntMap, time |
+| [`examples/wordcount.mno`](examples/wordcount.mno) | Text processing with StrMap |
+| [`examples/maze_solver.mno`](examples/maze_solver.mno) | BFS maze solver |
+| [`examples/neural_net.mno`](examples/neural_net.mno) | 2-2-1 MLP that learns XOR |
+| [`examples/http_server.mno`](examples/http_server.mno) | Real HTTP server via TCP capabilities |
+| [`examples/wasmgc.mno`](examples/wasmgc.mno) / [`complete_wasmgc.mno`](examples/complete_wasmgc.mno) | WASM-GC backend |
+| [`examples/smt_contracts.mno`](examples/smt_contracts.mno) / [`complete_smt.mno`](examples/complete_smt.mno) | SMT-verifiable contracts |
+| [`examples/registry.mno`](examples/registry.mno) | Package registry client sketch |
+| [`examples/namespaces/`](examples/namespaces/) | Namespaced imports (`geo::Point`, …) |
+
+### `test/` — 100 language examples + services
+
+Every `test/ex_NNN_*.mno` typechecks and passes `machino test`. Run them all with:
+
+```sh
+for f in test/ex_*.mno; do ./target/release/machino test "$f" || exit 1; done
+```
+
+| Range | Topic |
+|---|---|
+| `ex_001`–`ex_010` | Basics: print, int/float/bool/str, arrays, `if`, `while`, `for`, `break`/`continue` |
+| `ex_011`–`ex_020` | Functions, recursion, `requires`/`ensures`, early return |
+| `ex_021`–`ex_030` | Structs, enums, `match` |
+| `ex_031`–`ex_040` | Generics, higher-order functions, closures, `Box` |
+| `ex_041`–`ex_050` | Strings, Unicode codepoints, StrMap/IntMap/HashMap |
+| `ex_051`–`ex_060` | JSON, time, float math, `hash` |
+| `ex_061`–`ex_075` | Algorithms: search, GCD, primes, DP, BFS, knapsack, Levenshtein |
+| `ex_076`–`ex_085` | Snapshot tests, nested arrays, spawn/join, channels, generic bounds |
+| `ex_086`–`ex_100` | Mini apps: Caesar, RPN, perceptron, todos, ledger, tic-tac-toe, Roman, neural forward |
+
+| File | What it is |
+|---|---|
+| [`test/ex_001_hello.mno`](test/ex_001_hello.mno) … [`test/ex_100_neural_step.mno`](test/ex_100_neural_step.mno) | 100 self-contained examples (see ranges above) |
+| [`test/weather_api.mno`](test/weather_api.mno) | Live weather HTTP API (Open-Meteo via `http_get`) |
+| [`test/task_backend_service.mno`](test/task_backend_service.mno) | Stateful task backend with persistence and auth |
+
 ## Status and roadmap
 
 This is **v1.1**. Everything above is implemented and covered by the end-to-end suite: interpreter/WASM byte-for-byte output parity for every language feature — on **both** backends — including generic structs/`HashMap`, channels, Unicode codepoint APIs, and trapping integer overflow on the GC backend.

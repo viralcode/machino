@@ -1,0 +1,25 @@
+# Enum array counting.
+enum Cell {
+    Empty
+    Val(int)
+}
+
+fn count_vals(xs: [Cell]) -> int {
+    let c = 0
+    for i in 0..len(xs) {
+        let add = match xs[i] {
+            Cell::Val(_) => 1
+            Cell::Empty => 0
+        }
+        c = c + add
+    }
+    return c
+}
+
+fn main() {
+    print(count_vals([Cell::Empty, Cell::Val(1), Cell::Val(2)]))
+}
+
+test "cells" {
+    assert count_vals([Cell::Empty, Cell::Val(1), Cell::Val(2)]) == 2
+}

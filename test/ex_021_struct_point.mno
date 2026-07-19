@@ -1,0 +1,17 @@
+# Struct Point and Manhattan distance.
+struct Point {
+    x: int
+    y: int
+}
+
+fn manhattan(p: Point) -> int {
+    return abs_int(p.x) + abs_int(p.y)
+}
+
+fn main() {
+    print(manhattan(Point(3, -4)))
+}
+
+test "point" {
+    assert manhattan(Point(3, -4)) == 7
+}

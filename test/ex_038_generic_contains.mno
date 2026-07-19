@@ -1,0 +1,18 @@
+# Generic contains with Eq.
+fn<T: Eq> contains_v(xs: [T], v: T) -> bool {
+    for i in 0..len(xs) {
+        if xs[i] == v {
+            return true
+        }
+    }
+    return false
+}
+
+fn main() {
+    print(contains_v([1, 2, 3], 2))
+}
+
+test "contains" {
+    assert contains_v([1, 2, 3], 2)
+    assert !contains_v([1, 2, 3], 9)
+}

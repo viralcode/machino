@@ -1,0 +1,8 @@
+# Smallest print program.
+fn main() {
+    print("hello from machino")
+}
+
+test "prints greeting" expects "hello from machino" {
+    print("hello from machino")
+}

@@ -1,0 +1,20 @@
+# Build a string in a loop.
+fn join_nums(xs: [int]) -> str {
+    let out = ""
+    for i in 0..len(xs) {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + str_of_int(xs[i])
+    }
+    return out
+}
+
+fn main() {
+    print(join_nums([1, 2, 3]))
+}
+
+test "join nums" {
+    assert join_nums([1, 2, 3]) == "1,2,3"
+    assert join_nums([7]) == "7"
+}

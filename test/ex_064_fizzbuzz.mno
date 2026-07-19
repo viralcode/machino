@@ -1,0 +1,26 @@
+# FizzBuzz to strings.
+fn fb(n: int) -> str {
+    if n % 15 == 0 {
+        return "FizzBuzz"
+    }
+    if n % 3 == 0 {
+        return "Fizz"
+    }
+    if n % 5 == 0 {
+        return "Buzz"
+    }
+    return str_of_int(n)
+}
+
+fn main() {
+    for i in 1..16 {
+        print(fb(i))
+    }
+}
+
+test "fizzbuzz" {
+    assert fb(3) == "Fizz"
+    assert fb(5) == "Buzz"
+    assert fb(15) == "FizzBuzz"
+    assert fb(7) == "7"
+}

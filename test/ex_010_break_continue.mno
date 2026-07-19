@@ -1,0 +1,30 @@
+# Break and continue.
+fn first_even(xs: [int]) -> int {
+    for i in 0..len(xs) {
+        if xs[i] % 2 != 0 {
+            continue
+        }
+        return xs[i]
+    }
+    return -1
+}
+
+fn sum_until_neg(xs: [int]) -> int {
+    let s = 0
+    for i in 0..len(xs) {
+        if xs[i] < 0 {
+            break
+        }
+        s = s + xs[i]
+    }
+    return s
+}
+
+fn main() {
+    print(first_even([1, 3, 4, 6]))
+}
+
+test "break continue" {
+    assert first_even([1, 3, 4, 6]) == 4
+    assert sum_until_neg([1, 2, -1, 9]) == 3
+}

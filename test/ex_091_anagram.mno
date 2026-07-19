@@ -1,0 +1,34 @@
+# Letter-count anagram check (a-z).
+fn counts(s: str) -> [int] {
+    let c: [int] = []
+    for i in 0..26 {
+        c = push(c, 0)
+    }
+    for i in 0..len(s) {
+        let b = char_at(s, i)
+        if b >= 97 && b <= 122 {
+            c[b - 97] = c[b - 97] + 1
+        }
+    }
+    return c
+}
+
+fn anagram(a: str, b: str) -> bool {
+    let ca = counts(a)
+    let cb = counts(b)
+    for i in 0..26 {
+        if ca[i] != cb[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn main() {
+    print(anagram("listen", "silent"))
+}
+
+test "anagram" {
+    assert anagram("listen", "silent")
+    assert !anagram("hello", "world")
+}

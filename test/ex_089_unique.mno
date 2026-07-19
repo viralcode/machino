@@ -1,0 +1,22 @@
+# Deduplicate sorted ints.
+fn unique(xs: [int]) -> [int] {
+    let out: [int] = []
+    for i in 0..len(xs) {
+        if len(out) == 0 || out[len(out) - 1] != xs[i] {
+            out = push(out, xs[i])
+        }
+    }
+    return out
+}
+
+fn main() {
+    let u = unique([1, 1, 2, 2, 2, 3])
+    print(len(u))
+}
+
+test "unique" {
+    let u = unique([1, 1, 2, 2, 2, 3])
+    assert len(u) == 3
+    assert u[0] == 1
+    assert u[2] == 3
+}

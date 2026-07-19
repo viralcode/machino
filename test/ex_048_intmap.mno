@@ -1,0 +1,14 @@
+# IntMap updates.
+fn main() {
+    let m = intmap_new()
+    intmap_set(m, 1, 10)
+    print(intmap_get(m, 1))
+}
+
+test "intmap" {
+    let m = intmap_new()
+    intmap_set(m, 1, 10)
+    intmap_set(m, 1, 20)
+    assert intmap_get(m, 1) == 20
+    assert intmap_get_or(m, 9, -1) == -1
+}

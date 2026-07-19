@@ -1,0 +1,15 @@
+# StrMap set/get/has.
+fn main() {
+    let m = strmap_new()
+    strmap_set(m, "a", "1")
+    print(strmap_get(m, "a"))
+}
+
+test "strmap" {
+    let m = strmap_new()
+    strmap_set(m, "a", "1")
+    strmap_set(m, "b", "2")
+    assert strmap_get(m, "a") == "1"
+    assert strmap_has(m, "b")
+    assert strmap_len(m) == 2
+}

@@ -1,0 +1,14 @@
+# String concat and substr.
+fn greet(name: str) -> str {
+    return "hi, " + name
+}
+
+fn main() {
+    print(greet("machino"))
+}
+
+test "strings" {
+    assert greet("x") == "hi, x"
+    assert len("abc") == 3
+    assert substr("abcdef", 1, 4) == "bcd"
+}

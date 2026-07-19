@@ -1,0 +1,34 @@
+# Trial-division primes.
+fn is_prime(n: int) -> bool {
+    if n < 2 {
+        return false
+    }
+    let d = 2
+    while d * d <= n {
+        if n % d == 0 {
+            return false
+        }
+        d = d + 1
+    }
+    return true
+}
+
+fn count_primes(n: int) -> int {
+    let c = 0
+    for i in 0..(n + 1) {
+        if is_prime(i) {
+            c = c + 1
+        }
+    }
+    return c
+}
+
+fn main() {
+    print(count_primes(20))
+}
+
+test "primes" {
+    assert is_prime(17)
+    assert !is_prime(18)
+    assert count_primes(10) == 4
+}

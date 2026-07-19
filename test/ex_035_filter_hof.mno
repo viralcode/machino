@@ -1,0 +1,24 @@
+# Higher-order filter.
+fn filter_int(xs: [int], keep: fn(int) -> bool) -> [int] {
+    let out: [int] = []
+    for i in 0..len(xs) {
+        if keep(xs[i]) {
+            out = push(out, xs[i])
+        }
+    }
+    return out
+}
+
+fn pos(n: int) -> bool {
+    return n > 0
+}
+
+fn main() {
+    print(len(filter_int([-1, 2, 0, 3], pos)))
+}
+
+test "filter" {
+    let ys = filter_int([-1, 2, 0, 3], pos)
+    assert len(ys) == 2
+    assert ys[0] == 2
+}

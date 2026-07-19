@@ -1,0 +1,40 @@
+# Mini in-memory todo list.
+struct Todo {
+    title: str
+    done: bool
+}
+
+fn add_todo(xs: [Todo], title: str) -> [Todo] {
+    return push(xs, Todo(title, false))
+}
+
+fn complete(xs: [Todo], i: int) {
+    xs[i].done = true
+}
+
+fn pending(xs: [Todo]) -> int {
+    let c = 0
+    for i in 0..len(xs) {
+        if !xs[i].done {
+            c = c + 1
+        }
+    }
+    return c
+}
+
+fn main() {
+    let xs: [Todo] = []
+    xs = add_todo(xs, "write")
+    xs = add_todo(xs, "test")
+    complete(xs, 0)
+    print(pending(xs))
+}
+
+test "todos" {
+    let xs: [Todo] = []
+    xs = add_todo(xs, "a")
+    xs = add_todo(xs, "b")
+    complete(xs, 0)
+    assert pending(xs) == 1
+    assert xs[0].done
+}

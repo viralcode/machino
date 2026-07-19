@@ -1,0 +1,35 @@
+# Simple bank ledger.
+struct Acct {
+    bal: int
+}
+
+fn deposit(a: Acct, n: int)
+    requires n >= 0
+{
+    a.bal = a.bal + n
+}
+
+fn withdraw(a: Acct, n: int) -> bool
+    requires n >= 0
+{
+    if a.bal < n {
+        return false
+    }
+    a.bal = a.bal - n
+    return true
+}
+
+fn main() {
+    let a = Acct(100)
+    deposit(a, 50)
+    print(withdraw(a, 30))
+    print(a.bal)
+}
+
+test "bank" {
+    let a = Acct(100)
+    deposit(a, 50)
+    assert withdraw(a, 30)
+    assert a.bal == 120
+    assert !withdraw(a, 1000)
+}

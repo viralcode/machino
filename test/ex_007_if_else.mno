@@ -1,0 +1,16 @@
+# If/else abs.
+fn abs_i(n: int) -> int {
+    if n < 0 {
+        return 0 - n
+    }
+    return n
+}
+
+fn main() {
+    print(abs_i(-7))
+}
+
+test "abs" {
+    assert abs_i(-7) == 7
+    assert abs_i(0) == 0
+}

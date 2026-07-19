@@ -1,0 +1,13 @@
+# Std float helpers.
+fn main() {
+    print(floor(2.7))
+    print(ceil(2.1))
+    print(round(2.5))
+}
+
+test "float math" {
+    assert floor(2.7) == 2
+    assert ceil(2.1) == 3
+    assert round(2.5) == 3
+    assert abs_float(-1.5) == 1.5
+}

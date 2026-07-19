@@ -1,0 +1,28 @@
+# Result-style enum.
+enum Res {
+    Ok(int)
+    Err(str)
+}
+
+fn parse_digit(s: str) -> Res {
+    if len(s) != 1 || !is_digit(char_at(s, 0)) {
+        return Res::Err("bad")
+    }
+    return Res::Ok(parse_int(s))
+}
+
+fn value_or_neg(r: Res) -> int {
+    return match r {
+        Res::Ok(n) => n
+        Res::Err(_) => -1
+    }
+}
+
+fn main() {
+    print(value_or_neg(parse_digit("5")))
+}
+
+test "parse digit" {
+    assert value_or_neg(parse_digit("5")) == 5
+    assert value_or_neg(parse_digit("x")) == -1
+}

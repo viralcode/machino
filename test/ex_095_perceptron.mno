@@ -1,0 +1,45 @@
+# One-step perceptron update.
+struct Perc {
+    w0: float
+    w1: float
+    b: float
+}
+
+fn activate(p: Perc, x0: float, x1: float) -> float {
+    let z = p.w0 * x0 + p.w1 * x1 + p.b
+    if z >= 0.0 {
+        return 1.0
+    }
+    return 0.0
+}
+
+fn train_step(p: Perc, x0: float, x1: float, y: float, lr: float) {
+    let yhat = activate(p, x0, x1)
+    let err = y - yhat
+    p.w0 = p.w0 + lr * err * x0
+    p.w1 = p.w1 + lr * err * x1
+    p.b = p.b + lr * err
+}
+
+fn main() {
+    let p = Perc(0.0, 0.0, 0.0)
+    for e in 0..20 {
+        train_step(p, 0.0, 0.0, 0.0, 0.1)
+        train_step(p, 0.0, 1.0, 0.0, 0.1)
+        train_step(p, 1.0, 0.0, 0.0, 0.1)
+        train_step(p, 1.0, 1.0, 1.0, 0.1)
+    }
+    print(to_int(activate(p, 1.0, 1.0)))
+}
+
+test "and gate" {
+    let p = Perc(0.0, 0.0, 0.0)
+    for e in 0..40 {
+        train_step(p, 0.0, 0.0, 0.0, 0.1)
+        train_step(p, 0.0, 1.0, 0.0, 0.1)
+        train_step(p, 1.0, 0.0, 0.0, 0.1)
+        train_step(p, 1.0, 1.0, 1.0, 0.1)
+    }
+    assert activate(p, 0.0, 0.0) == 0.0
+    assert activate(p, 1.0, 1.0) == 1.0
+}

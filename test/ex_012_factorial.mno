@@ -1,0 +1,18 @@
+# Recursive factorial with requires.
+fn fact(n: int) -> int
+    requires n >= 0
+{
+    if n < 2 {
+        return 1
+    }
+    return n * fact(n - 1)
+}
+
+fn main() {
+    print(fact(6))
+}
+
+test "fact" {
+    assert fact(0) == 1
+    assert fact(5) == 120
+}

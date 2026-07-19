@@ -1,0 +1,22 @@
+# 2x2 matrix add as flat arrays.
+fn mat_add(a: [int], b: [int]) -> [int]
+    requires len(a) == 4 && len(b) == 4
+{
+    let out: [int] = []
+    for i in 0..4 {
+        out = push(out, a[i] + b[i])
+    }
+    return out
+}
+
+fn main() {
+    let c = mat_add([1, 2, 3, 4], [5, 6, 7, 8])
+    print(c[0])
+    print(c[3])
+}
+
+test "mat add" {
+    let c = mat_add([1, 2, 3, 4], [5, 6, 7, 8])
+    assert c[0] == 6
+    assert c[3] == 12
+}

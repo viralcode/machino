@@ -1,0 +1,27 @@
+# Caesar cipher on ASCII letters.
+fn shift_byte(c: int, k: int) -> int {
+    if c >= 65 && c <= 90 {
+        return 65 + ((c - 65 + k) % 26 + 26) % 26
+    }
+    if c >= 97 && c <= 122 {
+        return 97 + ((c - 97 + k) % 26 + 26) % 26
+    }
+    return c
+}
+
+fn caesar(s: str, k: int) -> str {
+    let out = ""
+    for i in 0..len(s) {
+        out = out + chr(shift_byte(char_at(s, i), k))
+    }
+    return out
+}
+
+fn main() {
+    print(caesar("Abc", 1))
+}
+
+test "caesar" {
+    assert caesar("Abc", 1) == "Bcd"
+    assert caesar("xyz", 3) == "abc"
+}

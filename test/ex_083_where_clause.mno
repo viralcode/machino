@@ -1,0 +1,19 @@
+# Generic where clause style bound.
+fn<T: Ord + Eq> clamp_t(x: T, lo: T, hi: T) -> T {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+fn main() {
+    print(clamp_t(15, 0, 10))
+}
+
+test "clamp_t" {
+    assert clamp_t(15, 0, 10) == 10
+    assert clamp_t(-1, 0, 10) == 0
+}

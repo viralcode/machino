@@ -1,0 +1,23 @@
+# Higher-order map.
+fn map_int(xs: [int], f: fn(int) -> int) -> [int] {
+    let out: [int] = []
+    for i in 0..len(xs) {
+        out = push(out, f(xs[i]))
+    }
+    return out
+}
+
+fn double(n: int) -> int {
+    return n * 2
+}
+
+fn main() {
+    let ys = map_int([1, 2, 3], double)
+    print(ys[2])
+}
+
+test "map" {
+    let ys = map_int([1, 2, 3], double)
+    assert ys[0] == 2
+    assert ys[2] == 6
+}

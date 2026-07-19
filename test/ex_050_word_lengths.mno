@@ -1,0 +1,25 @@
+# Count words by length with IntMap.
+fn count_by_len(text: str) -> IntMap {
+    let words = split(trim(text), " ")
+    let m = intmap_new()
+    for i in 0..len(words) {
+        let w = words[i]
+        if len(w) == 0 {
+            continue
+        }
+        let k = len(w)
+        intmap_set(m, k, intmap_get_or(m, k, 0) + 1)
+    }
+    return m
+}
+
+fn main() {
+    let m = count_by_len("a bb ccc bb")
+    print(intmap_get_or(m, 2, 0))
+}
+
+test "word lengths" {
+    let m = count_by_len("a bb ccc bb")
+    assert intmap_get_or(m, 1, 0) == 1
+    assert intmap_get_or(m, 2, 0) == 2
+}

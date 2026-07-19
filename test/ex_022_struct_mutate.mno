@@ -1,0 +1,21 @@
+# Struct field mutation.
+struct Counter {
+    n: int
+}
+
+fn bump(c: Counter) {
+    c.n = c.n + 1
+}
+
+fn main() {
+    let c = Counter(0)
+    bump(c)
+    bump(c)
+    print(c.n)
+}
+
+test "mutate" {
+    let c = Counter(10)
+    bump(c)
+    assert c.n == 11
+}

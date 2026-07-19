@@ -1,0 +1,29 @@
+# Simple moving average.
+fn sma(xs: [float], w: int) -> [float]
+    requires w > 0
+{
+    let out: [float] = []
+    if len(xs) < w {
+        return out
+    }
+    for i in 0..(len(xs) - w + 1) {
+        let s = 0.0
+        for j in 0..w {
+            s = s + xs[i + j]
+        }
+        out = push(out, s / to_float(w))
+    }
+    return out
+}
+
+fn main() {
+    let a = sma([1.0, 2.0, 3.0, 4.0], 2)
+    print(str_of_float(a[0], 1))
+}
+
+test "sma" {
+    let a = sma([1.0, 2.0, 3.0, 4.0], 2)
+    assert len(a) == 3
+    assert abs_float(a[0] - 1.5) < 0.000001
+    assert abs_float(a[2] - 3.5) < 0.000001
+}

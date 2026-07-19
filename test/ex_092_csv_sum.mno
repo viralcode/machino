@@ -1,0 +1,17 @@
+# Sum a CSV of ints.
+fn csv_sum(line: str) -> int {
+    let parts = split(line, ",")
+    let s = 0
+    for i in 0..len(parts) {
+        s = s + parse_int(trim(parts[i]))
+    }
+    return s
+}
+
+fn main() {
+    print(csv_sum("1, 2, 3, 4"))
+}
+
+test "csv" {
+    assert csv_sum("1, 2, 3, 4") == 10
+}

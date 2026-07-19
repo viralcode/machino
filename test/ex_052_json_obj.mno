@@ -1,0 +1,14 @@
+# Build a JSON object.
+fn main() {
+    let o = json_obj_new()
+    json_obj_set(o, "n", Json::JNum(3.0))
+    json_obj_set(o, "ok", Json::JBool(true))
+    print(json_serialize(Json::JObj(o)))
+}
+
+test "json obj" {
+    let o = json_obj_new()
+    json_obj_set(o, "n", Json::JNum(3.0))
+    let s = json_serialize(Json::JObj(o))
+    assert contains(s, "\"n\"")
+}

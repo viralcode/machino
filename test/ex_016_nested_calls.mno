@@ -1,0 +1,16 @@
+# Nested pure calls.
+fn sq(n: int) -> int {
+    return n * n
+}
+
+fn hyp2(a: int, b: int) -> int {
+    return sq(a) + sq(b)
+}
+
+fn main() {
+    print(hyp2(3, 4))
+}
+
+test "nested" {
+    assert hyp2(3, 4) == 25
+}

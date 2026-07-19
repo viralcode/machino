@@ -1,0 +1,15 @@
+# Shared-nothing spawn/join.
+fn square(n: int) -> int {
+    return n * n
+}
+
+fn main() {
+    let h = spawn(square, 12)
+    print(join_int(h))
+}
+
+test "spawn" {
+    let h1 = spawn(square, 3)
+    let h2 = spawn(square, 4)
+    assert join_int(h1) + join_int(h2) == 25
+}

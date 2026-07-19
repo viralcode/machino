@@ -1,0 +1,28 @@
+# 0/1 knapsack DP.
+fn knapsack(w: [int], v: [int], cap: int) -> int
+    requires len(w) == len(v) && cap >= 0
+{
+    let n = len(w)
+    let dp: [int] = []
+    for i in 0..(cap + 1) {
+        dp = push(dp, 0)
+    }
+    for i in 0..n {
+        let wi = w[i]
+        let vi = v[i]
+        let c = cap
+        while c >= wi {
+            dp[c] = max_int(dp[c], dp[c - wi] + vi)
+            c = c - 1
+        }
+    }
+    return dp[cap]
+}
+
+fn main() {
+    print(knapsack([2, 3, 4], [3, 4, 5], 5))
+}
+
+test "knapsack" {
+    assert knapsack([2, 3, 4], [3, 4, 5], 5) == 7
+}

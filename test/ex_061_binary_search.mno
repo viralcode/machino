@@ -1,0 +1,26 @@
+# Binary search on sorted ints.
+fn bsearch(xs: [int], v: int) -> int {
+    let lo = 0
+    let hi = len(xs)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if xs[mid] == v {
+            return mid
+        }
+        if xs[mid] < v {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return -1
+}
+
+fn main() {
+    print(bsearch([1, 3, 5, 7, 9], 7))
+}
+
+test "bsearch" {
+    assert bsearch([1, 3, 5, 7, 9], 7) == 3
+    assert bsearch([1, 3, 5, 7, 9], 2) == -1
+}

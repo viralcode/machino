@@ -1,0 +1,13 @@
+# Prelude sort_ints.
+fn main() {
+    let s = sort_ints([3, 1, 4, 1, 5])
+    print(s[0])
+    print(s[4])
+}
+
+test "sort_ints" {
+    let s = sort_ints([3, 1, 4, 1, 5])
+    assert s[0] == 1
+    assert s[4] == 5
+    assert index_of_int(s, 4) == 3
+}

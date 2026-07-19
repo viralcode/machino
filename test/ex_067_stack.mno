@@ -1,0 +1,41 @@
+# Stack via array push/pop pattern.
+struct Stack {
+    items: [int]
+}
+
+fn stack_new() -> Stack {
+    let items: [int] = []
+    return Stack(items)
+}
+
+fn stack_push(s: Stack, v: int) {
+    s.items = push(s.items, v)
+}
+
+fn stack_pop(s: Stack) -> int
+    requires len(s.items) > 0
+{
+    let i = len(s.items) - 1
+    let v = s.items[i]
+    let out: [int] = []
+    for j in 0..i {
+        out = push(out, s.items[j])
+    }
+    s.items = out
+    return v
+}
+
+fn main() {
+    let s = stack_new()
+    stack_push(s, 1)
+    stack_push(s, 2)
+    print(stack_pop(s))
+}
+
+test "stack" {
+    let s = stack_new()
+    stack_push(s, 1)
+    stack_push(s, 2)
+    assert stack_pop(s) == 2
+    assert stack_pop(s) == 1
+}

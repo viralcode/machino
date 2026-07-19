@@ -1,0 +1,16 @@
+# Struct holding an array.
+struct Vec3 {
+    xs: [int]
+}
+
+fn sum3(v: Vec3) -> int {
+    return sum_ints(v.xs)
+}
+
+fn main() {
+    print(sum3(Vec3([1, 2, 3])))
+}
+
+test "vec3" {
+    assert sum3(Vec3([1, 2, 3])) == 6
+}

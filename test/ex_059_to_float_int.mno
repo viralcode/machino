@@ -1,0 +1,10 @@
+# Explicit numeric conversions.
+fn main() {
+    print(str_of_float(to_float(7) + 0.5, 1))
+    print(to_int(3.9))
+}
+
+test "conversions" {
+    assert to_int(3.9) == 3
+    assert to_float(7) + 0.5 == 7.5
+}

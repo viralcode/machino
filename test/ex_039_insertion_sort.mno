@@ -1,0 +1,26 @@
+# Insertion sort.
+fn sort_copy(xs: [int]) -> [int] {
+    let out: [int] = []
+    for i in 0..len(xs) {
+        out = push(out, xs[i])
+        let j = len(out) - 1
+        while j > 0 && out[j - 1] > out[j] {
+            let t = out[j]
+            out[j] = out[j - 1]
+            out[j - 1] = t
+            j = j - 1
+        }
+    }
+    return out
+}
+
+fn main() {
+    let s = sort_copy([3, 1, 2])
+    print(s[0])
+}
+
+test "sort" {
+    let s = sort_copy([3, 1, 2])
+    assert s[0] == 1
+    assert s[2] == 3
+}

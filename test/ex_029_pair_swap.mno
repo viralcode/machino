@@ -1,0 +1,20 @@
+# Pair swap.
+struct Pair {
+    a: int
+    b: int
+}
+
+fn swap(p: Pair) -> Pair {
+    return Pair(p.b, p.a)
+}
+
+fn main() {
+    let p = swap(Pair(1, 2))
+    print(p.a)
+}
+
+test "swap" {
+    let p = swap(Pair(1, 2))
+    assert p.a == 2
+    assert p.b == 1
+}

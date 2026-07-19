@@ -1,0 +1,10 @@
+# Prelude sum_ints.
+fn main() {
+    print(sum_ints([1, 2, 3, 4, 5]))
+}
+
+test "sum" {
+    assert sum_ints([1, 2, 3, 4, 5]) == 15
+    let e: [int] = []
+    assert sum_ints(e) == 0
+}

@@ -1,0 +1,22 @@
+# Jagged nested arrays.
+fn flatten(xss: [[int]]) -> [int] {
+    let out: [int] = []
+    for i in 0..len(xss) {
+        let row = xss[i]
+        for j in 0..len(row) {
+            out = push(out, row[j])
+        }
+    }
+    return out
+}
+
+fn main() {
+    let flat = flatten([[1, 2], [3], [4, 5]])
+    print(len(flat))
+}
+
+test "flatten" {
+    let flat = flatten([[1, 2], [3], [4, 5]])
+    assert len(flat) == 5
+    assert flat[3] == 4
+}

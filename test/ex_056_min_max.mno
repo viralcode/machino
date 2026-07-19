@@ -1,0 +1,11 @@
+# min/max helpers.
+fn main() {
+    print(min_int(3, 9))
+    print(max_int(3, 9))
+}
+
+test "min max" {
+    assert min_int(3, 9) == 3
+    assert max_int(3, 9) == 9
+    assert min_float(1.5, 2.5) == 1.5
+}

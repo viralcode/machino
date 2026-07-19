@@ -1,0 +1,10 @@
+# Case folding and repeat.
+fn main() {
+    print(to_upper("AbC"))
+}
+
+test "case repeat" {
+    assert to_upper("AbC") == "ABC"
+    assert to_lower("AbC") == "abc"
+    assert repeat("ab", 3) == "ababab"
+}

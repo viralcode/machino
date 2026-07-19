@@ -1,0 +1,22 @@
+# Helper predicates.
+fn even(n: int) -> bool {
+    return n % 2 == 0
+}
+
+fn count_even(xs: [int]) -> int {
+    let c = 0
+    for i in 0..len(xs) {
+        if even(xs[i]) {
+            c = c + 1
+        }
+    }
+    return c
+}
+
+fn main() {
+    print(count_even([1, 2, 3, 4, 5]))
+}
+
+test "count even" {
+    assert count_even([1, 2, 3, 4, 5]) == 2
+}

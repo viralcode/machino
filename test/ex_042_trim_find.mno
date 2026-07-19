@@ -1,0 +1,12 @@
+# trim, find, contains, prefix/suffix.
+fn main() {
+    print(trim("  hi  "))
+}
+
+test "trim find" {
+    assert trim("  hi  ") == "hi"
+    assert find("hello", "ll") == 2
+    assert contains("hello", "ell")
+    assert starts_with("hello", "he")
+    assert ends_with("hello", "lo")
+}

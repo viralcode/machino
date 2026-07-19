@@ -1,0 +1,18 @@
+# Nested generic structs (Box of Box).
+struct<T> Box {
+    value: T
+}
+
+fn main() {
+    let inner = Box(7)
+    let outer = Box(inner)
+    print(outer.value.value)
+}
+
+test "nested box" {
+    let inner = Box(7)
+    let outer = Box(inner)
+    assert outer.value.value == 7
+    let s = Box(Box("ok"))
+    assert s.value.value == "ok"
+}

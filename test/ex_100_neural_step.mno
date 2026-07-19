@@ -1,0 +1,27 @@
+# Tiny linear layer forward pass.
+fn relu(x: float) -> float {
+    if x < 0.0 {
+        return 0.0
+    }
+    return x
+}
+
+fn forward(x0: float, x1: float, w: [float], b: [float]) -> [float]
+    requires len(w) == 4 && len(b) == 2
+{
+    let h0 = relu(w[0] * x0 + w[1] * x1 + b[0])
+    let h1 = relu(w[2] * x0 + w[3] * x1 + b[1])
+    return [h0, h1]
+}
+
+fn main() {
+    let h = forward(1.0, 2.0, [0.5, -1.0, 1.0, 0.25], [0.0, -0.5])
+    print(str_of_float(h[0], 2))
+    print(str_of_float(h[1], 2))
+}
+
+test "forward" {
+    let h = forward(1.0, 2.0, [0.5, -1.0, 1.0, 0.25], [0.0, -0.5])
+    assert abs_float(h[0] - 0.0) < 0.000001
+    assert abs_float(h[1] - 1.0) < 0.000001
+}

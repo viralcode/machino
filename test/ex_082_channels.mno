@@ -1,0 +1,16 @@
+# Channel send/recv ints.
+fn main() {
+    let ch = chan_new()
+    chan_send_int(ch, 11)
+    chan_send_int(ch, 22)
+    print(chan_recv_int(ch))
+    print(chan_recv_int(ch))
+    chan_close(ch)
+}
+
+test "chan" {
+    let ch = chan_new()
+    chan_send_int(ch, 7)
+    assert chan_recv_int(ch) == 7
+    chan_close(ch)
+}

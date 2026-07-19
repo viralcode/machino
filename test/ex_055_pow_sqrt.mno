@@ -1,0 +1,11 @@
+# pow_int, pow_float, sqrt.
+fn main() {
+    print(pow_int(2, 8))
+    print(str_of_float(sqrt(9.0), 1))
+}
+
+test "pow sqrt" {
+    assert pow_int(2, 8) == 256
+    assert abs_float(sqrt(9.0) - 3.0) < 0.000001
+    assert abs_float(pow_float(2.0, 3) - 8.0) < 0.000001
+}

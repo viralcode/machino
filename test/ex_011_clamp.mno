@@ -1,0 +1,19 @@
+# Multi-arg clamp.
+fn clamp(x: int, lo: int, hi: int) -> int {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+fn main() {
+    print(clamp(15, 0, 10))
+}
+
+test "clamp" {
+    assert clamp(-1, 0, 10) == 0
+    assert clamp(15, 0, 10) == 10
+}

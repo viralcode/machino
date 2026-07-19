@@ -1,0 +1,18 @@
+# Vector dot product.
+fn dot(a: [float], b: [float]) -> float
+    requires len(a) == len(b)
+{
+    let s = 0.0
+    for i in 0..len(a) {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+fn main() {
+    print(str_of_float(dot([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]), 1))
+}
+
+test "dot" {
+    assert abs_float(dot([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]) - 32.0) < 0.000001
+}

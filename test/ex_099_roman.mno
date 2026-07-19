@@ -1,0 +1,27 @@
+# Integer to Roman (1..20).
+fn to_roman(n: int) -> str
+    requires n >= 1 && n <= 20
+{
+    let vals = [10, 9, 5, 4, 1]
+    let syms = ["X", "IX", "V", "IV", "I"]
+    let out = ""
+    let x = n
+    for i in 0..len(vals) {
+        while x >= vals[i] {
+            out = out + syms[i]
+            x = x - vals[i]
+        }
+    }
+    return out
+}
+
+fn main() {
+    print(to_roman(14))
+}
+
+test "roman" {
+    assert to_roman(1) == "I"
+    assert to_roman(4) == "IV"
+    assert to_roman(14) == "XIV"
+    assert to_roman(20) == "XX"
+}

@@ -1,0 +1,36 @@
+# Bounded Levenshtein distance (DP).
+fn min3(a: int, b: int, c: int) -> int {
+    return min_int(a, min_int(b, c))
+}
+
+fn edit_dist(a: str, b: str) -> int {
+    let n = len(a)
+    let m = len(b)
+    let prev: [int] = []
+    for j in 0..(m + 1) {
+        prev = push(prev, j)
+    }
+    for i in 1..(n + 1) {
+        let cur: [int] = []
+        cur = push(cur, i)
+        for j in 1..(m + 1) {
+            let cost = 1
+            if char_at(a, i - 1) == char_at(b, j - 1) {
+                cost = 0
+            }
+            let v = min3(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            cur = push(cur, v)
+        }
+        prev = cur
+    }
+    return prev[m]
+}
+
+fn main() {
+    print(edit_dist("kitten", "sitting"))
+}
+
+test "edit" {
+    assert edit_dist("kitten", "sitting") == 3
+    assert edit_dist("abc", "abc") == 0
+}

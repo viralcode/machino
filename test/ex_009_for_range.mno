@@ -1,0 +1,16 @@
+# For-range triangular numbers.
+fn triangular(n: int) -> int {
+    let s = 0
+    for i in 1..(n + 1) {
+        s = s + i
+    }
+    return s
+}
+
+fn main() {
+    print(triangular(10))
+}
+
+test "triangular" {
+    assert triangular(10) == 55
+}
