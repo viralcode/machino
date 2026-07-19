@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::rc::Rc;
+use ureq;
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -512,6 +513,20 @@ impl<'a> Interp<'a> {
                 let val = std::env::var(as_string(&args[0])).unwrap_or_default();
                 Ok(Value::str_value(&val))
             }
+            "http_get" => {
+                check_sig!(
+                    vec![Type::Str],
+                    Type::Str,
+                    "extern fn http_get(url: str) -> str"
+                );
+                let url = as_string(&args[0]);
+                let body = match ureq::get(&url).call() {
+                    Ok(resp) => resp.into_string().unwrap_or_default(),
+                    Err(ureq::Error::Status(_, resp)) => resp.into_string().unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
+                Ok(Value::str_value(&body))
+            }
             "args" => {
                 check_sig!(
                     Vec::<Type>::new(),
@@ -626,7 +641,7 @@ impl<'a> Interp<'a> {
             other => Err(RuntimeError::new(
                 format!(
                     "extern '{}' is not provided by the machino native runtime. Available externs: \
-                     clock_ms, sleep_ms, read_file, write_file, file_exists, read_line, getenv, \
+                     clock_ms, sleep_ms, read_file, write_file, file_exists, read_line, getenv, http_get, \
                      args, exit, tcp_listen, tcp_accept, tcp_read, tcp_write, tcp_close. \
                      For other capabilities, compile with 'machino build' and provide the import \
                      from your own host.",

@@ -9,7 +9,9 @@
 //!
 //! Every heap object has a uniform 16-byte header for the garbage collector:
 //!   word 0 (meta):   bits 0..2 tag, bit 3 mark, bits 4.. count
-//!   word 1 (bitmap): for TAG_STRUCT, bit i set if payload word i is a pointer
+//!   word 1 (bitmap): for TAG_STRUCT, bit i set if payload word i is a pointer;
+//!   for TAG_BIGSTRUCT (>60 payload words) it holds the address of a static
+//!   multi-word bitmap in the data segment instead
 //!   payload at +16
 //! Tags: 0 = bytes (str, count = byte length), 1 = array of scalars,
 //! 2 = array of pointers (count = elements), 3 = struct/closure (count =
@@ -83,8 +85,15 @@ const BLOCK_VOID: u8 = 0x40;
 const TAG_BYTES: i64 = 0;
 const TAG_ARR: i64 = 1; // array of scalars
 const TAG_ARRP: i64 = 2; // array of pointers
-const TAG_STRUCT: i64 = 3; // struct or closure
+const TAG_STRUCT: i64 = 3; // struct or closure, inline pointer bitmap
+/// Struct/closure with more than [`INLINE_BITMAP_WORDS`] payload words: header
+/// word 1 holds the address of a static multi-word pointer bitmap in the data
+/// segment instead of an inline bitmap. Same size/layout otherwise.
+const TAG_BIGSTRUCT: i64 = 4;
 const TAG_FREE: i64 = 6; // free block (count = total size in bytes)
+
+/// Payload-word limit for the inline (single-word) pointer bitmap.
+const INLINE_BITMAP_WORDS: usize = 60;
 const MARK: i64 = 8;
 const HDR: i64 = 16;
 
@@ -100,8 +109,9 @@ const G_MSTOP: u32 = 6; // i64 mark-stack element count
 const G_HEAP_BASE: u32 = 7; // i32
 const G_SHADOW_BASE: u32 = 8; // i32
 
-const SHADOW_BYTES: u32 = 4 * 1024 * 1024;
-const MAX_PAGES: u64 = 16384; // 1 GiB
+/// Default shadow-stack size; `machino build --stack-mib N` overrides.
+const DEFAULT_SHADOW_BYTES: u32 = 16 * 1024 * 1024;
+const MAX_PAGES: u64 = 65536; // 4 GiB (the wasm32 address-space maximum)
 
 fn valtype(ty: &Type) -> u8 {
     match ty {
@@ -456,7 +466,7 @@ pub struct WasmCompiler<'a> {
     source: &'a str,
     signatures: HashMap<&'a str, (Vec<Type>, Type)>,
     struct_fields: HashMap<&'a str, &'a [Param]>,
-    struct_bitmap: HashMap<&'a str, u64>,
+    struct_bitmap: HashMap<&'a str, Vec<u64>>,
     enum_variants: HashMap<&'a str, &'a [EnumVariant]>,
     types: Vec<Vec<u8>>,
     type_index: HashMap<Vec<u8>, u32>,
@@ -493,6 +503,15 @@ pub struct WasmCompiler<'a> {
     h_mark_push: u32,
     h_gc_collect: u32,
     h_gc_maybe: u32,
+    shadow_bytes: u32,
+    // concurrency imports (present only when the program uses spawn/join)
+    imp_spawn: u32,
+    imp_join_i64: u32,
+    imp_join_f64: u32,
+    imp_join_str: u32,
+    /// Functions passed to spawn(); exported so worker instances can call
+    /// them by name.
+    spawn_targets: std::collections::BTreeSet<String>,
 }
 
 type Scope = Vec<HashMap<String, (u32, Type)>>;
@@ -534,7 +553,14 @@ enum Saved {
 }
 
 pub fn compile(program: &Program, source: &str) -> Vec<u8> {
-    WasmCompiler::new(program, source).compile()
+    compile_with_stack(program, source, DEFAULT_SHADOW_BYTES)
+}
+
+/// Compile with an explicit shadow-stack size (for `--stack-mib`).
+pub fn compile_with_stack(program: &Program, source: &str, shadow_bytes: u32) -> Vec<u8> {
+    let mut c = WasmCompiler::new(program, source);
+    c.shadow_bytes = shadow_bytes;
+    c.compile()
 }
 
 /// Conservative: an expression "can GC" if evaluating it may reach a
@@ -553,6 +579,44 @@ fn can_gc(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// One-character marshalling tag for the task_spawn host protocol.
+fn sig_char(ty: &Type) -> char {
+    match ty {
+        Type::Int => 'i',
+        Type::Bool => 'b',
+        Type::Float => 'f',
+        Type::Str => 's',
+        _ => 'p',
+    }
+}
+
+/// True if any reachable function (or test) calls spawn/join.
+fn program_uses_concurrency(program: &Program, reachable: &HashSet<String>) -> bool {
+    const CONC: &[&str] = &["spawn", "join_int", "join_float", "join_bool", "join_str"];
+    let mut names: Vec<&str> = Vec::new();
+    for f in &program.functions {
+        if f.is_extern || !reachable.contains(&f.name) {
+            continue;
+        }
+        collect_fn_names_stmts(&f.body, &mut names);
+    }
+    for t in &program.tests {
+        collect_fn_names_stmts(&t.body, &mut names);
+    }
+    names.iter().any(|n| CONC.contains(n))
+}
+
+/// Pointer bitmap for a struct's payload, one u64 per 64 fields.
+fn pointer_bitmap_words(fields: &[Param]) -> Vec<u64> {
+    let mut words = vec![0u64; fields.len().div_ceil(64).max(1)];
+    for (i, fld) in fields.iter().enumerate() {
+        if is_ptr(&fld.ty) {
+            words[i / 64] |= 1 << (i % 64);
+        }
+    }
+    words
 }
 
 fn reachable_functions(program: &Program) -> HashSet<String> {
@@ -784,6 +848,12 @@ impl<'a> WasmCompiler<'a> {
             h_mark_push: 0,
             h_gc_collect: 0,
             h_gc_maybe: 0,
+            shadow_bytes: DEFAULT_SHADOW_BYTES,
+            imp_spawn: 0,
+            imp_join_i64: 0,
+            imp_join_f64: 0,
+            imp_join_str: 0,
+            spawn_targets: std::collections::BTreeSet::new(),
         }
     }
 
@@ -838,6 +908,20 @@ impl<'a> WasmCompiler<'a> {
         addr
     }
 
+    /// Static multi-word pointer bitmap for a TAG_BIGSTRUCT object; returns
+    /// its address in the data segment (word i/64, bit i%64 <=> payload word
+    /// i is a pointer).
+    fn intern_bitmap(&mut self, words: &[u64]) -> u32 {
+        while self.data.len() % 8 != 0 {
+            self.data.push(0);
+        }
+        let addr = 8 + self.data.len() as u32;
+        for w in words {
+            self.data.extend_from_slice(&w.to_le_bytes());
+        }
+        addr
+    }
+
     /// A static closure object for a named function: [meta][0][table_slot].
     fn intern_singleton(&mut self, name: &str, slot: u32) -> u32 {
         if let Some(&addr) = self.singleton_addrs.get(name) {
@@ -867,13 +951,8 @@ impl<'a> WasmCompiler<'a> {
         }
         for s in &self.program.structs {
             self.struct_fields.insert(s.name.as_str(), &s.fields);
-            let mut bm = 0u64;
-            for (i, fld) in s.fields.iter().enumerate() {
-                if is_ptr(&fld.ty) {
-                    bm |= 1 << i;
-                }
-            }
-            self.struct_bitmap.insert(s.name.as_str(), bm);
+            self.struct_bitmap
+                .insert(s.name.as_str(), pointer_bitmap_words(&s.fields));
         }
         for e in &self.program.enums {
             self.enum_variants.insert(e.name.as_str(), &e.variants);
@@ -891,6 +970,23 @@ impl<'a> WasmCompiler<'a> {
             ("print_bool".to_string(), t_i64_void),
             ("print_str".to_string(), t_i64_void),
         ];
+        // task imports are added only when the program actually uses
+        // spawn/join, so ordinary modules run on hosts without thread support
+        let uses_concurrency = program_uses_concurrency(self.program, &reachable);
+        if uses_concurrency {
+            let t_spawn = self.get_type(&[VT_I64, VT_I64, VT_I64], &[VT_I64]);
+            let t_i64_i64 = self.get_type(&[VT_I64], &[VT_I64]);
+            let t_i64_f64 = self.get_type(&[VT_I64], &[VT_F64]);
+            self.imp_spawn = imports.len() as u32;
+            imports.push(("task_spawn".to_string(), t_spawn));
+            self.imp_join_i64 = imports.len() as u32;
+            imports.push(("task_join_i64".to_string(), t_i64_i64));
+            self.imp_join_f64 = imports.len() as u32;
+            imports.push(("task_join_f64".to_string(), t_i64_f64));
+            self.imp_join_str = imports.len() as u32;
+            imports.push(("task_join_str".to_string(), t_i64_i64));
+        }
+        let extern_base = imports.len() as u32;
         let externs: Vec<&Function> = self
             .program
             .functions
@@ -904,8 +1000,7 @@ impl<'a> WasmCompiler<'a> {
         }
         self.n_imports = imports.len() as u32;
         for (i, f) in externs.iter().enumerate() {
-            self.func_index
-                .insert(f.name.as_str(), N_RUNTIME_IMPORTS + i as u32);
+            self.func_index.insert(f.name.as_str(), extern_base + i as u32);
         }
 
         // -- lambdas and named-function values in reachable code --
@@ -1086,7 +1181,7 @@ impl<'a> WasmCompiler<'a> {
             end
         };
         let shadow_base = data_end;
-        let heap_base = shadow_base + SHADOW_BYTES;
+        let heap_base = shadow_base + self.shadow_bytes;
         let min_pages = (heap_base as u64 / 65536) + 17;
 
         // -- assemble --
@@ -1168,18 +1263,36 @@ impl<'a> WasmCompiler<'a> {
         // exports
         {
             let exported: Vec<&&Function> = user_fns.iter().filter(|f| !f.is_std).collect();
+            // spawn targets not already exported (std functions, for example)
+            // must be callable by name from worker instances
+            let extra: Vec<&str> = self
+                .spawn_targets
+                .iter()
+                .map(|s| s.as_str())
+                .filter(|n| !exported.iter().any(|f| f.name == *n))
+                .collect();
             let mut payload = Vec::new();
-            uleb(&mut payload, 2 + exported.len() as u64);
+            uleb(&mut payload, 3 + (exported.len() + extra.len()) as u64);
             write_name(&mut payload, "memory");
             payload.push(0x02);
             uleb(&mut payload, 0);
             write_name(&mut payload, "alloc");
             payload.push(0x00);
             uleb(&mut payload, self.h_alloc as u64);
+            // hosts use heap_base to tell static objects from heap objects
+            // when deep-copying spawn arguments
+            write_name(&mut payload, "heap_base");
+            payload.push(0x03);
+            uleb(&mut payload, G_HEAP_BASE as u64);
             for f in exported {
                 write_name(&mut payload, &f.name);
                 payload.push(0x00);
                 uleb(&mut payload, self.func_index[f.name.as_str()] as u64);
+            }
+            for n in extra {
+                write_name(&mut payload, n);
+                payload.push(0x00);
+                uleb(&mut payload, self.func_index[n] as u64);
             }
             section(&mut module, 7, &payload);
         }
@@ -2110,7 +2223,7 @@ impl<'a> WasmCompiler<'a> {
                 b.end();
             }
             b.end();
-            // struct/closure: trace fields flagged in the bitmap
+            // struct/closure: trace fields flagged in the inline bitmap
             b.local_get(tag);
             b.i64_const(TAG_STRUCT);
             b.i64_eq();
@@ -2131,6 +2244,66 @@ impl<'a> WasmCompiler<'a> {
                     b.br_if(1);
                     b.local_get(bm);
                     b.local_get(i);
+                    b.i64_shr_u();
+                    b.i64_const(1);
+                    b.i64_and();
+                    b.i64_eqz();
+                    b.i32_eqz();
+                    b.if_void();
+                    {
+                        b.local_get(obj);
+                        b.local_get(i);
+                        b.i64_const(3);
+                        b.i64_shl();
+                        b.i64_add();
+                        b.i32_wrap_i64();
+                        b.i64_load(HDR as u32);
+                        b.call(self.h_mark_push);
+                    }
+                    b.end();
+                    b.local_get(i);
+                    b.i64_const(1);
+                    b.i64_add();
+                    b.local_set(i);
+                    b.br(0);
+                }
+                b.end();
+                b.end();
+            }
+            b.end();
+            // big struct: header word 1 is the address of a static multi-word
+            // bitmap (word i/64, bit i%64) in the data segment
+            b.local_get(tag);
+            b.i64_const(TAG_BIGSTRUCT);
+            b.i64_eq();
+            b.if_void();
+            {
+                b.local_get(obj);
+                b.i32_wrap_i64();
+                b.i64_load(8);
+                b.local_set(bm); // bm = bitmap base address
+                b.i64_const(0);
+                b.local_set(i);
+                b.block_void();
+                b.loop_void();
+                {
+                    b.local_get(i);
+                    b.local_get(count);
+                    b.i64_ge_s();
+                    b.br_if(1);
+                    // bit = (load(bm + (i>>6)*8) >> (i & 63)) & 1
+                    b.local_get(bm);
+                    b.local_get(i);
+                    b.i64_const(6);
+                    b.i64_shr_u();
+                    b.i64_const(3);
+                    b.i64_shl();
+                    b.i64_add();
+                    b.i32_wrap_i64();
+                    b.i64_load(0);
+                    b.local_get(i);
+                    b.i64_const(63);
+                    b.i64_and();
                     b.i64_shr_u();
                     b.i64_const(1);
                     b.i64_and();
@@ -2993,12 +3166,18 @@ impl<'a> WasmCompiler<'a> {
                 }
                 self.lambda_captures.insert(l.id, captures.clone());
                 let ncaps = captures.len() as i64;
-                let mut bitmap: i64 = 0;
+                let words = 1 + captures.len(); // table slot + captures
+                let mut bm_words = vec![0u64; words.div_ceil(64)];
                 for (i, (_, ty)) in captures.iter().enumerate() {
                     if is_ptr(ty) {
-                        bitmap |= 1 << (i + 1);
+                        bm_words[(i + 1) / 64] |= 1 << ((i + 1) % 64);
                     }
                 }
+                let (tag, word1) = if words <= INLINE_BITMAP_WORDS {
+                    (TAG_STRUCT, bm_words[0] as i64)
+                } else {
+                    (TAG_BIGSTRUCT, self.intern_bitmap(&bm_words) as i64)
+                };
                 ctx.b.i64_const(HDR + 8 * (1 + ncaps));
                 ctx.b.call(self.h_alloc);
                 let tmp = ctx.b.new_local(VT_I64);
@@ -3007,11 +3186,11 @@ impl<'a> WasmCompiler<'a> {
                 self.frame_store(ctx, root);
                 ctx.b.local_get(tmp);
                 ctx.b.i32_wrap_i64();
-                ctx.b.i64_const((1 + ncaps) << 4 | TAG_STRUCT);
+                ctx.b.i64_const((1 + ncaps) << 4 | tag);
                 ctx.b.i64_store(0);
                 ctx.b.local_get(tmp);
                 ctx.b.i32_wrap_i64();
-                ctx.b.i64_const(bitmap);
+                ctx.b.i64_const(word1);
                 ctx.b.i64_store(8);
                 ctx.b.local_get(tmp);
                 ctx.b.i32_wrap_i64();
@@ -3431,6 +3610,74 @@ impl<'a> WasmCompiler<'a> {
                 self.expr(ctx, scope, &args[0], Some(&Type::Int));
                 ctx.b.call(self.h_chr);
             }
+            "spawn" => {
+                // spawn(f, args...) compiles to the task_spawn host import:
+                // the host deep-copies the argument graph out of this
+                // instance's memory and runs `f` in a fresh instance of the
+                // same module on another thread (shared-nothing).
+                let ExprKind::Var(target) = &args[0].kind else {
+                    unreachable!("validated by cmd_build: spawn target is a named function")
+                };
+                let target = target.clone();
+                let (params, ret) = self.signatures[target.as_str()].clone();
+                self.spawn_targets.insert(target.clone());
+                // signature string tells the host how to read the argv words
+                // and how to ship the result back: i/b/f scalars, s/p pointers
+                let mut sig: String = params.iter().map(sig_char).collect();
+                sig.push(':');
+                sig.push(sig_char(&ret));
+                let name_addr = self.intern(&target);
+                let sig_addr = self.intern(&sig);
+                // evaluate arguments into GC-safe temps
+                let ops: Vec<(&Expr, Option<Type>)> = args[1..]
+                    .iter()
+                    .zip(params.iter())
+                    .map(|(a, p)| (a, Some(p.clone())))
+                    .collect();
+                let saved = self.eval_to_temps(ctx, scope, &ops);
+                // pack them into a scalar array; no safepoint can run between
+                // filling it and the import call, so GC tracing is not needed
+                let n = saved.len() as i64;
+                ctx.b.i64_const(HDR + 8 * n);
+                ctx.b.call(self.h_alloc);
+                let argv = ctx.b.new_local(VT_I64);
+                ctx.b.local_set(argv);
+                ctx.b.local_get(argv);
+                ctx.b.i32_wrap_i64();
+                ctx.b.i64_const(n << 4 | TAG_ARR);
+                ctx.b.i64_store(0);
+                ctx.b.local_get(argv);
+                ctx.b.i32_wrap_i64();
+                ctx.b.i64_const(0);
+                ctx.b.i64_store(8);
+                for (i, (s, p)) in saved.iter().zip(params.iter()).enumerate() {
+                    ctx.b.local_get(argv);
+                    ctx.b.i32_wrap_i64();
+                    self.reload(ctx, s);
+                    let off = HDR as u32 + 8 * i as u32;
+                    if *p == Type::Float {
+                        ctx.b.f64_store(off);
+                    } else {
+                        ctx.b.i64_store(off);
+                    }
+                }
+                ctx.b.i64_const(name_addr as i64);
+                ctx.b.i64_const(sig_addr as i64);
+                ctx.b.local_get(argv);
+                ctx.b.call(self.imp_spawn);
+            }
+            "join_int" | "join_bool" => {
+                self.expr(ctx, scope, &args[0], Some(&Type::Int));
+                ctx.b.call(self.imp_join_i64);
+            }
+            "join_float" => {
+                self.expr(ctx, scope, &args[0], Some(&Type::Int));
+                ctx.b.call(self.imp_join_f64);
+            }
+            "join_str" => {
+                self.expr(ctx, scope, &args[0], Some(&Type::Int));
+                ctx.b.call(self.imp_join_str);
+            }
             _ => {
                 // check if this is an enum variant constructor (Enum::Variant)
                 if let Some(colon_pos) = name.rfind("::") {
@@ -3491,8 +3738,15 @@ impl<'a> WasmCompiler<'a> {
                 }
                 // struct constructor
                 if let Some(fields) = self.struct_fields.get(name).map(|f| f.to_vec()) {
-                    let bitmap = self.struct_bitmap[name] as i64;
+                    let bm_words = self.struct_bitmap[name].clone();
                     let n = fields.len() as i64;
+                    // small structs keep the pointer bitmap inline in header
+                    // word 1; larger ones point at a static multi-word bitmap
+                    let (tag, word1) = if fields.len() <= INLINE_BITMAP_WORDS {
+                        (TAG_STRUCT, bm_words[0] as i64)
+                    } else {
+                        (TAG_BIGSTRUCT, self.intern_bitmap(&bm_words) as i64)
+                    };
                     ctx.b.i64_const(HDR + 8 * n);
                     ctx.b.call(self.h_alloc);
                     let tmp = ctx.b.new_local(VT_I64);
@@ -3501,11 +3755,11 @@ impl<'a> WasmCompiler<'a> {
                     self.frame_store(ctx, root);
                     ctx.b.local_get(tmp);
                     ctx.b.i32_wrap_i64();
-                    ctx.b.i64_const(n << 4 | TAG_STRUCT);
+                    ctx.b.i64_const(n << 4 | tag);
                     ctx.b.i64_store(0);
                     ctx.b.local_get(tmp);
                     ctx.b.i32_wrap_i64();
-                    ctx.b.i64_const(bitmap);
+                    ctx.b.i64_const(word1);
                     ctx.b.i64_store(8);
                     for (i, (fld, arg)) in fields.iter().zip(args).enumerate() {
                         ctx.b.local_get(tmp);
@@ -3588,8 +3842,12 @@ impl<'a> WasmCompiler<'a> {
                 match name.as_str() {
                     "print" => Type::Unit,
                     "len" | "to_int" | "char_at" => Type::Int,
+                    "spawn" | "join_int" => Type::Int,
+                    "join_bool" => Type::Bool,
                     "to_float" => Type::Float,
+                    "join_float" => Type::Float,
                     "substr" | "chr" => Type::Str,
+                    "join_str" => Type::Str,
                     "push" => match self.type_of(&args[0], scope) {
                         t @ Type::Array(_) => t,
                         _ => Type::Array(Box::new(Type::Int)),

@@ -600,9 +600,34 @@ fn cmd_run(rest: &[String]) -> ExitCode {
 
 fn cmd_build(rest: &[String]) -> ExitCode {
     let use_gc = rest.iter().any(|a| a == "--gc");
-    let Some(path) = parse_file_arg(rest, "build") else {
+    let stack_mib: u32 = rest
+        .iter()
+        .position(|a| a == "--stack-mib")
+        .and_then(|i| rest.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    // drop flag-value pairs so the positional file argument is found correctly
+    let positional: Vec<String> = {
+        let mut out = Vec::new();
+        let mut skip = false;
+        for a in rest {
+            if skip {
+                skip = false;
+                continue;
+            }
+            if a == "-o" || a == "--stack-mib" {
+                skip = true;
+                continue;
+            }
+            out.push(a.clone());
+        }
+        out
+    };
+    let Some(path) = parse_file_arg(&positional, "build") else {
         return ExitCode::from(2);
     };
+    let path = path.to_string();
+    let path = path.as_str();
     let out_path = rest
         .iter()
         .position(|a| a == "-o")
@@ -627,13 +652,18 @@ fn cmd_build(rest: &[String]) -> ExitCode {
         eprintln!("error: 'machino build' requires a 'fn main()' entry point");
         return ExitCode::FAILURE;
     }
-    if let Some(span) = find_concurrency_use(&loaded.program) {
-        let d = Diagnostic::new(
-            "E072",
-            "spawn/join are interpreter-only: WebAssembly has no threads in this backend",
-            span,
-        )
-        .with_help("run concurrent programs with 'machino run'; compiled builds must be sequential");
+    if use_gc {
+        if let Some(span) = find_concurrency_use(&loaded.program) {
+            let d = Diagnostic::new(
+                "E072",
+                "the WASM-GC backend has no thread support; use the default backend for spawn/join",
+                span,
+            )
+            .with_help("compile without --gc, or run with 'machino run'");
+            eprintln!("{}", loaded.render_error(&d));
+            return ExitCode::FAILURE;
+        }
+    } else if let Some(d) = validate_spawn_targets(&loaded.program) {
         eprintln!("{}", loaded.render_error(&d));
         return ExitCode::FAILURE;
     }
@@ -646,7 +676,7 @@ fn cmd_build(rest: &[String]) -> ExitCode {
             }
         }
     } else {
-        wasm::compile(&loaded.program, &loaded.bundle)
+        wasm::compile_with_stack(&loaded.program, &loaded.bundle, stack_mib * 1024 * 1024)
     };
     match std::fs::write(&out_path, &bytes) {
         Ok(()) => {
@@ -665,8 +695,85 @@ fn cmd_build(rest: &[String]) -> ExitCode {
     }
 }
 
-/// Returns the span of the first spawn/join call, if any. The WASM backends
-/// have no thread support, so `machino build` rejects these programs.
+/// Compiled spawn runs the target in a fresh module instance on another
+/// thread, located by its export name — so the first argument must be a
+/// named top-level function, not a lambda or a variable holding one.
+fn validate_spawn_targets(program: &ast::Program) -> Option<Diagnostic> {
+    fn in_expr(e: &ast::Expr, fns: &std::collections::HashSet<&str>) -> Option<Diagnostic> {
+        use ast::ExprKind::*;
+        match &e.kind {
+            Call(name, args) => {
+                if name == "spawn" {
+                    let ok = matches!(&args[0].kind, Var(n) if fns.contains(n.as_str()));
+                    if !ok {
+                        return Some(
+                            Diagnostic::new(
+                                "E074",
+                                "compiled spawn requires a named top-level function as its first argument",
+                                args[0].span,
+                            )
+                            .with_help(
+                                "lambdas and function-typed variables can be spawned by the interpreter only; name the function at top level",
+                            ),
+                        );
+                    }
+                }
+                args.iter().find_map(|a| in_expr(a, fns))
+            }
+            Array(elems) => elems.iter().find_map(|a| in_expr(a, fns)),
+            Index(a, b) | Bin(_, a, b) => in_expr(a, fns).or_else(|| in_expr(b, fns)),
+            Field(a, _) | Un(_, a) => in_expr(a, fns),
+            Lambda(l) => in_stmts(&l.body, fns),
+            Match(m) => in_expr(&m.scrutinee, fns)
+                .or_else(|| m.arms.iter().find_map(|arm| in_expr(&arm.body, fns))),
+            _ => None,
+        }
+    }
+    fn in_stmts(
+        stmts: &[ast::Stmt],
+        fns: &std::collections::HashSet<&str>,
+    ) -> Option<Diagnostic> {
+        use ast::StmtKind::*;
+        stmts.iter().find_map(|s| match &s.kind {
+            Let { value, .. } | Assign { value, .. } => in_expr(value, fns),
+            IndexAssign { base, index, value } => in_expr(base, fns)
+                .or_else(|| in_expr(index, fns))
+                .or_else(|| in_expr(value, fns)),
+            FieldAssign { base, value, .. } => {
+                in_expr(base, fns).or_else(|| in_expr(value, fns))
+            }
+            If {
+                cond,
+                then_body,
+                else_body,
+            } => in_expr(cond, fns)
+                .or_else(|| in_stmts(then_body, fns))
+                .or_else(|| in_stmts(else_body, fns)),
+            While { cond, body } => in_expr(cond, fns).or_else(|| in_stmts(body, fns)),
+            For {
+                start, end, body, ..
+            } => in_expr(start, fns)
+                .or_else(|| in_expr(end, fns))
+                .or_else(|| in_stmts(body, fns)),
+            Return(Some(e)) | Assert(e) | Expr(e) => in_expr(e, fns),
+            _ => None,
+        })
+    }
+    let fns: std::collections::HashSet<&str> = program
+        .functions
+        .iter()
+        .filter(|f| !f.is_extern)
+        .map(|f| f.name.as_str())
+        .collect();
+    program
+        .functions
+        .iter()
+        .find_map(|f| in_stmts(&f.body, &fns))
+}
+
+/// Returns the span of the first spawn/join call, if any. The WASM-GC
+/// backend has no thread support, so `machino build --gc` rejects these
+/// programs.
 fn find_concurrency_use(program: &ast::Program) -> Option<Span> {
     const CONCURRENCY: &[&str] = &["spawn", "join_int", "join_float", "join_bool", "join_str"];
     fn in_expr(e: &ast::Expr) -> Option<Span> {

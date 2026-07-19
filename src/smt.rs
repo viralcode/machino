@@ -1,14 +1,19 @@
 //! Static contract verification with the Z3 SMT solver (`machino check
 //! --verify`, requires building with `--features smt`).
 //!
-//! The decidable subset: loop-free function bodies over int/bool (plus
-//! `len(arr)` treated as a symbolic non-negative int). The verifier runs the
-//! body symbolically, collecting a (path condition, result) pair per return
-//! path, then asks Z3 to prove every `ensures` clause on every path under the
-//! `requires` assumptions. It also flags contradictory `requires` clauses
-//! (contracts that no input can satisfy). Functions outside the subset
-//! (loops, calls, floats, strings, mutation of arrays) report `unknown` and
-//! fall back to machino's always-on runtime contract enforcement.
+//! The decidable subset: function bodies over int/bool (plus `len(arr)`
+//! treated as a symbolic non-negative int), where
+//! - calls to other user/std functions with int/bool signatures are inlined
+//!   (up to depth 8; recursion past that reports `unknown`), and
+//! - `for` loops whose bounds simplify to constants are unrolled (up to 128
+//!   iterations).
+//! The verifier runs the body symbolically, collecting a (path condition,
+//! result) pair per return path, then asks Z3 to prove every `ensures`
+//! clause on every path under the `requires` assumptions. It also flags
+//! contradictory `requires` clauses (contracts that no input can satisfy).
+//! Functions outside the subset (while loops, floats, strings, mutation of
+//! arrays) report `unknown` and fall back to machino's always-on runtime
+//! contract enforcement.
 
 #![allow(dead_code)]
 
@@ -70,7 +75,7 @@ mod z3impl {
         }
     }
 
-    struct SymState<'ctx> {
+    struct SymState<'ctx, 'p> {
         ctx: &'ctx Context,
         /// symbolic environment: variable -> value
         env: HashMap<String, Val<'ctx>>,
@@ -81,6 +86,10 @@ mod z3impl {
         selects: HashMap<String, Int<'ctx>>,
         /// struct field symbols: "base.field" -> int symbol
         fields: HashMap<String, Int<'ctx>>,
+        /// program functions by name, for call inlining
+        fns: &'p HashMap<String, &'p Function>,
+        /// current call-inlining depth
+        depth: usize,
         fresh: usize,
     }
 
@@ -90,10 +99,74 @@ mod z3impl {
         result: Option<Val<'ctx>>,
     }
 
-    impl<'ctx> SymState<'ctx> {
+    const MAX_INLINE_DEPTH: usize = 8;
+    const MAX_UNROLL: i64 = 128;
+
+    impl<'ctx, 'p> SymState<'ctx, 'p> {
         fn fresh_int(&mut self, hint: &str) -> Int<'ctx> {
             self.fresh += 1;
             Int::new_const(self.ctx, format!("{}!{}", hint, self.fresh))
+        }
+
+        /// Inlines a call to a user/std function with an int/bool signature:
+        /// executes the callee body symbolically on the translated arguments
+        /// and folds its return paths into one if-then-else value.
+        fn inline_call(&mut self, name: &str, args: &[Expr]) -> Result<Val<'ctx>, String> {
+            let Some(&f) = self.fns.get(name) else {
+                return Err(format!("call to '{}' is outside the decidable subset", name));
+            };
+            if self.depth >= MAX_INLINE_DEPTH {
+                return Err(format!(
+                    "call to '{}' exceeds the inlining depth limit ({}); recursion cannot be verified statically",
+                    name, MAX_INLINE_DEPTH
+                ));
+            }
+            if f.params.len() != args.len() {
+                return Err(format!("wrong argument count for '{}'", name));
+            }
+            if !matches!(f.ret, Type::Int | Type::Bool) {
+                return Err(format!(
+                    "'{}' returns '{}' (only int/bool calls can be inlined)",
+                    name, f.ret
+                ));
+            }
+            let mut vals = Vec::new();
+            for (p, a) in f.params.iter().zip(args) {
+                if !matches!(p.ty, Type::Int | Type::Bool) {
+                    return Err(format!(
+                        "'{}' takes '{}' (only int/bool calls can be inlined)",
+                        name, p.ty
+                    ));
+                }
+                vals.push(self.translate(a)?);
+            }
+            let saved_env = std::mem::take(&mut self.env);
+            for (p, v) in f.params.iter().zip(vals) {
+                self.env.insert(p.name.clone(), v);
+            }
+            self.depth += 1;
+            let t = Bool::from_bool(self.ctx, true);
+            let mut paths: Vec<RetPath<'ctx>> = Vec::new();
+            let res = self.exec_block(&f.body, &t, &mut paths);
+            self.depth -= 1;
+            self.env = saved_env;
+            if res?.is_some() {
+                return Err(format!("'{}' can fall off the end of its body", name));
+            }
+            let mut it = paths.into_iter().rev();
+            let last = it
+                .next()
+                .ok_or_else(|| format!("'{}' has no return paths", name))?;
+            let mut acc = last
+                .result
+                .ok_or_else(|| format!("'{}' returns unit", name))?;
+            for p in it {
+                let r = p
+                    .result
+                    .ok_or_else(|| format!("'{}' returns unit", name))?;
+                acc = Val::ite(&p.cond, &r, &acc)?;
+            }
+            Ok(acc)
         }
 
         fn translate(&mut self, expr: &Expr) -> Result<Val<'ctx>, String> {
@@ -114,7 +187,7 @@ mod z3impl {
                         }
                         return Err("len() is only symbolic for array parameters".to_string());
                     }
-                    Err(format!("call to '{}' is outside the decidable subset", name))
+                    self.inline_call(name, args)
                 }
                 ExprKind::Index(base, idx) => {
                     // arr[i] is an uninterpreted int per (array, index-text);
@@ -187,15 +260,19 @@ mod z3impl {
         }
 
         /// Symbolically executes a block. Completed return paths accumulate
-        /// in `paths` (with `cond` = the path condition). Returns Ok(true)
-        /// if control can fall through the end of the block.
+        /// in `paths` (with their exact path condition). Returns the path
+        /// condition under which control falls through the end of the block,
+        /// or None if every path returned.
         fn exec_block(
             &mut self,
             stmts: &[Stmt],
             cond: &Bool<'ctx>,
             paths: &mut Vec<RetPath<'ctx>>,
-        ) -> Result<bool, String> {
-            for (i, stmt) in stmts.iter().enumerate() {
+        ) -> Result<Option<Bool<'ctx>>, String> {
+            // the condition under which execution reaches the current
+            // statement; narrows when a branch of an if returns
+            let mut cur = cond.clone();
+            for stmt in stmts.iter() {
                 match &stmt.kind {
                     StmtKind::Let { name, value, .. } => {
                         let v = self.translate(value)?;
@@ -211,10 +288,10 @@ mod z3impl {
                             None => None,
                         };
                         paths.push(RetPath {
-                            cond: cond.clone(),
+                            cond: cur.clone(),
                             result,
                         });
-                        return Ok(false);
+                        return Ok(None);
                     }
                     StmtKind::Assert(e) => {
                         // asserts are runtime-enforced; treat as path assumption
@@ -226,8 +303,8 @@ mod z3impl {
                         else_body,
                     } => {
                         let cv = self.translate(c)?.as_bool()?.clone();
-                        let then_cond = Bool::and(self.ctx, &[cond, &cv]);
-                        let else_cond = Bool::and(self.ctx, &[cond, &cv.not()]);
+                        let then_cond = Bool::and(self.ctx, &[&cur, &cv]);
+                        let else_cond = Bool::and(self.ctx, &[&cur, &cv.not()]);
 
                         let saved_env = self.env.clone();
                         let then_falls = self.exec_block(then_body, &then_cond, paths)?;
@@ -235,8 +312,8 @@ mod z3impl {
                         let else_falls = self.exec_block(else_body, &else_cond, paths)?;
 
                         match (then_falls, else_falls) {
-                            (false, false) => return Ok(false),
-                            (true, true) => {
+                            (None, None) => return Ok(None),
+                            (Some(tc), Some(ec)) => {
                                 // merge: x = ite(cond, then_x, else_x)
                                 let else_env = self.env.clone();
                                 let mut merged = HashMap::new();
@@ -248,46 +325,91 @@ mod z3impl {
                                 // variables introduced only in the then-branch
                                 // are out of scope after the if; skip them
                                 self.env = merged;
+                                cur = Bool::or(self.ctx, &[&tc, &ec]);
                             }
-                            (true, false) => {
+                            (Some(tc), None) => {
                                 // only the then-branch continues
                                 self.env = then_env;
-                                let rest = &stmts[i + 1..];
-                                return self.exec_block(rest, &then_cond, paths);
+                                cur = tc;
                             }
-                            (false, true) => {
-                                let rest = &stmts[i + 1..];
-                                return self.exec_block(rest, &else_cond, paths);
+                            (None, Some(ec)) => {
+                                cur = ec;
                             }
                         }
+                    }
+                    StmtKind::For {
+                        var,
+                        start,
+                        end,
+                        body,
+                    } => {
+                        // unroll for-loops whose bounds simplify to constants
+                        let s = self.translate(start)?.as_int()?.clone();
+                        let e = self.translate(end)?.as_int()?.clone();
+                        let (Some(sc), Some(ec)) =
+                            (s.simplify().as_i64(), e.simplify().as_i64())
+                        else {
+                            return Err(
+                                "only 'for' loops with constant bounds can be unrolled"
+                                    .to_string(),
+                            );
+                        };
+                        if ec.saturating_sub(sc) > MAX_UNROLL {
+                            return Err(format!(
+                                "loop runs {} iterations; the unrolling limit is {}",
+                                ec - sc,
+                                MAX_UNROLL
+                            ));
+                        }
+                        for k in sc..ec {
+                            self.env
+                                .insert(var.clone(), Val::Int(Int::from_i64(self.ctx, k)));
+                            match self.exec_block(body, &cur, paths)? {
+                                Some(c) => cur = c,
+                                None => {
+                                    self.env.remove(var);
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                        self.env.remove(var);
                     }
                     StmtKind::Expr(_) => {
                         // pure expression statements can't affect the result
                     }
-                    StmtKind::While { .. } | StmtKind::For { .. } => {
-                        return Err("loops are outside the decidable subset".to_string());
+                    StmtKind::While { .. } => {
+                        return Err(
+                            "while loops are outside the decidable subset (use a bounded for loop)"
+                                .to_string(),
+                        );
                     }
                     _ => {
                         return Err("statement is outside the decidable subset".to_string());
                     }
                 }
             }
-            Ok(true)
+            Ok(Some(cur))
         }
     }
 
     pub fn verify_program(program: &Program) -> Vec<FunctionReport> {
+        let fns: HashMap<String, &Function> = program
+            .functions
+            .iter()
+            .filter(|f| !f.is_extern)
+            .map(|f| (f.name.clone(), f))
+            .collect();
         program
             .functions
             .iter()
             .filter(|f| {
                 !f.is_std && !f.is_extern && (!f.ensures.is_empty() || !f.requires.is_empty())
             })
-            .map(verify_function)
+            .map(|f| verify_function(f, &fns))
             .collect()
     }
 
-    pub fn verify_function(f: &Function) -> FunctionReport {
+    pub fn verify_function(f: &Function, fns: &HashMap<String, &Function>) -> FunctionReport {
         let cfg = Config::new();
         let ctx = Context::new(&cfg);
 
@@ -297,6 +419,8 @@ mod z3impl {
             lens: HashMap::new(),
             selects: HashMap::new(),
             fields: HashMap::new(),
+            fns,
+            depth: 0,
             fresh: 0,
         };
 

@@ -1,0 +1,290 @@
+# A shortest-path maze solver written in machino.
+# It parses an ASCII dungeon, runs breadth-first search, reconstructs the
+# shortest path, and renders the solved maze with `*`.
+
+struct Maze {
+    width: int
+    height: int
+    cells: [Tile]
+    start: int
+    goal: int
+}
+
+struct PathReport {
+    steps: int
+    visited: int
+    path: [int]
+    moves: str
+    solved: str
+}
+
+enum Tile {
+    Wall
+    Open
+    Start
+    Goal
+}
+
+enum SearchResult {
+    NoPath
+    Found(PathReport)
+}
+
+fn sample_maze() -> str {
+    return ("#########\n"
+        + "#S#....G#\n"
+        + "#.#.#####\n"
+        + "#.#.....#\n"
+        + "#.#####.#\n"
+        + "#.......#\n"
+        + "#########")
+}
+
+fn blocked_maze() -> str {
+    return ("#####\n"
+        + "#S###\n"
+        + "###G#\n"
+        + "#####")
+}
+
+fn tile_from_byte(c: int) -> Tile {
+    if c == 35 {
+        return Tile::Wall
+    }
+    if c == 46 {
+        return Tile::Open
+    }
+    if c == 83 {
+        return Tile::Start
+    }
+    return Tile::Goal
+}
+
+fn tile_to_str(tile: Tile) -> str {
+    return match tile {
+        Tile::Wall => "#"
+        Tile::Open => "."
+        Tile::Start => "S"
+        Tile::Goal => "G"
+    }
+}
+
+fn is_walkable(tile: Tile) -> bool {
+    return match tile {
+        Tile::Wall => false
+        _ => true
+    }
+}
+
+fn parse_maze(text: str) -> Maze {
+    let lines = split(trim(text), "\n")
+    let width = len(lines[0])
+    let cells: [Tile] = []
+    let start = - 1
+    let goal = - 1
+
+    for y in 0..len(lines) {
+        let line = lines[y]
+        assert len(line) == width
+        for x in 0..len(line) {
+            let b = char_at(line, x)
+            let tile = tile_from_byte(b)
+            cells = push(cells, tile)
+            let idx = y * width + x
+            if b == 83 {
+                start = idx
+            } else if b == 71 {
+                goal = idx
+            }
+        }
+    }
+
+    assert start != - 1
+    assert goal != - 1
+    return Maze(width, len(lines), cells, start, goal)
+}
+
+fn make_int_array(n: int, value: int) -> [int] {
+    let xs: [int] = []
+    for i in 0..n {
+        xs = push(xs, value)
+    }
+    return xs
+}
+
+fn reverse_ints(xs: [int]) -> [int] {
+    let out: [int] = []
+    let i = len(xs) - 1
+    while i >= 0 {
+        out = push(out, xs[i])
+        i = i - 1
+    }
+    return out
+}
+
+fn move_char(a: int, b: int, width: int) -> str {
+    if b == a + 1 {
+        return "R"
+    }
+    if b == a - 1 {
+        return "L"
+    }
+    if b == a + width {
+        return "D"
+    }
+    return "U"
+}
+
+fn moves_from_path(path: [int], width: int) -> str {
+    if len(path) < 2 {
+        return ""
+    }
+    let out = ""
+    for i in 1..len(path) {
+        out = out + move_char(path[i - 1], path[i], width)
+    }
+    return out
+}
+
+fn render_solution(maze: Maze, path: [int]) -> str {
+    let marks = make_int_array(len(maze.cells), 0)
+    for i in 0..len(path) {
+        marks[path[i]] = 1
+    }
+
+    let out = ""
+    for y in 0..maze.height {
+        for x in 0..maze.width {
+            let idx = y * maze.width + x
+            if idx != maze.start && idx != maze.goal && marks[idx] == 1 {
+                out = out + "*"
+            } else {
+                out = out + tile_to_str(maze.cells[idx])
+            }
+        }
+        if y + 1 < maze.height {
+            out = out + "\n"
+        }
+    }
+    return out
+}
+
+fn solve_maze(maze: Maze) -> SearchResult {
+    let queue: [int] = [maze.start]
+    let dist = make_int_array(len(maze.cells), - 1)
+    let parent = make_int_array(len(maze.cells), - 1)
+    let head = 0
+    let visited = 0
+
+    dist[maze.start] = 0
+
+    while head < len(queue) {
+        let idx = queue[head]
+        head = head + 1
+        visited = visited + 1
+        if idx == maze.goal {
+            break
+        }
+
+        let x = idx % maze.width
+        let y = idx / maze.width
+
+        if x + 1 < maze.width {
+            let n = idx + 1
+            if dist[n] == - 1 && is_walkable(maze.cells[n]) {
+                dist[n] = dist[idx] + 1
+                parent[n] = idx
+                queue = push(queue, n)
+            }
+        }
+        if x > 0 {
+            let n = idx - 1
+            if dist[n] == - 1 && is_walkable(maze.cells[n]) {
+                dist[n] = dist[idx] + 1
+                parent[n] = idx
+                queue = push(queue, n)
+            }
+        }
+        if y + 1 < maze.height {
+            let n = idx + maze.width
+            if dist[n] == - 1 && is_walkable(maze.cells[n]) {
+                dist[n] = dist[idx] + 1
+                parent[n] = idx
+                queue = push(queue, n)
+            }
+        }
+        if y > 0 {
+            let n = idx - maze.width
+            if dist[n] == - 1 && is_walkable(maze.cells[n]) {
+                dist[n] = dist[idx] + 1
+                parent[n] = idx
+                queue = push(queue, n)
+            }
+        }
+    }
+
+    if dist[maze.goal] == - 1 {
+        return SearchResult::NoPath
+    }
+
+    let rev: [int] = []
+    let cur = maze.goal
+    while cur != - 1 {
+        rev = push(rev, cur)
+        cur = parent[cur]
+    }
+    let path = reverse_ints(rev)
+    let solved = render_solution(maze, path)
+    let moves = moves_from_path(path, maze.width)
+    return SearchResult::Found(PathReport(len(path) - 1, visited, path, moves, solved))
+}
+
+fn describe(result: SearchResult) -> str {
+    return match result {
+        SearchResult::NoPath => "no path"
+        SearchResult::Found(r) => ("steps=" + str_of_int(r.steps)
+            + " visited=" + str_of_int(r.visited)
+            + " moves=" + r.moves
+            + "\n"
+            + r.solved)
+    }
+}
+
+fn main() {
+    let maze = parse_maze(sample_maze())
+    let result = solve_maze(maze)
+    print(describe(result))
+}
+
+test "parses maze dimensions and endpoints" {
+    let maze = parse_maze(sample_maze())
+    assert maze.width == 9
+    assert maze.height == 7
+    assert maze.start == 10
+    assert maze.goal == 16
+}
+
+test "finds shortest path through winding corridor" {
+    let maze = parse_maze(sample_maze())
+    let result = solve_maze(maze)
+    let ok = match result {
+        SearchResult::NoPath => false
+        SearchResult::Found(r) => r.steps == 22 && r.moves == "DDDDRRRRRRUULLLLUURRRR" && len(r.path) == 23
+    }
+    assert ok
+}
+
+test "reports blocked mazes" {
+    let maze = parse_maze(blocked_maze())
+    let result = solve_maze(maze)
+    let blocked = match result {
+        SearchResult::NoPath => true
+        SearchResult::Found(_) => false
+    }
+    assert blocked
+}
+
+test "rendered solution snapshot" expects "steps=22 visited=23 moves=DDDDRRRRRRUULLLLUURRRR\n#########\n#S#****G#\n#*#*#####\n#*#*****#\n#*#####*#\n#*******#\n#########" {
+    let maze = parse_maze(sample_maze())
+    print(describe(solve_maze(maze)))
+}

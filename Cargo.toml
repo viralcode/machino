@@ -8,15 +8,15 @@ license = "MIT"
 [dependencies]
 # SHA-256 for package content hashing
 sha2 = "0.10"
-# HTTP client for package registry
-ureq = { version = "2.9", optional = true }
+# HTTP client for package registry and native runtime fetches
+ureq = "2.9"
 # Z3 SMT solver for contract verification
 z3 = { version = "0.12", optional = true }
 
 [features]
 default = []
 smt = ["z3"]
-registry = ["ureq"]
+registry = []
 
 [profile.release]
 opt-level = 3

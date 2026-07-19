@@ -240,21 +240,6 @@ impl<'a> Checker<'a> {
                 ));
                 continue;
             }
-            if s.fields.len() > 60 {
-                self.diags.push(
-                    Diagnostic::new(
-                        "E050",
-                        format!(
-                            "struct '{}' has {} fields; the maximum is 60",
-                            s.name,
-                            s.fields.len()
-                        ),
-                        s.span,
-                    )
-                    .with_help("split large structs into nested structs"),
-                );
-                continue;
-            }
             let mut seen: HashMap<&str, ()> = HashMap::new();
             for f in &s.fields {
                 if seen.insert(&f.name, ()).is_some() {

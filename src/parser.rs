@@ -42,17 +42,7 @@ impl<'a> Parser<'a> {
                 let tname = self.parse_ident("type parameter")?;
                 let mut bounds = Vec::new();
                 if self.eat(&Tok::Colon) {
-                    let bspan = self.peek_span();
-                    let bound = self.parse_ident("constraint name")?;
-                    if !VALID_BOUNDS.contains(&bound.as_str()) {
-                        return Err(Diagnostic::new(
-                            "E067",
-                            format!("unknown constraint '{}'", bound),
-                            bspan,
-                        )
-                        .with_help("valid constraints: Eq (== !=), Ord (< <= > >=), Num (+ - * /)"));
-                    }
-                    bounds.push(bound);
+                    bounds = self.parse_bounds()?;
                 }
                 self.current_type_params.push(tname.clone());
                 type_params.push(TypeParam {
@@ -67,6 +57,62 @@ impl<'a> Parser<'a> {
             self.expect(Tok::Gt, "'>' after type parameters")?;
         }
         Ok(type_params)
+    }
+
+    /// Parses `Bound` or `Bound + Bound + ...` after a ':' in type-parameter
+    /// or where-clause position.
+    fn parse_bounds(&mut self) -> PResult<Vec<String>> {
+        let mut bounds = Vec::new();
+        loop {
+            let bspan = self.peek_span();
+            let bound = self.parse_ident("constraint name")?;
+            if !VALID_BOUNDS.contains(&bound.as_str()) {
+                return Err(Diagnostic::new(
+                    "E067",
+                    format!("unknown constraint '{}'", bound),
+                    bspan,
+                )
+                .with_help("valid constraints: Eq (== !=), Ord (< <= > >=), Num (+ - * /)"));
+            }
+            if !bounds.contains(&bound) {
+                bounds.push(bound);
+            }
+            if !self.eat(&Tok::Plus) {
+                break;
+            }
+        }
+        Ok(bounds)
+    }
+
+    /// Parses an optional `where T: Ord + Num, U: Eq` clause, merging the
+    /// bounds into the already-declared type parameters.
+    fn parse_where_clause(&mut self, type_params: &mut [TypeParam]) -> PResult<()> {
+        if !self.eat(&Tok::Where) {
+            return Ok(());
+        }
+        loop {
+            let tspan = self.peek_span();
+            let tname = self.parse_ident("type parameter in where clause")?;
+            self.expect(Tok::Colon, "':' after type parameter in where clause")?;
+            let bounds = self.parse_bounds()?;
+            let Some(tp) = type_params.iter_mut().find(|tp| tp.name == tname) else {
+                return Err(Diagnostic::new(
+                    "E073",
+                    format!("where clause names unknown type parameter '{}'", tname),
+                    tspan,
+                )
+                .with_help("declare the parameter in angle brackets first: fn<T> ... where T: Ord"));
+            };
+            for b in bounds {
+                if !tp.bounds.contains(&b) {
+                    tp.bounds.push(b);
+                }
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn peek(&self) -> &Tok {
@@ -197,8 +243,9 @@ impl<'a> Parser<'a> {
 
     fn parse_struct(&mut self) -> PResult<StructDef> {
         let struct_tok = self.expect(Tok::Struct, "'struct'")?;
-        let type_params = self.parse_type_params()?;
+        let mut type_params = self.parse_type_params()?;
         let name = self.parse_ident("struct name")?;
+        self.parse_where_clause(&mut type_params)?;
         self.skip_newlines();
         self.expect(Tok::LBrace, "'{' to open struct body")?;
         let mut fields = Vec::new();
@@ -239,8 +286,9 @@ impl<'a> Parser<'a> {
 
     fn parse_enum(&mut self) -> PResult<EnumDef> {
         let enum_tok = self.expect(Tok::Enum, "'enum'")?;
-        let type_params = self.parse_type_params()?;
+        let mut type_params = self.parse_type_params()?;
         let name = self.parse_ident("enum name")?;
+        self.parse_where_clause(&mut type_params)?;
         self.skip_newlines();
         self.expect(Tok::LBrace, "'{' to open enum body")?;
         let mut variants = Vec::new();
@@ -312,6 +360,8 @@ impl<'a> Parser<'a> {
         } else {
             Type::Unit
         };
+        let mut type_params = type_params;
+        self.parse_where_clause(&mut type_params)?;
 
         let mut requires = Vec::new();
         let mut ensures = Vec::new();
@@ -1090,6 +1140,7 @@ fn describe(tok: &Tok) -> String {
         Tok::Import => "'import'".to_string(),
         Tok::Enum => "'enum'".to_string(),
         Tok::Match => "'match'".to_string(),
+        Tok::Where => "'where'".to_string(),
         Tok::LParen => "'('".to_string(),
         Tok::RParen => "')'".to_string(),
         Tok::LBrace => "'{'".to_string(),

@@ -1,0 +1,596 @@
+# A weather API written in machino and backed by the free Open-Meteo API.
+#
+# Run:
+#   machino run test/weather_api.mno 8092
+#
+# Sample requests:
+#   curl http://localhost:8092/health
+#   curl http://localhost:8092/cities
+#   curl "http://localhost:8092/weather?city=London"
+#   curl "http://localhost:8092/forecast?city=Tokyo"
+#   curl -X POST http://localhost:8092/admin/shutdown -H "X-API-Key: weather-secret"
+#
+# Note:
+# - `machino run` provides the native `http_get(url)` capability used here.
+# - This service keeps a fixed list of supported cities and fetches live weather
+#   data for them on demand from Open-Meteo.
+
+extern fn tcp_listen(port: int) -> int
+extern fn tcp_accept(listener: int) -> int
+extern fn tcp_read(conn: int) -> str
+extern fn tcp_write(conn: int, data: str) -> int
+extern fn tcp_close(handle: int)
+extern fn args() -> [str]
+extern fn getenv(name: str) -> str
+extern fn http_get(url: str) -> str
+
+struct Location {
+    city: str
+    latitude: float
+    longitude: float
+}
+
+struct WeatherReading {
+    city: str
+    temp_c: int
+    humidity: int
+    wind_kph: int
+    condition: str
+    updated_at: str
+}
+
+struct ForecastDay {
+    day: str
+    temp_max_c: int
+    temp_min_c: int
+    condition: str
+}
+
+struct WeatherBundle {
+    current: WeatherReading
+    forecast: [ForecastDay]
+}
+
+struct Response {
+    status: str
+    content_type: str
+    body: str
+    should_stop: bool
+}
+
+struct AppState {
+    locations: [Location]
+    request_count: int
+}
+
+enum ApiParse {
+    Ok(WeatherBundle)
+    Err(str)
+}
+
+fn response(status: str, content_type: str, body: str, should_stop: bool) -> Response {
+    return Response(status, content_type, body, should_stop)
+}
+
+fn seeded_locations() -> [Location] {
+    return [
+        Location("New York", 40.7128, - 74.0060),
+        Location("London", 51.5072, - 0.1276),
+        Location("Tokyo", 35.6764, 139.6500),
+        Location("Bengaluru", 12.9716, 77.5946)
+    ]
+}
+
+fn app_state() -> AppState {
+    return AppState(seeded_locations(), 0)
+}
+
+fn request_line(request: str) -> str {
+    return split(request, "\r\n")[0]
+}
+
+fn request_method(request: str) -> str {
+    let parts = split(request_line(request), " ")
+    if len(parts) == 0 {
+        return ""
+    }
+    return parts[0]
+}
+
+fn request_target(request: str) -> str {
+    let parts = split(request_line(request), " ")
+    if len(parts) < 2 {
+        return "/"
+    }
+    return parts[1]
+}
+
+fn target_path(target: str) -> str {
+    let pos = find(target, "?")
+    if pos == - 1 {
+        return target
+    }
+    return substr(target, 0, pos)
+}
+
+fn target_query(target: str) -> str {
+    let pos = find(target, "?")
+    if pos == - 1 {
+        return ""
+    }
+    return substr(target, pos + 1, len(target))
+}
+
+fn hex_value(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    return - 1
+}
+
+fn decode_component(s: str) -> str {
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c == 43 {
+            out = out + " "
+            i = i + 1
+        } else if c == 37 && i + 2 < len(s) {
+            let hi = hex_value(char_at(s, i + 1))
+            let lo = hex_value(char_at(s, i + 2))
+            if hi >= 0 && lo >= 0 {
+                out = out + chr(hi * 16 + lo)
+                i = i + 3
+            } else {
+                out = out + chr(c)
+                i = i + 1
+            }
+        } else {
+            out = out + chr(c)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn query_value(query: str, wanted: str) -> str {
+    if len(query) == 0 {
+        return ""
+    }
+    let parts = split(query, "&")
+    for i in 0..len(parts) {
+        let pair = split(parts[i], "=")
+        if len(pair) > 0 && pair[0] == wanted {
+            if len(pair) > 1 {
+                return decode_component(pair[1])
+            }
+            return ""
+        }
+    }
+    return ""
+}
+
+fn header_value(request: str, wanted: str) -> str {
+    let prefix = to_lower(wanted) + ":"
+    let lines = split(request, "\r\n")
+    for i in 0..len(lines) {
+        let line = lines[i]
+        if starts_with(to_lower(line), prefix) {
+            return trim(substr(line, len(prefix), len(line)))
+        }
+    }
+    return ""
+}
+
+fn is_authorized(request: str, api_key: str) -> bool {
+    return header_value(request, "x-api-key") == api_key
+}
+
+fn escape_json(s: str) -> str {
+    let out = ""
+    let i = 0
+    while i < len(s) {
+        let c = char_at(s, i)
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn json_error(status: str, message: str) -> Response {
+    return response(status, "application/json", "{\"error\":\"" + escape_json(message) + "\"}", false)
+}
+
+fn city_index(locations: [Location], wanted: str) -> int {
+    let wanted_lower = to_lower(trim(wanted))
+    for i in 0..len(locations) {
+        if to_lower(locations[i].city) == wanted_lower {
+            return i
+        }
+    }
+    return - 1
+}
+
+fn condition_from_code(code: int) -> str {
+    if code == 0 {
+        return "Clear"
+    }
+    if code == 1 || code == 2 {
+        return "Partly Cloudy"
+    }
+    if code == 3 {
+        return "Cloudy"
+    }
+    if code == 45 || code == 48 {
+        return "Fog"
+    }
+    if code >= 51 && code <= 67 {
+        return "Rain"
+    }
+    if code >= 71 && code <= 77 {
+        return "Snow"
+    }
+    if code >= 80 && code <= 82 {
+        return "Showers"
+    }
+    if code >= 95 {
+        return "Thunderstorm"
+    }
+    return "Unknown"
+}
+
+fn reading_json(r: WeatherReading) -> str {
+    return ("{\"city\":\"" + escape_json(r.city)
+        + "\",\"temp_c\":" + str_of_int(r.temp_c)
+        + ",\"humidity\":" + str_of_int(r.humidity)
+        + ",\"wind_kph\":" + str_of_int(r.wind_kph)
+        + ",\"condition\":\"" + escape_json(r.condition)
+        + "\",\"updated_at\":\"" + escape_json(r.updated_at)
+        + "\"}")
+}
+
+fn forecast_json(days: [ForecastDay]) -> str {
+    let out = "["
+    for i in 0..len(days) {
+        if i > 0 {
+            out = out + ","
+        }
+        let d = days[i]
+        out = out + ("{\"day\":\"" + escape_json(d.day)
+            + "\",\"temp_max_c\":" + str_of_int(d.temp_max_c)
+            + ",\"temp_min_c\":" + str_of_int(d.temp_min_c)
+            + ",\"condition\":\"" + escape_json(d.condition)
+            + "\"}")
+    }
+    out = out + "]"
+    return out
+}
+
+fn weather_payload(bundle: WeatherBundle) -> str {
+    return ("{\"current\":" + reading_json(bundle.current)
+        + ",\"forecast\":" + forecast_json(bundle.forecast)
+        + "}")
+}
+
+fn cities_json(locations: [Location]) -> str {
+    let out = "["
+    for i in 0..len(locations) {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + "\"" + escape_json(locations[i].city) + "\""
+    }
+    out = out + "]"
+    return out
+}
+
+fn docs_json() -> str {
+    return ("{\"service\":\"weather-api\","
+        + "\"provider\":\"open-meteo\","
+        + "\"routes\":["
+        + "\"GET /health\","
+        + "\"GET /cities\","
+        + "\"GET /weather?city=...\","
+        + "\"GET /forecast?city=...\","
+        + "\"POST /admin/shutdown\""
+        + "]}")
+}
+
+fn open_meteo_url(loc: Location) -> str {
+    return ("https://api.open-meteo.com/v1/forecast?"
+        + "latitude=" + str_of_float(loc.latitude, 4)
+        + "&longitude=" + str_of_float(loc.longitude, 4)
+        + "&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code"
+        + "&daily=weather_code,temperature_2m_max,temperature_2m_min"
+        + "&forecast_days=3"
+        + "&timezone=UTC")
+}
+
+fn num_from_json(v: Json, default: float) -> float {
+    return match v {
+        Json::JNum(n) => n
+        _ => default
+    }
+}
+
+fn str_from_json(v: Json, default: str) -> str {
+    return match v {
+        Json::JStr(s) => s
+        _ => default
+    }
+}
+
+fn empty_json_array() -> [Json] {
+    let xs: [Json] = []
+    return xs
+}
+
+fn arr_from_json(v: Json) -> [Json] {
+    return match v {
+        Json::JArr(xs) => xs
+        _ => empty_json_array()
+    }
+}
+
+fn obj_from_json(v: Json) -> JsonObj {
+    return match v {
+        Json::JObj(o) => o
+        _ => json_obj_new()
+    }
+}
+
+fn str_at(xs: [Json], idx: int, default: str) -> str {
+    if idx < 0 || idx >= len(xs) {
+        return default
+    }
+    return str_from_json(xs[idx], default)
+}
+
+fn num_at(xs: [Json], idx: int, default: float) -> float {
+    if idx < 0 || idx >= len(xs) {
+        return default
+    }
+    return num_from_json(xs[idx], default)
+}
+
+fn bundle_from_root(city: str, root: JsonObj) -> WeatherBundle {
+    let current_obj = obj_from_json(json_obj_get(root, "current"))
+    let daily_obj = obj_from_json(json_obj_get(root, "daily"))
+
+    let current = WeatherReading(
+        city,
+        round(num_from_json(json_obj_get(current_obj, "temperature_2m"), 0.0)),
+        round(num_from_json(json_obj_get(current_obj, "relative_humidity_2m"), 0.0)),
+        round(num_from_json(json_obj_get(current_obj, "wind_speed_10m"), 0.0)),
+        condition_from_code(round(num_from_json(json_obj_get(current_obj, "weather_code"), - 1.0))),
+        str_from_json(json_obj_get(current_obj, "time"), "")
+    )
+
+    let times = arr_from_json(json_obj_get(daily_obj, "time"))
+    let codes = arr_from_json(json_obj_get(daily_obj, "weather_code"))
+    let maxs = arr_from_json(json_obj_get(daily_obj, "temperature_2m_max"))
+    let mins = arr_from_json(json_obj_get(daily_obj, "temperature_2m_min"))
+    let days: [ForecastDay] = []
+
+    for i in 0..len(times) {
+        days = push(
+            days,
+            ForecastDay(
+                str_at(times, i, ""),
+                round(num_at(maxs, i, 0.0)),
+                round(num_at(mins, i, 0.0)),
+                condition_from_code(round(num_at(codes, i, - 1.0)))
+            )
+        )
+    }
+
+    return WeatherBundle(current, days)
+}
+
+fn parse_open_meteo(city: str, body: str) -> ApiParse {
+    if len(body) == 0 {
+        return ApiParse::Err("weather upstream unavailable")
+    }
+    return match json_parse(body) {
+        JsonParsed::JError(e) => ApiParse::Err("invalid upstream json: " + e)
+        JsonParsed::JVal(v) => match v {
+            Json::JObj(root) => ApiParse::Ok(bundle_from_root(city, root))
+            _ => ApiParse::Err("upstream root must be an object")
+        }
+    }
+}
+
+fn weather_or_404(state: AppState, city: str) -> Response {
+    let idx = city_index(state.locations, city)
+    if idx == - 1 {
+        return json_error("404 Not Found", "unknown city: " + city)
+    }
+    let loc = state.locations[idx]
+    let parsed = parse_open_meteo(loc.city, http_get(open_meteo_url(loc)))
+    return match parsed {
+        ApiParse::Ok(bundle) => response("200 OK", "application/json", weather_payload(bundle), false)
+        ApiParse::Err(msg) => json_error("502 Bad Gateway", msg)
+    }
+}
+
+fn forecast_or_404(state: AppState, city: str) -> Response {
+    let idx = city_index(state.locations, city)
+    if idx == - 1 {
+        return json_error("404 Not Found", "unknown city: " + city)
+    }
+    let loc = state.locations[idx]
+    let parsed = parse_open_meteo(loc.city, http_get(open_meteo_url(loc)))
+    return match parsed {
+        ApiParse::Ok(bundle) => response("200 OK", "application/json", forecast_json(bundle.forecast), false)
+        ApiParse::Err(msg) => json_error("502 Bad Gateway", msg)
+    }
+}
+
+fn handle_request(state: AppState, request: str, api_key: str) -> Response {
+    state.request_count = state.request_count + 1
+    let method = request_method(request)
+    let target = request_target(request)
+    let path = target_path(target)
+    let query = target_query(target)
+
+    if method == "GET" && path == "/" {
+        return response("200 OK", "application/json", docs_json(), false)
+    }
+    if method == "GET" && path == "/health" {
+        return response("200 OK", "application/json", "{\"ok\":true,\"service\":\"weather-api\",\"provider\":\"open-meteo\"}", false)
+    }
+    if method == "GET" && path == "/cities" {
+        return response("200 OK", "application/json", cities_json(state.locations), false)
+    }
+    if method == "GET" && path == "/weather" {
+        let city = query_value(query, "city")
+        if len(trim(city)) == 0 {
+            return json_error("400 Bad Request", "city is required")
+        }
+        return weather_or_404(state, city)
+    }
+    if method == "GET" && path == "/forecast" {
+        let city = query_value(query, "city")
+        if len(trim(city)) == 0 {
+            return json_error("400 Bad Request", "city is required")
+        }
+        return forecast_or_404(state, city)
+    }
+    if method == "POST" && path == "/admin/shutdown" {
+        if !is_authorized(request, api_key) {
+            return json_error("401 Unauthorized", "missing or invalid x-api-key header")
+        }
+        return response("200 OK", "application/json", "{\"stopping\":true}", true)
+    }
+    return json_error("404 Not Found", "route not found")
+}
+
+fn write_response(conn: int, r: Response) {
+    let payload = ("HTTP/1.1 " + r.status + "\r\n"
+        + "Content-Type: " + r.content_type + "\r\n"
+        + "Content-Length: " + str_of_int(len(r.body)) + "\r\n"
+        + "Connection: close\r\n"
+        + "\r\n"
+        + r.body)
+    tcp_write(conn, payload)
+}
+
+fn fake_request(method: str, target: str, api_key: str) -> str {
+    let req = method + " " + target + " HTTP/1.1\r\nHost: test\r\n"
+    if len(api_key) == 0 {
+        return req + "\r\n"
+    }
+    return req + "X-API-Key: " + api_key + "\r\n\r\n"
+}
+
+fn sample_api_json() -> str {
+    return ("{\"latitude\":51.5,\"longitude\":-0.25,\"generationtime_ms\":0.6119,"
+        + "\"utc_offset_seconds\":0,\"timezone\":\"GMT\",\"timezone_abbreviation\":\"GMT\","
+        + "\"elevation\":16.0,"
+        + "\"current\":{\"time\":\"2026-07-19T01:30\",\"interval\":900,"
+        + "\"temperature_2m\":15.7,\"relative_humidity_2m\":65,"
+        + "\"wind_speed_10m\":11.9,\"weather_code\":0},"
+        + "\"daily\":{\"time\":[\"2026-07-19\",\"2026-07-20\",\"2026-07-21\"],"
+        + "\"weather_code\":[3,51,3],"
+        + "\"temperature_2m_max\":[22.5,22.7,25.6],"
+        + "\"temperature_2m_min\":[13.9,14.4,15.3]}}")
+}
+
+fn main() {
+    let argv = args()
+    let port = 8092
+    if len(argv) > 0 && is_int_str(argv[0]) {
+        port = parse_int(argv[0])
+    }
+    let api_key = getenv("MACHINO_WEATHER_KEY")
+    if len(api_key) == 0 {
+        api_key = "weather-secret"
+    }
+
+    let state = app_state()
+    let listener = tcp_listen(port)
+    print("weather api listening on http://localhost:" + str_of_int(port))
+
+    let running = true
+    while running {
+        let conn = tcp_accept(listener)
+        let request = tcp_read(conn)
+        let r = handle_request(state, request, api_key)
+        write_response(conn, r)
+        tcp_close(conn)
+        if r.should_stop {
+            running = false
+        }
+    }
+
+    tcp_close(listener)
+    print("weather api stopped after " + str_of_int(state.request_count) + " requests")
+}
+
+test "supported cities list is stable" {
+    let state = app_state()
+    let body = cities_json(state.locations)
+    assert contains(body, "\"London\"")
+    assert contains(body, "\"Bengaluru\"")
+}
+
+test "open meteo fixture parses current weather" {
+    let parsed = parse_open_meteo("London", sample_api_json())
+    let ok = match parsed {
+        ApiParse::Err(_) => false
+        ApiParse::Ok(bundle) => (
+            bundle.current.city == "London"
+            && bundle.current.temp_c == 16
+            && bundle.current.humidity == 65
+            && bundle.current.wind_kph == 12
+            && bundle.current.condition == "Clear"
+        )
+    }
+    assert ok
+}
+
+test "open meteo fixture parses forecast days" {
+    let parsed = parse_open_meteo("London", sample_api_json())
+    let ok = match parsed {
+        ApiParse::Err(_) => false
+        ApiParse::Ok(bundle) => (
+            len(bundle.forecast) == 3
+            && bundle.forecast[0].day == "2026-07-19"
+            && bundle.forecast[0].condition == "Cloudy"
+            && bundle.forecast[1].condition == "Rain"
+            && bundle.forecast[2].temp_max_c == 26
+        )
+    }
+    assert ok
+}
+
+test "missing city is a 404" {
+    let state = app_state()
+    let r = handle_request(state, fake_request("GET", "/weather?city=Atlantis", ""), "weather-secret")
+    assert r.status == "404 Not Found"
+}
+
+test "shutdown requires auth" {
+    let state = app_state()
+    let denied = handle_request(state, fake_request("POST", "/admin/shutdown", ""), "weather-secret")
+    assert denied.status == "401 Unauthorized"
+
+    let ok = handle_request(state, fake_request("POST", "/admin/shutdown", "weather-secret"), "weather-secret")
+    assert ok.status == "200 OK"
+    assert ok.should_stop
+}

@@ -236,6 +236,7 @@ arrays of scalars/`str` (`E026` otherwise).
 | `file_exists` | `(path: str) -> bool` |
 | `read_line` | `() -> str` — one stdin line, `""` at EOF |
 | `getenv` | `(name: str) -> str` — `""` if unset |
+| `http_get` | `(url: str) -> str` — UTF-8 body, `""` on HTTP/network failure |
 | `args` | `() -> [str]` — CLI args after the file name |
 | `exit` | `(code: int)` |
 | `tcp_listen` | `(port: int) -> int` — returns a listener handle |

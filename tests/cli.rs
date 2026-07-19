@@ -40,6 +40,7 @@ fn check_passes_on_examples() {
         "json",
         "stdlib_tour",
         "concurrency",
+        "maze_solver",
         "namespaces/main",
     ] {
         let out = machino(&["check", &format!("examples/{}.mno", ex)]);
@@ -62,6 +63,7 @@ fn tests_pass_on_examples() {
         "json",
         "stdlib_tour",
         "concurrency",
+        "maze_solver",
         "namespaces/main",
     ] {
         let out = machino(&["test", &format!("examples/{}.mno", ex)]);
@@ -85,6 +87,16 @@ fn fib_output_is_correct() {
     assert_eq!(lines[0], "0");
     assert_eq!(lines[10], "55");
     assert_eq!(lines[15], "610");
+}
+
+#[test]
+fn maze_solver_output_is_correct() {
+    let out = machino(&["run", "examples/maze_solver.mno"]);
+    assert!(out.status.success());
+    assert_eq!(
+        stdout(&out).trim(),
+        "steps=22 visited=23 moves=DDDDRRRRRRUULLLLUURRRR\n#########\n#S#****G#\n#*#*#####\n#*#*****#\n#*#####*#\n#*******#\n#########"
+    );
 }
 
 #[test]
@@ -186,6 +198,7 @@ fn wasm_output_matches_interpreter_in_node() {
         "wordcount",
         "higher_order",
         "closures",
+        "maze_solver",
     ] {
         let wasm = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{}.wasm", ex));
         let out = machino(&[

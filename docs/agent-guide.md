@@ -198,6 +198,7 @@ extern fn write_file(path: str, data: str) -> bool
 extern fn file_exists(path: str) -> bool
 extern fn read_line() -> str
 extern fn getenv(name: str) -> str
+extern fn http_get(url: str) -> str
 extern fn args() -> [str]
 extern fn exit(code: int)
 extern fn tcp_listen(port: int) -> int
