@@ -43,7 +43,8 @@ as in compiled WASM.
 
 `machino build --native` requires `clang` on `PATH` (or `MACHINO_CC`). The
 binary includes the host externs (files, TCP, env, …) from the C runtime — no
-WebAssembly host needed. Host builds use `-O3 -flto -march=native`. Use
+WebAssembly host needed. Host builds use `-O3` (plus `-flto -march=native` on
+Unix). Windows skips LTO unless `MACHINO_LTO=1` and lld are available. Use
 `--target <triple>` for cross-compilation, or `--universal` on macOS for an
 arm64+x86_64 lipo binary. Portable one-file deploy across browsers/Workers
 still prefers `.wasm`.

@@ -2093,6 +2093,17 @@ fn runtime_dir() -> PathBuf {
     PathBuf::from("runtime/native")
 }
 
+/// Whether this clang can link with LTO.
+/// Windows clang typically errors with "LTO requires -fuse-ld=lld" unless a
+/// full LLVM lld install is present; keep host builds reliable with `-O3` only.
+fn native_lto_supported(_clang: &str) -> bool {
+    match std::env::var("MACHINO_LTO") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+        _ => !cfg!(windows),
+    }
+}
+
 /// Compile a monomorphized program to a native executable via Clang/LLVM.
 pub fn compile_native(
     program: &Program,
@@ -2140,7 +2151,6 @@ pub fn compile_native(
     let clang = std::env::var("MACHINO_CC").unwrap_or_else(|_| "clang".into());
     let mut compile_args = vec![
         "-O3".to_string(),
-        "-flto".to_string(),
         "-ffunction-sections".to_string(),
         "-fdata-sections".to_string(),
         "-pthread".to_string(),
@@ -2150,11 +2160,19 @@ pub fn compile_native(
         c_path.to_str().unwrap_or("program.c").to_string(),
         rt_c.to_str().unwrap_or("machino_rt.c").to_string(),
     ];
+    // LTO when supported (see native_lto_supported). Override with MACHINO_LTO=0/1.
+    if native_lto_supported(&clang) {
+        compile_args.insert(1, "-flto".to_string());
+        if cfg!(windows) {
+            compile_args.insert(2, "-fuse-ld=lld".to_string());
+        }
+    }
     if let Some(triple) = target {
         compile_args.insert(0, "-target".to_string());
         compile_args.insert(1, triple.to_string());
-    } else {
+    } else if !cfg!(windows) {
         // Host builds: tune for the CPU running the compiler.
+        // Skipped on Windows: clang's -march=native is flaky across MSVC/MinGW.
         compile_args.insert(0, "-march=native".to_string());
     }
     // Dead-strip unused sections on common linkers (best-effort).
@@ -2192,7 +2210,6 @@ pub fn compile_native(
     let ll_status = Command::new(&clang)
         .args([
             "-O3",
-            "-flto",
             "-pthread",
             "-std=c11",
             "-S",
