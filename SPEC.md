@@ -1,4 +1,4 @@
-# The machino Language Specification (v0.7)
+# The machino Language Specification (v1.0)
 
 machino is an AI-first programming language. It is designed for code that is
 *written and verified by machines*: the syntax is small and canonical, the
@@ -321,7 +321,7 @@ atoms. `&&`/`||` short-circuit.
 | `join_bool(h)` | `int` → `bool`                  | likewise for `bool`          |
 | `join_str(h)` | `int` → `str`                    | likewise for `str`           |
 
-### Concurrency (interpreter only)
+### Concurrency
 
 `spawn(f, args...)` starts `f` on a fresh OS thread and returns a task
 handle. The arguments (and, for closures, the captured environment) are
@@ -331,8 +331,20 @@ regardless of scheduling. `f` must return `int`, `float`, `bool`, or `str`
 (`E071`); retrieve the result with the matching `join_*`, which blocks until
 the task finishes. Joining a handle twice, or a handle that never existed,
 is a runtime error. A contract violation or trap inside a task surfaces as
-a runtime error at the `join_*` call site. The WASM backends have no thread
-support, so `machino build` rejects programs that use spawn/join (`E072`).
+a runtime error at the `join_*` call site.
+
+**Compiled WASM.** The default (linear-memory) backend compiles `spawn` to
+a `task_spawn` host import: the host deep-copies the argument graph out of
+the parent instance's memory and runs the target in a **fresh instance of
+the same module** on another thread (shared-nothing, same semantics as the
+interpreter). Because the target is located by its export name, the first
+argument to a compiled `spawn` must be a named top-level function — lambdas
+and function-typed variables are rejected at build time (`E074`). The Node
+runner (`runners/run.mjs`) implements the task protocol with
+`worker_threads`, `SharedArrayBuffer`, and `Atomics`; task modules import
+`task_spawn` / `task_join_*` only when the program actually uses
+concurrency, so ordinary modules still run on hosts without threads. The
+WASM-GC backend has no thread support (`E072` with `--gc`).
 
 ## Standard prelude
 
@@ -369,9 +381,12 @@ from compiled WASM.
 
 Values are 8 bytes each. Every heap object carries a 16-byte header:
 `[meta: i64][bitmap: i64][payload]`, where `meta` packs a type tag (bits
-0–2: bytes / scalar array / pointer array / struct / free block), a GC mark
-bit (bit 3), and a count (bits 4+). For structs and closures the bitmap
-flags which payload words are pointers. Enums are represented as struct-like
+0–2: bytes / scalar array / pointer array / struct / big struct / free
+block), a GC mark bit (bit 3), and a count (bits 4+). For structs and
+closures up to 60 payload words the bitmap flags which payload words are
+pointers; larger objects use the *big struct* tag, and the second header
+word holds the address of a static multi-word bitmap in the data segment —
+so structs have no field limit. Enums are represented as struct-like
 objects with a tag field (variant index) and a payload field (variant data
 if present). Function values are closure objects
 `[header][table_slot][captures...]`; calls through them use a `funcref`
@@ -384,8 +399,10 @@ linear memory, which the collector scans as roots; collection runs only at
 safepoints (function entry and loop back-edges) when allocation since the
 last cycle exceeds an adaptive threshold (min 1 MiB). Objects never move;
 freed blocks are coalesced into a free list that the allocator searches
-before bumping. Memory is capped at 1 GiB — allocating past it (with
-nothing to collect) traps with `out of memory`. The interpreter uses
+before bumping. Memory is capped at 4 GiB (the wasm32 address-space
+maximum) — allocating past it (with nothing to collect) traps with
+`out of memory`. The shadow stack defaults to 16 MiB and is sized with
+`machino build --stack-mib N`. The interpreter uses
 reference counting; the only divergence is pathological reference cycles
 (e.g. an array pushed into a struct it contains), which the interpreter
 leaks and the compiled GC reclaims.
@@ -399,7 +416,7 @@ that create objects (strings, arrays) must write the 16-byte header — see
 `machino check --json` prints one JSON object:
 `{"ok":bool,"errors":n,"diagnostics":[{severity,code,message,file,line,col,endLine,endCol,help?,fix?}]}`.
 Positions map to the correct file across imports. Error codes are stable:
-`E001–E005` lexical, `E010–E019` syntax, `E020–E072` types and semantics.
+`E001–E005` lexical, `E010–E019` syntax, `E020–E074` types and semantics.
 Some diagnostics carry a machine-applicable `fix`
 (`{line,col,endLine,endCol,replace}`): apply it by replacing that range with
 `replace`. The full schema is `docs/diagnostics.schema.json`; the formal
@@ -420,11 +437,18 @@ fn<T: Ord> max2(a: T, b: T) -> T {
     }
     return b
 }
+
+fn<T, U> pair_max(a: T, b: T, tag: U) -> T where T: Ord + Num, U: Eq {
+    return max2(a, b)
+}
 ```
 
 - Bounds: `Eq` enables `==`/`!=`, `Ord` enables comparisons (and implies
   `Eq`), `Num` enables `+ - * /`. Using an operator without the matching
-  bound is a compile error (`E065`).
+  bound is a compile error (`E065`). Multiple bounds combine with `+`,
+  either inline (`fn<T: Ord + Num>`) or in a trailing `where` clause after
+  the return type; a `where` clause naming an undeclared parameter is
+  `E073`.
 - Type arguments are inferred at every call site by unification; there is
   no explicit turbofish syntax. Ambiguous or conflicting inference is an
   error with the conflicting types named.
@@ -438,12 +462,15 @@ fn<T: Ord> max2(a: T, b: T) -> T {
 ## Static verification (`machino check --verify`)
 
 Built with `--features smt` (Z3), the verifier symbolically executes a
-decidable subset — loop-free, call-free functions over `int`/`bool`
-(array `len`/indexing and struct fields become uninterpreted symbols) —
-and reports, per function: contracts **proved**, a **counterexample**
-(concrete argument values violating an `ensures`), or **vacuous requires**
-(no input can satisfy them). Functions outside the subset are skipped and
-still enforced at runtime, as always.
+decidable subset — functions over `int`/`bool` (array `len`/indexing and
+struct fields become uninterpreted symbols), where calls to other int/bool
+functions are **inlined** (up to depth 8; deeper recursion reports
+`unknown`) and `for` loops with constant bounds are **unrolled** (up to
+128 iterations) — and reports, per function: contracts **proved**, a
+**counterexample** (concrete argument values violating an `ensures`), or
+**vacuous requires** (no input can satisfy them). Functions outside the
+subset (while loops, floats, strings) are skipped and still enforced at
+runtime, as always.
 
 ## Tooling
 
@@ -468,32 +495,34 @@ still enforced at runtime, as always.
   package and uploads it to a registry over HTTP (client side; running a
   registry server is out of scope).
 
-## Known limits (v0.7)
+## Known limits (v1.0)
 
 - Generic structs/enums cannot be instantiated directly (`E066`); generic
   functions cover the common cases.
-- `spawn`/`join_*` are interpreter-only; `machino build` rejects them
-  (`E072`). Spawned functions must return a scalar (`E071`).
-- The WASM-GC backend (`build --gc`) covers scalars, strings, arrays of
-  scalars, and all control flow, but not structs, enums, closures, or
-  match (`E070`); the default linear-memory backend covers everything.
-- SMT verification covers loop-free, call-free int/bool contracts;
-  everything else stays runtime-checked.
+- Compiled `spawn` targets must be named top-level functions (`E074`);
+  lambdas and function-typed variables spawn in the interpreter only.
+  Spawned functions must return a scalar (`E071`). The WASM-GC backend
+  has no thread support (`E072` with `--gc`).
+- The WASM-GC backend wraps on integer overflow (the linear backend
+  traps), provides no extern fns beyond print, and needs a GC-capable
+  host (Node 22+, modern browsers).
+- SMT verification covers int/bool contracts with bounded inlining and
+  loop unrolling; floats, strings, and while loops stay runtime-checked.
 - Enum variants carry at most one payload value; 255 variants max.
-- Structs are limited to 60 fields (`E050`); GC bitmaps are one word.
 - Contracts on `extern fn`s are enforced by the interpreter but not in
   compiled WASM.
 - The interpreter's call depth defaults to 4096 (`MACHINO_MAX_DEPTH` env
-  var overrides); compiled WASM has a 4 MiB shadow stack for pointer
-  frames. Compiled-module memory is capped at 1 GiB.
+  var overrides); the compiled shadow stack defaults to 16 MiB
+  (`--stack-mib N` overrides). Compiled-module memory is capped at 4 GiB
+  (the wasm32 maximum).
 - Reference cycles are reclaimed by the compiled GC but leak in the
   interpreter (they require deliberately circular data).
 
 ## Roadmap
 
-- Hosted public registry service
-- Threads in compiled WASM (shared-nothing workers)
-- Generic structs/enums end-to-end; `where` clauses
-- Incremental compilation
+- Hosted public registry service (`pkg publish` already speaks the
+  protocol; the server itself is out of scope for the toolchain)
+- Generic structs/enums instantiated directly
+- Shared-memory primitives (channels) on top of shared-nothing tasks
 
 

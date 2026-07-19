@@ -145,6 +145,7 @@ pub fn upload_package(_registry_url: &str, _package_path: &std::path::Path, _tok
 }
 
 #[cfg(not(feature = "registry"))]
+#[allow(dead_code)]
 pub fn download_package(_registry_url: &str, _name: &str, _version: &str, _dest: &std::path::Path) -> Result<(), String> {
     Err("registry support not enabled (compile with --features registry)".to_string())
 }

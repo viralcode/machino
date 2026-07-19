@@ -1,38 +1,46 @@
 //! WASM-GC backend (`machino build --gc`): compiles to the WebAssembly GC
-//! proposal, using reference-typed GC arrays instead of the linear-memory
+//! proposal, using reference-typed GC objects instead of the linear-memory
 //! mark-sweep collector in wasm.rs. The host's collector manages all memory.
 //!
-//! Supported subset (diagnostic E070 otherwise, with the construct named):
-//!   - int (i64), float (f64), bool (i32)
-//!   - str as an immutable GC byte array: literals, +, ==/!=, len,
-//!     char_at, substr, chr
-//!   - [int] and [float]: literals, indexing, index-assign, len, push
-//!   - all control flow (if/while/for/break/continue), recursion, asserts
-//!   - requires/ensures contracts (enforced with traps)
-//!   - print for int/float/bool/str
+//! Value representation:
+//!   - int -> i64, float -> f64, bool -> i32
+//!   - str -> (ref null $bytes), an immutable GC byte array
+//!   - [int]/[float] -> specialized GC arrays of i64/f64
+//!   - structs, enums, closures, and arrays of references -> $anyarr, a GC
+//!     array of anyref. Scalars stored in $anyarr slots are boxed in $boxi64
+//!     / $boxf64 structs; reads cast back with ref.cast. An enum value is
+//!     [box(tag), payload-or-null]; a closure is [box(table slot), captures].
+//!   - function calls through values use a funcref table + call_indirect,
+//!     passing the closure as a hidden trailing parameter.
 //!
-//! Not yet in the subset: structs, enums/match, closures, arrays of
-//! references, string externs (files/sockets). Use the default backend for
-//! those. Integer arithmetic wraps (the default backend traps on overflow).
+//! The full language compiles on this backend. Remaining divergences from
+//! the default backend: integer arithmetic wraps instead of trapping on
+//! overflow, extern fns beyond print are not provided by the reference GC
+//! host, and spawn/join require the default backend (E072).
 //!
 //! Run the output with `node runners/run-gc.mjs out.wasm` (Node 22+ / any
 //! host with WASM GC).
 
 use crate::ast::*;
 use crate::diag::{Diagnostic, Span};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // value types
 const I32: u8 = 0x7f;
 const I64: u8 = 0x7e;
 const F64: u8 = 0x7c;
+const ANYREF: u8 = 0x6e;
+const FUNCREF: u8 = 0x70;
 const REF_NULL: u8 = 0x63; // (ref null $t) followed by type index
 
 // GC type indices (fixed layout in the type section)
 const TY_BYTES: u32 = 0; // array (mut i8)   — strings
 const TY_ARR_I64: u32 = 1; // array (mut i64)
 const TY_ARR_F64: u32 = 2; // array (mut f64)
-const FIRST_FUNC_TYPE: u32 = 3;
+const TY_ANYARR: u32 = 3; // array (mut anyref) — structs/enums/closures/ref arrays
+const TY_BOXI64: u32 = 4; // struct { i64 } — boxed int/bool
+const TY_BOXF64: u32 = 5; // struct { f64 } — boxed float
+const N_FIXED_TYPES: u32 = 6;
 
 // opcodes
 const OP_UNREACHABLE: u8 = 0x00;
@@ -49,13 +57,14 @@ const OP_DROP: u8 = 0x1a;
 const OP_LOCAL_GET: u8 = 0x20;
 const OP_LOCAL_SET: u8 = 0x21;
 const OP_LOCAL_TEE: u8 = 0x22;
+const OP_CALL_INDIRECT: u8 = 0x11;
+const OP_REF_NULL: u8 = 0xd0;
 const OP_I32_CONST: u8 = 0x41;
 const OP_I64_CONST: u8 = 0x42;
 const OP_F64_CONST: u8 = 0x44;
 const OP_I32_EQZ: u8 = 0x45;
 const OP_I32_EQ: u8 = 0x46;
 const OP_I32_NE: u8 = 0x47;
-const OP_I64_EQZ: u8 = 0x50;
 const OP_I64_EQ: u8 = 0x51;
 const OP_I64_NE: u8 = 0x52;
 const OP_I64_LT_S: u8 = 0x53;
@@ -81,9 +90,12 @@ const OP_F64_MUL: u8 = 0xa2;
 const OP_F64_DIV: u8 = 0xa3;
 const OP_I32_WRAP_I64: u8 = 0xa7;
 const OP_I64_EXTEND_I32_S: u8 = 0xac;
+const OP_I64_EXTEND_I32_U: u8 = 0xad;
 const OP_I64_TRUNC_F64_S: u8 = 0xb0;
 const OP_F64_CONVERT_I64_S: u8 = 0xb9;
 const GC_PREFIX: u8 = 0xfb;
+const GC_STRUCT_NEW: u8 = 0x00;
+const GC_STRUCT_GET: u8 = 0x02;
 const GC_ARRAY_NEW_DEFAULT: u8 = 0x07;
 const GC_ARRAY_NEW_FIXED: u8 = 0x08;
 const GC_ARRAY_NEW_DATA: u8 = 0x09;
@@ -92,6 +104,7 @@ const GC_ARRAY_GET_U: u8 = 0x0d;
 const GC_ARRAY_SET: u8 = 0x0e;
 const GC_ARRAY_LEN: u8 = 0x0f;
 const GC_ARRAY_COPY: u8 = 0x11;
+const GC_REF_CAST_NULL: u8 = 0x17;
 
 fn uleb(out: &mut Vec<u8>, mut n: u64) {
     loop {
@@ -135,6 +148,7 @@ fn e070(what: &str, span: Span) -> Diagnostic {
 
 /// Writes the machino type as a WASM value type. Returns None for Unit.
 fn valtype(ty: &Type, span: Span) -> Result<Option<Vec<u8>>, Diagnostic> {
+    let _ = span;
     Ok(match ty {
         Type::Int => Some(vec![I64]),
         Type::Float => Some(vec![F64]),
@@ -143,18 +157,88 @@ fn valtype(ty: &Type, span: Span) -> Result<Option<Vec<u8>>, Diagnostic> {
         Type::Array(inner) => match inner.as_ref() {
             Type::Int => Some(vec![REF_NULL, TY_ARR_I64 as u8]),
             Type::Float => Some(vec![REF_NULL, TY_ARR_F64 as u8]),
-            other => return Err(e070(&format!("arrays of '{}'", other), span)),
+            _ => Some(vec![REF_NULL, TY_ANYARR as u8]),
         },
+        Type::Struct(_) | Type::Enum(_) | Type::Fn(_, _) => {
+            Some(vec![REF_NULL, TY_ANYARR as u8])
+        }
         Type::Unit => None,
-        other => return Err(e070(&format!("the type '{}'", other), span)),
+        Type::TypeVar(_) => unreachable!("monomorphized before codegen"),
     })
 }
 
-fn array_type_index(elem: &Type, span: Span) -> Result<u32, Diagnostic> {
+fn array_type_index(elem: &Type) -> u32 {
     match elem {
-        Type::Int => Ok(TY_ARR_I64),
-        Type::Float => Ok(TY_ARR_F64),
-        other => Err(e070(&format!("arrays of '{}'", other), span)),
+        Type::Int => TY_ARR_I64,
+        Type::Float => TY_ARR_F64,
+        _ => TY_ANYARR,
+    }
+}
+
+/// Wraps the value on top of the stack (of machino type `ty`) as an anyref
+/// suitable for an $anyarr slot.
+fn box_value(code: &mut Vec<u8>, ty: &Type) {
+    match ty {
+        Type::Int => {
+            code.push(GC_PREFIX);
+            code.push(GC_STRUCT_NEW);
+            uleb(code, TY_BOXI64 as u64);
+        }
+        Type::Bool => {
+            code.push(OP_I64_EXTEND_I32_U);
+            code.push(GC_PREFIX);
+            code.push(GC_STRUCT_NEW);
+            uleb(code, TY_BOXI64 as u64);
+        }
+        Type::Float => {
+            code.push(GC_PREFIX);
+            code.push(GC_STRUCT_NEW);
+            uleb(code, TY_BOXF64 as u64);
+        }
+        // reference types are already anyref-compatible
+        _ => {}
+    }
+}
+
+/// Casts/unboxes the anyref on top of the stack back to machino type `ty`.
+fn unbox_value(code: &mut Vec<u8>, ty: &Type) {
+    match ty {
+        Type::Int | Type::Bool => {
+            code.push(GC_PREFIX);
+            code.push(GC_REF_CAST_NULL);
+            sleb(code, TY_BOXI64 as i64);
+            code.push(GC_PREFIX);
+            code.push(GC_STRUCT_GET);
+            uleb(code, TY_BOXI64 as u64);
+            uleb(code, 0);
+            if *ty == Type::Bool {
+                code.push(OP_I32_WRAP_I64);
+            }
+        }
+        Type::Float => {
+            code.push(GC_PREFIX);
+            code.push(GC_REF_CAST_NULL);
+            sleb(code, TY_BOXF64 as i64);
+            code.push(GC_PREFIX);
+            code.push(GC_STRUCT_GET);
+            uleb(code, TY_BOXF64 as u64);
+            uleb(code, 0);
+        }
+        Type::Str => {
+            code.push(GC_PREFIX);
+            code.push(GC_REF_CAST_NULL);
+            sleb(code, TY_BYTES as i64);
+        }
+        Type::Array(inner) => {
+            code.push(GC_PREFIX);
+            code.push(GC_REF_CAST_NULL);
+            sleb(code, array_type_index(inner) as i64);
+        }
+        _ => {
+            code.push(GC_PREFIX);
+            code.push(GC_REF_CAST_NULL);
+            sleb(code, TY_ANYARR as i64);
+        }
     }
 }
 
@@ -173,14 +257,15 @@ const IMP_PRINT_STR: u32 = 3;
 const N_IMPORTS: u32 = 4;
 
 // helper functions generated by the compiler, placed before user functions
-const N_HELPERS: u32 = 7;
+const N_HELPERS: u32 = 8;
 const HELP_CONCAT: u32 = N_IMPORTS; // (bytes, bytes) -> bytes
 const HELP_STREQ: u32 = N_IMPORTS + 1; // (bytes, bytes) -> i32
 const HELP_SUBSTR: u32 = N_IMPORTS + 2; // (bytes, i64, i64) -> bytes
 const HELP_PUSH_I64: u32 = N_IMPORTS + 3; // (arr_i64, i64) -> arr_i64
 const HELP_PUSH_F64: u32 = N_IMPORTS + 4; // (arr_f64, f64) -> arr_f64
-const HELP_STR_LEN: u32 = N_IMPORTS + 5; // (bytes) -> i32, exported for the host
-const HELP_STR_AT: u32 = N_IMPORTS + 6; // (bytes, i32) -> i32, exported for the host
+const HELP_PUSH_ANY: u32 = N_IMPORTS + 5; // (anyarr, anyref) -> anyarr
+const HELP_STR_LEN: u32 = N_IMPORTS + 6; // (bytes) -> i32, exported for the host
+const HELP_STR_AT: u32 = N_IMPORTS + 7; // (bytes, i32) -> i32, exported for the host
 
 pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
     // ---- reachability from main (dead-code elimination) ----
@@ -228,7 +313,19 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
         signatures: HashMap::new(),
         func_types: Vec::new(),
         data_segments: Vec::new(),
+        structs: HashMap::new(),
+        enums: HashMap::new(),
+        lambdas: BTreeMap::new(),
+        lambda_slot: HashMap::new(),
+        lambda_captures: HashMap::new(),
+        wrapper_slot: HashMap::new(),
     };
+    for s in &program.structs {
+        c.structs.insert(s.name.clone(), s.fields.clone());
+    }
+    for e in &program.enums {
+        c.enums.insert(e.name.clone(), e.variants.clone());
+    }
     for (i, f) in reachable.iter().enumerate() {
         c.func_index
             .insert(f.name.clone(), N_IMPORTS + N_HELPERS + i as u32);
@@ -241,6 +338,42 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
         );
     }
 
+    // ---- closures: collect lambdas and named-function values upfront ----
+    let mut fn_value_names: Vec<String> = Vec::new();
+    for f in &reachable {
+        collect_lambdas_stmts(&f.body, &mut c.lambdas);
+        for ct in f.requires.iter().chain(f.ensures.iter()) {
+            collect_lambdas_expr(&ct.expr, &mut c.lambdas);
+        }
+        collect_fn_value_names_stmts(&f.body, &mut fn_value_names);
+        for ct in f.requires.iter().chain(f.ensures.iter()) {
+            let wrapper = [Stmt {
+                kind: StmtKind::Expr(ct.expr.clone()),
+                span: ct.expr.span,
+            }];
+            collect_fn_value_names_stmts(&wrapper, &mut fn_value_names);
+        }
+    }
+    fn_value_names.retain(|n| c.signatures.contains_key(n));
+    fn_value_names.sort();
+    fn_value_names.dedup();
+
+    // function indices: imports, helpers, user fns, wrappers, lambdas
+    let wrapper_base = N_IMPORTS + N_HELPERS + reachable.len() as u32;
+    let lambda_base = wrapper_base + fn_value_names.len() as u32;
+    let lambda_ids: Vec<usize> = c.lambdas.keys().copied().collect();
+    // table slots: wrappers first, then lambdas
+    let mut slot = 0u32;
+    for name in &fn_value_names {
+        c.wrapper_slot.insert(name.clone(), slot);
+        slot += 1;
+    }
+    for id in &lambda_ids {
+        c.lambda_slot.insert(*id, slot);
+        slot += 1;
+    }
+    let n_slots = slot;
+
     // ---- compile function bodies first (they register func types/data) ----
     let helper_bodies = c.helper_bodies();
     let mut bodies: Vec<Vec<u8>> = Vec::new();
@@ -250,11 +383,38 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
         type_indices.push(type_idx);
         bodies.push(body);
     }
+    // wrappers: adapt a named function to the closure calling convention by
+    // dropping the trailing env parameter
+    let mut wrapper_type_indices: Vec<u32> = Vec::new();
+    let mut wrapper_bodies: Vec<Vec<u8>> = Vec::new();
+    for name in &fn_value_names {
+        let (params, ret) = c.signatures[name].clone();
+        let tidx = c.env_type_index(&params, &ret)?;
+        wrapper_type_indices.push(tidx);
+        let mut body = vec![0]; // no extra locals
+        for i in 0..params.len() as u32 {
+            body.push(OP_LOCAL_GET);
+            uleb(&mut body, i as u64);
+        }
+        body.push(OP_CALL);
+        uleb(&mut body, c.func_index[name] as u64);
+        body.push(OP_END);
+        wrapper_bodies.push(body);
+    }
+    // lambda bodies, parents before children so nested captures resolve
+    let mut lambda_type_indices: Vec<u32> = Vec::new();
+    let mut lambda_bodies: Vec<Vec<u8>> = Vec::new();
+    for id in &lambda_ids {
+        let l = c.lambdas[id].clone();
+        let (tidx, body) = c.compile_lambda(&l)?;
+        lambda_type_indices.push(tidx);
+        lambda_bodies.push(body);
+    }
 
     // ---- assemble the module ----
     let mut module = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
 
-    // type section: 3 array types + helper func types + user func types
+    // type section: fixed GC types + import/helper/user func types
     let helper_types: Vec<(Vec<u8>, Vec<u8>)> = vec![
         (
             vec![REF_NULL, TY_BYTES as u8, REF_NULL, TY_BYTES as u8],
@@ -276,11 +436,15 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
             vec![REF_NULL, TY_ARR_F64 as u8, F64],
             vec![REF_NULL, TY_ARR_F64 as u8],
         ), // push_f64
+        (
+            vec![REF_NULL, TY_ANYARR as u8, ANYREF],
+            vec![REF_NULL, TY_ANYARR as u8],
+        ), // push_any
         (vec![REF_NULL, TY_BYTES as u8], vec![I32]), // str_len
         (vec![REF_NULL, TY_BYTES as u8, I32], vec![I32]), // str_at
     ];
     let mut tsec = Vec::new();
-    let n_types = 3 + IMPORTS.len() + helper_types.len() + c.func_types.len();
+    let n_types = N_FIXED_TYPES as usize + IMPORTS.len() + helper_types.len() + c.func_types.len();
     uleb(&mut tsec, n_types as u64);
     // 0: bytes (array (mut i8))
     tsec.extend_from_slice(&[0x5e, 0x78, 0x01]);
@@ -288,10 +452,16 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
     tsec.extend_from_slice(&[0x5e, I64, 0x01]);
     // 2: array (mut f64)
     tsec.extend_from_slice(&[0x5e, F64, 0x01]);
-    // import func types (indices 3..)
+    // 3: array (mut anyref)
+    tsec.extend_from_slice(&[0x5e, ANYREF, 0x01]);
+    // 4: struct { i64 } (immutable field)
+    tsec.extend_from_slice(&[0x5f, 0x01, I64, 0x00]);
+    // 5: struct { f64 }
+    tsec.extend_from_slice(&[0x5f, 0x01, F64, 0x00]);
+    // import func types
     let mut import_type_idx = Vec::new();
     for (_, params, results) in IMPORTS {
-        import_type_idx.push(3 + import_type_idx.len() as u32);
+        import_type_idx.push(N_FIXED_TYPES + import_type_idx.len() as u32);
         tsec.push(0x60);
         uleb(&mut tsec, count_valtypes(params) as u64);
         tsec.extend_from_slice(params);
@@ -299,7 +469,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
         tsec.extend_from_slice(results);
     }
     // helper func types
-    let helper_type_base = 3 + IMPORTS.len() as u32;
+    let helper_type_base = N_FIXED_TYPES + IMPORTS.len() as u32;
     for (params, results) in &helper_types {
         tsec.push(0x60);
         uleb(&mut tsec, count_valtypes(params) as u64);
@@ -307,8 +477,8 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
         uleb(&mut tsec, count_valtypes(results) as u64);
         tsec.extend_from_slice(results);
     }
-    // user func types
-    let user_type_base = helper_type_base + helper_types.len() as u32;
+    // user func types (absolute index = USER_TYPE_BASE + relative)
+    debug_assert_eq!(helper_type_base + helper_types.len() as u32, USER_TYPE_BASE);
     for (params, results) in &c.func_types {
         tsec.push(0x60);
         uleb(&mut tsec, count_valtypes(params) as u64);
@@ -331,16 +501,31 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
     }
     section(&mut module, 2, &isec);
 
-    // function section: helpers then user functions
+    // function section: helpers, user functions, wrappers, lambdas
+    let n_funcs = N_HELPERS as usize + reachable.len() + wrapper_bodies.len() + lambda_bodies.len();
     let mut fsec = Vec::new();
-    uleb(&mut fsec, (N_HELPERS as usize + reachable.len()) as u64);
+    uleb(&mut fsec, n_funcs as u64);
     for i in 0..N_HELPERS {
         uleb(&mut fsec, (helper_type_base + i) as u64);
     }
-    for t in &type_indices {
-        uleb(&mut fsec, (user_type_base + t) as u64);
+    for t in type_indices
+        .iter()
+        .chain(wrapper_type_indices.iter())
+        .chain(lambda_type_indices.iter())
+    {
+        uleb(&mut fsec, (USER_TYPE_BASE + t) as u64);
     }
     section(&mut module, 3, &fsec);
+
+    // table section (for closures / function values)
+    if n_slots > 0 {
+        let mut tabsec = Vec::new();
+        uleb(&mut tabsec, 1);
+        tabsec.push(FUNCREF);
+        tabsec.push(0x00); // min only
+        uleb(&mut tabsec, n_slots as u64);
+        section(&mut module, 4, &tabsec);
+    }
 
     // export section: main + string accessors so the host can decode strings
     let mut esec = Vec::new();
@@ -358,6 +543,25 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
     }
     section(&mut module, 7, &esec);
 
+    // element section: fill the table, wrappers first then lambdas
+    if n_slots > 0 {
+        let mut elsec = Vec::new();
+        uleb(&mut elsec, 1); // one segment
+        uleb(&mut elsec, 0); // active, table 0, funcref, expr offset
+        elsec.push(OP_I32_CONST);
+        sleb(&mut elsec, 0);
+        elsec.push(OP_END);
+        uleb(&mut elsec, n_slots as u64);
+        // in slot order: wrappers (sorted names), then lambdas (ascending id)
+        for (i, _) in fn_value_names.iter().enumerate() {
+            uleb(&mut elsec, (wrapper_base + i as u32) as u64);
+        }
+        for (i, _) in lambda_ids.iter().enumerate() {
+            uleb(&mut elsec, (lambda_base + i as u32) as u64);
+        }
+        section(&mut module, 9, &elsec);
+    }
+
     // data count section (required when array.new_data is used)
     let mut dcsec = Vec::new();
     uleb(&mut dcsec, c.data_segments.len() as u64);
@@ -365,8 +569,13 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
 
     // code section
     let mut csec = Vec::new();
-    uleb(&mut csec, (N_HELPERS as usize + bodies.len()) as u64);
-    for b in helper_bodies.iter().chain(bodies.iter()) {
+    uleb(&mut csec, n_funcs as u64);
+    for b in helper_bodies
+        .iter()
+        .chain(bodies.iter())
+        .chain(wrapper_bodies.iter())
+        .chain(lambda_bodies.iter())
+    {
         uleb(&mut csec, b.len() as u64);
         csec.extend_from_slice(b);
     }
@@ -384,6 +593,10 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, Diagnostic> {
 
     Ok(module)
 }
+
+/// Absolute type index of the first user function type:
+/// fixed GC types + import types + helper types.
+const USER_TYPE_BASE: u32 = N_FIXED_TYPES + N_IMPORTS + N_HELPERS;
 
 /// Counts value types in a flat encoding (refs take 2 bytes).
 fn count_valtypes(bytes: &[u8]) -> usize {
@@ -464,12 +677,151 @@ fn collect_calls_expr(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
+/// Walks statements collecting every lambda (including nested ones).
+fn collect_lambdas_stmts(stmts: &[Stmt], out: &mut BTreeMap<usize, Lambda>) {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Let { value, .. }
+            | StmtKind::Assign { value, .. }
+            | StmtKind::Assert(value)
+            | StmtKind::Expr(value)
+            | StmtKind::Return(Some(value)) => collect_lambdas_expr(value, out),
+            StmtKind::IndexAssign { base, index, value } => {
+                collect_lambdas_expr(base, out);
+                collect_lambdas_expr(index, out);
+                collect_lambdas_expr(value, out);
+            }
+            StmtKind::FieldAssign { base, value, .. } => {
+                collect_lambdas_expr(base, out);
+                collect_lambdas_expr(value, out);
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                collect_lambdas_expr(cond, out);
+                collect_lambdas_stmts(then_body, out);
+                collect_lambdas_stmts(else_body, out);
+            }
+            StmtKind::While { cond, body } => {
+                collect_lambdas_expr(cond, out);
+                collect_lambdas_stmts(body, out);
+            }
+            StmtKind::For {
+                start, end, body, ..
+            } => {
+                collect_lambdas_expr(start, out);
+                collect_lambdas_expr(end, out);
+                collect_lambdas_stmts(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_lambdas_expr(e: &Expr, out: &mut BTreeMap<usize, Lambda>) {
+    match &e.kind {
+        ExprKind::Lambda(l) => {
+            out.insert(l.id, (**l).clone());
+            collect_lambdas_stmts(&l.body, out);
+        }
+        ExprKind::Array(elems) => elems.iter().for_each(|e| collect_lambdas_expr(e, out)),
+        ExprKind::Index(a, b) | ExprKind::Bin(_, a, b) => {
+            collect_lambdas_expr(a, out);
+            collect_lambdas_expr(b, out);
+        }
+        ExprKind::Field(a, _) | ExprKind::Un(_, a) => collect_lambdas_expr(a, out),
+        ExprKind::Call(_, args) => args.iter().for_each(|a| collect_lambdas_expr(a, out)),
+        ExprKind::Match(m) => {
+            collect_lambdas_expr(&m.scrutinee, out);
+            for arm in &m.arms {
+                collect_lambdas_expr(&arm.body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collects names that appear in value position (ExprKind::Var); those that
+/// resolve to top-level functions become table wrappers.
+fn collect_fn_value_names_stmts(stmts: &[Stmt], out: &mut Vec<String>) {
+    fn in_expr(e: &Expr, out: &mut Vec<String>) {
+        match &e.kind {
+            ExprKind::Var(name) => out.push(name.clone()),
+            ExprKind::Array(elems) => elems.iter().for_each(|e| in_expr(e, out)),
+            ExprKind::Index(a, b) | ExprKind::Bin(_, a, b) => {
+                in_expr(a, out);
+                in_expr(b, out);
+            }
+            ExprKind::Field(a, _) | ExprKind::Un(_, a) => in_expr(a, out),
+            ExprKind::Call(_, args) => args.iter().for_each(|a| in_expr(a, out)),
+            ExprKind::Lambda(l) => collect_fn_value_names_stmts(&l.body, out),
+            ExprKind::Match(m) => {
+                in_expr(&m.scrutinee, out);
+                for arm in &m.arms {
+                    in_expr(&arm.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Let { value, .. }
+            | StmtKind::Assign { value, .. }
+            | StmtKind::Assert(value)
+            | StmtKind::Expr(value)
+            | StmtKind::Return(Some(value)) => in_expr(value, out),
+            StmtKind::IndexAssign { base, index, value } => {
+                in_expr(base, out);
+                in_expr(index, out);
+                in_expr(value, out);
+            }
+            StmtKind::FieldAssign { base, value, .. } => {
+                in_expr(base, out);
+                in_expr(value, out);
+            }
+            StmtKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                in_expr(cond, out);
+                collect_fn_value_names_stmts(then_body, out);
+                collect_fn_value_names_stmts(else_body, out);
+            }
+            StmtKind::While { cond, body } => {
+                in_expr(cond, out);
+                collect_fn_value_names_stmts(body, out);
+            }
+            StmtKind::For {
+                start, end, body, ..
+            } => {
+                in_expr(start, out);
+                in_expr(end, out);
+                collect_fn_value_names_stmts(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 struct Compiler {
     func_index: HashMap<String, u32>,
     signatures: HashMap<String, (Vec<Type>, Type)>,
     /// user function types (params bytes, results bytes), deduped by content
     func_types: Vec<(Vec<u8>, Vec<u8>)>,
     data_segments: Vec<Vec<u8>>,
+    structs: HashMap<String, Vec<Param>>,
+    enums: HashMap<String, Vec<EnumVariant>>,
+    lambdas: BTreeMap<usize, Lambda>,
+    /// lambda id -> table slot
+    lambda_slot: HashMap<usize, u32>,
+    /// lambda id -> captured (name, type), recorded at the creation site
+    lambda_captures: HashMap<usize, Vec<(String, Type)>>,
+    /// named function value -> table slot (wrapper drops the env argument)
+    wrapper_slot: HashMap<String, u32>,
 }
 
 struct Frame {
@@ -477,7 +829,6 @@ struct Frame {
 }
 
 enum FrameKind {
-    Block,
     Loop,
     If,
     /// target for `break`
@@ -531,6 +882,26 @@ impl Ctx {
     }
 }
 
+/// Locals declaration (grouping consecutive identical valtypes) + code.
+fn assemble_body(ctx: &Ctx, code: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    let extra: Vec<&Vec<u8>> = ctx.locals[ctx.n_params as usize..].iter().collect();
+    let mut groups: Vec<(u64, Vec<u8>)> = Vec::new();
+    for enc in extra {
+        match groups.last_mut() {
+            Some((n, e)) if e == enc => *n += 1,
+            _ => groups.push((1, enc.clone())),
+        }
+    }
+    uleb(&mut body, groups.len() as u64);
+    for (n, enc) in groups {
+        uleb(&mut body, n);
+        body.extend_from_slice(&enc);
+    }
+    body.extend_from_slice(code);
+    body
+}
+
 impl Compiler {
     fn func_type_index(&mut self, params: Vec<u8>, results: Vec<u8>) -> u32 {
         for (i, ft) in self.func_types.iter().enumerate() {
@@ -550,6 +921,62 @@ impl Compiler {
         }
         self.data_segments.push(s.as_bytes().to_vec());
         (self.data_segments.len() - 1) as u32
+    }
+
+    /// Type index (relative to USER_TYPE_BASE) of the closure calling
+    /// convention for this signature: params plus a hidden env parameter.
+    fn env_type_index(&mut self, params: &[Type], ret: &Type) -> Result<u32, Diagnostic> {
+        let span = Span::new(0, 0);
+        let mut p = Vec::new();
+        for t in params {
+            let vt = valtype(t, span)?.ok_or_else(|| e070("unit parameters", span))?;
+            p.extend_from_slice(&vt);
+        }
+        p.extend_from_slice(&[REF_NULL, TY_ANYARR as u8]);
+        let r = valtype(ret, span)?.unwrap_or_default();
+        Ok(self.func_type_index(p, r))
+    }
+
+    /// Compiles a lambda as a function taking its params plus the closure
+    /// (env) reference; captures load from env slots 1.. at entry.
+    fn compile_lambda(&mut self, l: &Lambda) -> Result<(u32, Vec<u8>), Diagnostic> {
+        let params: Vec<Type> = l.params.iter().map(|p| p.ty.clone()).collect();
+        let type_idx = self.env_type_index(&params, &l.ret)?;
+        let mut ctx = Ctx {
+            scopes: vec![HashMap::new()],
+            locals: Vec::new(),
+            n_params: l.params.len() as u32 + 1,
+            frames: Vec::new(),
+            ret: l.ret.clone(),
+            result_local: None,
+        };
+        for p in &l.params {
+            let enc = valtype(&p.ty, p.span)?.unwrap();
+            ctx.add_local(&p.name, p.ty.clone(), enc);
+        }
+        let env_idx = ctx.add_temp(vec![REF_NULL, TY_ANYARR as u8]);
+        let mut code = Vec::new();
+        let captures = self.lambda_captures.get(&l.id).cloned().unwrap_or_default();
+        for (i, (name, ty)) in captures.iter().enumerate() {
+            code.push(OP_LOCAL_GET);
+            uleb(&mut code, env_idx as u64);
+            code.push(OP_I32_CONST);
+            sleb(&mut code, (i + 1) as i64);
+            code.push(GC_PREFIX);
+            code.push(GC_ARRAY_GET);
+            uleb(&mut code, TY_ANYARR as u64);
+            unbox_value(&mut code, ty);
+            let enc = valtype(ty, Span::new(0, 0))?.unwrap();
+            let idx = ctx.add_local(name, ty.clone(), enc);
+            code.push(OP_LOCAL_SET);
+            uleb(&mut code, idx as u64);
+        }
+        let falls_through = self.compile_block(&mut code, &l.body, &mut ctx)?;
+        if l.ret != Type::Unit && falls_through {
+            code.push(OP_UNREACHABLE);
+        }
+        code.push(OP_END);
+        Ok((type_idx, assemble_body(&ctx, &code)))
     }
 
     fn compile_function(&mut self, f: &Function) -> Result<(u32, Vec<u8>), Diagnostic> {
@@ -635,25 +1062,7 @@ impl Compiler {
             code.push(OP_UNREACHABLE);
         }
         code.push(OP_END);
-
-        // assemble: locals declaration + code
-        let mut body = Vec::new();
-        let extra: Vec<&Vec<u8>> = ctx.locals[ctx.n_params as usize..].iter().collect();
-        // group consecutive identical valtypes
-        let mut groups: Vec<(u64, Vec<u8>)> = Vec::new();
-        for enc in extra {
-            match groups.last_mut() {
-                Some((n, e)) if e == enc => *n += 1,
-                _ => groups.push((1, enc.clone())),
-            }
-        }
-        uleb(&mut body, groups.len() as u64);
-        for (n, enc) in groups {
-            uleb(&mut body, n);
-            body.extend_from_slice(&enc);
-        }
-        body.extend_from_slice(&code);
-        Ok((type_idx, body))
+        Ok((type_idx, assemble_body(&ctx, &code)))
     }
 
     /// Compiles a block of statements. Returns whether control can fall
@@ -711,17 +1120,39 @@ impl Compiler {
                 let Type::Array(elem) = bty else {
                     return Err(e070("index-assignment on this type", stmt.span));
                 };
-                let arr_ty = array_type_index(&elem, stmt.span)?;
+                let arr_ty = array_type_index(&elem);
                 self.compile_expr(code, base, ctx, None)?;
                 self.compile_expr(code, index, ctx, None)?;
                 code.push(OP_I32_WRAP_I64);
                 self.compile_expr(code, value, ctx, Some(&elem))?;
+                if arr_ty == TY_ANYARR {
+                    box_value(code, &elem);
+                }
                 code.push(GC_PREFIX);
                 code.push(GC_ARRAY_SET);
                 uleb(code, arr_ty as u64);
                 Ok(true)
             }
-            StmtKind::FieldAssign { .. } => Err(e070("structs", stmt.span)),
+            StmtKind::FieldAssign { base, field, value } => {
+                let Type::Struct(sname) = self.expr_type(base, ctx)? else {
+                    return Err(e070("field assignment on this type", stmt.span));
+                };
+                let fields = self.structs[&sname].clone();
+                let idx = fields
+                    .iter()
+                    .position(|f| f.name == *field)
+                    .expect("checked field");
+                let fty = fields[idx].ty.clone();
+                self.compile_expr(code, base, ctx, None)?;
+                code.push(OP_I32_CONST);
+                sleb(code, idx as i64);
+                self.compile_expr(code, value, ctx, Some(&fty))?;
+                box_value(code, &fty);
+                code.push(GC_PREFIX);
+                code.push(GC_ARRAY_SET);
+                uleb(code, TY_ANYARR as u64);
+                Ok(true)
+            }
             StmtKind::If {
                 cond,
                 then_body,
@@ -888,18 +1319,48 @@ impl Compiler {
         }
     }
 
+    /// The parser writes every named type as Type::Struct; rewrite to
+    /// Type::Enum when the name is an enum (matches the checker's norm()).
+    fn norm(&self, t: Type) -> Type {
+        match t {
+            Type::Struct(n) if self.enums.contains_key(&n) => Type::Enum(n),
+            Type::Array(inner) => Type::Array(Box::new(self.norm(*inner))),
+            Type::Fn(params, ret) => Type::Fn(
+                params.into_iter().map(|p| self.norm(p)).collect(),
+                Box::new(self.norm(*ret)),
+            ),
+            other => other,
+        }
+    }
+
     /// Static type of an expression (the program is already fully checked
     /// and monomorphized, so this cannot fail on well-typed input).
-    fn expr_type(&self, expr: &Expr, ctx: &Ctx) -> Result<Type, Diagnostic> {
+    fn expr_type(&self, expr: &Expr, ctx: &mut Ctx) -> Result<Type, Diagnostic> {
+        let t = self.expr_type_raw(expr, ctx)?;
+        Ok(self.norm(t))
+    }
+
+    fn expr_type_raw(&self, expr: &Expr, ctx: &mut Ctx) -> Result<Type, Diagnostic> {
         Ok(match &expr.kind {
             ExprKind::Int(_) => Type::Int,
             ExprKind::Float(_) => Type::Float,
             ExprKind::Bool(_) => Type::Bool,
             ExprKind::Str(_) => Type::Str,
             ExprKind::Var(name) => {
-                ctx.lookup(name)
-                    .map(|(_, t)| t)
-                    .ok_or_else(|| e070("first-class function values", expr.span))?
+                if let Some((_, t)) = ctx.lookup(name) {
+                    t
+                } else if let Some(colon) = name.rfind("::") {
+                    let enum_name = &name[..colon];
+                    if self.enums.contains_key(enum_name) {
+                        Type::Enum(enum_name.to_string())
+                    } else {
+                        return Err(e070(&format!("the name '{}'", name), expr.span));
+                    }
+                } else if let Some((params, ret)) = self.signatures.get(name) {
+                    Type::Fn(params.clone(), Box::new(ret.clone()))
+                } else {
+                    return Err(e070(&format!("the name '{}'", name), expr.span));
+                }
             }
             ExprKind::Array(elems) => {
                 let elem = match elems.first() {
@@ -912,7 +1373,17 @@ impl Compiler {
                 Type::Array(e) => *e,
                 _ => return Err(e070("indexing this type", expr.span)),
             },
-            ExprKind::Field(_, _) => return Err(e070("structs", expr.span)),
+            ExprKind::Field(base, field) => {
+                let Type::Struct(sname) = self.expr_type(base, ctx)? else {
+                    return Err(e070("field access on this type", expr.span));
+                };
+                self.structs[&sname]
+                    .iter()
+                    .find(|f| f.name == *field)
+                    .expect("checked field")
+                    .ty
+                    .clone()
+            }
             ExprKind::Bin(op, lhs, _) => {
                 use BinOp::*;
                 match op {
@@ -931,6 +1402,18 @@ impl Compiler {
                 "substr" | "chr" => Type::Str,
                 "push" => self.expr_type(&args[0], ctx)?,
                 _ => {
+                    if let Some((_, Type::Fn(_, ret))) = ctx.lookup(name) {
+                        return Ok(*ret);
+                    }
+                    if let Some(colon) = name.rfind("::") {
+                        let enum_name = &name[..colon];
+                        if self.enums.contains_key(enum_name) {
+                            return Ok(Type::Enum(enum_name.to_string()));
+                        }
+                    }
+                    if self.structs.contains_key(name) {
+                        return Ok(Type::Struct(name.clone()));
+                    }
                     let (_, ret) = self
                         .signatures
                         .get(name)
@@ -938,9 +1421,49 @@ impl Compiler {
                     ret.clone()
                 }
             },
-            ExprKind::Lambda(_) => return Err(e070("closures", expr.span)),
-            ExprKind::Match(_) => return Err(e070("match expressions", expr.span)),
+            ExprKind::Lambda(l) => Type::Fn(
+                l.params.iter().map(|p| p.ty.clone()).collect(),
+                Box::new(l.ret.clone()),
+            ),
+            ExprKind::Match(m) => {
+                let scrut_ty = self.expr_type(&m.scrutinee, ctx)?;
+                let arm = m
+                    .arms
+                    .first()
+                    .ok_or_else(|| e070("empty match expressions", expr.span))?;
+                let mut frame = HashMap::new();
+                self.pattern_type_frame(&arm.pattern, &scrut_ty, &mut frame);
+                ctx.scopes.push(frame);
+                let t = self.expr_type(&arm.body, ctx);
+                ctx.scopes.pop();
+                t?
+            }
         })
+    }
+
+    /// Records pattern binding types (with dummy local indices) so arm
+    /// bodies can be typed before their binding code is emitted.
+    fn pattern_type_frame(
+        &self,
+        pattern: &Pattern,
+        scrut_ty: &Type,
+        frame: &mut HashMap<String, (u32, Type)>,
+    ) {
+        match pattern {
+            Pattern::Var(name) => {
+                frame.insert(name.clone(), (u32::MAX, scrut_ty.clone()));
+            }
+            Pattern::VariantPayload(enum_name, variant_name, inner) => {
+                if let Some(variants) = self.enums.get(enum_name) {
+                    if let Some(v) = variants.iter().find(|v| v.name == *variant_name) {
+                        if let Some(payload_ty) = &v.payload {
+                            self.pattern_type_frame(inner, payload_ty, frame);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn compile_expr(
@@ -975,11 +1498,46 @@ impl Compiler {
                 uleb(code, seg as u64);
             }
             ExprKind::Var(name) => {
-                let (idx, _) = ctx
-                    .lookup(name)
-                    .ok_or_else(|| e070("first-class function values", expr.span))?;
-                code.push(OP_LOCAL_GET);
-                uleb(code, idx as u64);
+                if let Some((idx, _)) = ctx.lookup(name) {
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, idx as u64);
+                } else if let Some(colon) = name.rfind("::") {
+                    // payload-less enum variant value: [box(tag), null]
+                    let enum_name = &name[..colon];
+                    let variant_name = &name[colon + 2..];
+                    let variants = self
+                        .enums
+                        .get(enum_name)
+                        .ok_or_else(|| e070(&format!("the name '{}'", name), expr.span))?;
+                    let tag = variants
+                        .iter()
+                        .position(|v| v.name == variant_name)
+                        .expect("checked variant");
+                    code.push(OP_I64_CONST);
+                    sleb(code, tag as i64);
+                    code.push(GC_PREFIX);
+                    code.push(GC_STRUCT_NEW);
+                    uleb(code, TY_BOXI64 as u64);
+                    code.push(OP_REF_NULL);
+                    code.push(ANYREF);
+                    code.push(GC_PREFIX);
+                    code.push(GC_ARRAY_NEW_FIXED);
+                    uleb(code, TY_ANYARR as u64);
+                    uleb(code, 2);
+                } else if let Some(&slot) = self.wrapper_slot.get(name) {
+                    // named function as a value: singleton closure [box(slot)]
+                    code.push(OP_I64_CONST);
+                    sleb(code, slot as i64);
+                    code.push(GC_PREFIX);
+                    code.push(GC_STRUCT_NEW);
+                    uleb(code, TY_BOXI64 as u64);
+                    code.push(GC_PREFIX);
+                    code.push(GC_ARRAY_NEW_FIXED);
+                    uleb(code, TY_ANYARR as u64);
+                    uleb(code, 1);
+                } else {
+                    return Err(e070(&format!("the name '{}'", name), expr.span));
+                }
             }
             ExprKind::Array(elems) => {
                 let elem_ty = if let Some(first) = elems.first() {
@@ -990,9 +1548,12 @@ impl Compiler {
                         _ => Type::Int,
                     }
                 };
-                let arr_ty = array_type_index(&elem_ty, expr.span)?;
+                let arr_ty = array_type_index(&elem_ty);
                 for e in elems {
                     self.compile_expr(code, e, ctx, Some(&elem_ty))?;
+                    if arr_ty == TY_ANYARR {
+                        box_value(code, &elem_ty);
+                    }
                 }
                 code.push(GC_PREFIX);
                 code.push(GC_ARRAY_NEW_FIXED);
@@ -1003,18 +1564,38 @@ impl Compiler {
                 let bty = self.expr_type(base, ctx)?;
                 match bty {
                     Type::Array(elem) => {
-                        let arr_ty = array_type_index(&elem, expr.span)?;
+                        let arr_ty = array_type_index(&elem);
                         self.compile_expr(code, base, ctx, None)?;
                         self.compile_expr(code, index, ctx, None)?;
                         code.push(OP_I32_WRAP_I64);
                         code.push(GC_PREFIX);
                         code.push(GC_ARRAY_GET);
                         uleb(code, arr_ty as u64);
+                        if arr_ty == TY_ANYARR {
+                            unbox_value(code, &elem);
+                        }
                     }
                     _ => return Err(e070("indexing this type", expr.span)),
                 }
             }
-            ExprKind::Field(_, _) => return Err(e070("structs", expr.span)),
+            ExprKind::Field(base, field) => {
+                let Type::Struct(sname) = self.expr_type(base, ctx)? else {
+                    return Err(e070("field access on this type", expr.span));
+                };
+                let fields = self.structs[&sname].clone();
+                let idx = fields
+                    .iter()
+                    .position(|f| f.name == *field)
+                    .expect("checked field");
+                let fty = fields[idx].ty.clone();
+                self.compile_expr(code, base, ctx, None)?;
+                code.push(OP_I32_CONST);
+                sleb(code, idx as i64);
+                code.push(GC_PREFIX);
+                code.push(GC_ARRAY_GET);
+                uleb(code, TY_ANYARR as u64);
+                unbox_value(code, &fty);
+            }
             ExprKind::Un(op, inner) => match op {
                 UnOp::Neg => {
                     let ty = self.expr_type(inner, ctx)?;
@@ -1112,6 +1693,32 @@ impl Compiler {
                 code.push(opcode);
             }
             ExprKind::Call(name, args) => match name.as_str() {
+                // a variable holding a function value: indirect call
+                _ if matches!(ctx.lookup(name), Some((_, Type::Fn(_, _)))) => {
+                    let Some((idx, Type::Fn(params, ret))) = ctx.lookup(name) else {
+                        unreachable!()
+                    };
+                    for (a, p) in args.iter().zip(params.iter()) {
+                        self.compile_expr(code, a, ctx, Some(p))?;
+                    }
+                    // hidden env argument (the closure itself)
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, idx as u64);
+                    // table slot from closure[0]
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, idx as u64);
+                    code.push(OP_I32_CONST);
+                    sleb(code, 0);
+                    code.push(GC_PREFIX);
+                    code.push(GC_ARRAY_GET);
+                    uleb(code, TY_ANYARR as u64);
+                    unbox_value(code, &Type::Int);
+                    code.push(OP_I32_WRAP_I64);
+                    let tidx = self.env_type_index(&params, &ret)?;
+                    code.push(OP_CALL_INDIRECT);
+                    uleb(code, (USER_TYPE_BASE + tidx) as u64);
+                    uleb(code, 0); // table 0
+                }
                 "print" => {
                     let aty = self.expr_type(&args[0], ctx)?;
                     self.compile_expr(code, &args[0], ctx, None)?;
@@ -1133,13 +1740,19 @@ impl Compiler {
                 }
                 "push" => {
                     let aty = self.expr_type(&args[0], ctx)?;
-                    let helper = match &aty {
-                        Type::Array(e) if **e == Type::Int => HELP_PUSH_I64,
-                        Type::Array(e) if **e == Type::Float => HELP_PUSH_F64,
-                        other => return Err(e070(&format!("push on '{}'", other), expr.span)),
+                    let Type::Array(elem) = &aty else {
+                        return Err(e070(&format!("push on '{}'", aty), expr.span));
+                    };
+                    let (helper, boxed) = match elem.as_ref() {
+                        Type::Int => (HELP_PUSH_I64, false),
+                        Type::Float => (HELP_PUSH_F64, false),
+                        _ => (HELP_PUSH_ANY, true),
                     };
                     self.compile_expr(code, &args[0], ctx, None)?;
-                    self.compile_expr(code, &args[1], ctx, None)?;
+                    self.compile_expr(code, &args[1], ctx, Some(elem))?;
+                    if boxed {
+                        box_value(code, elem);
+                    }
                     code.push(OP_CALL);
                     uleb(code, helper as u64);
                 }
@@ -1176,6 +1789,45 @@ impl Compiler {
                     uleb(code, 1);
                 }
                 _ => {
+                    // enum variant constructor with payload: [box(tag), payload]
+                    if let Some(colon) = name.rfind("::") {
+                        let enum_name = &name[..colon];
+                        let variant_name = &name[colon + 2..];
+                        if let Some(variants) = self.enums.get(enum_name).cloned() {
+                            let tag = variants
+                                .iter()
+                                .position(|v| v.name == variant_name)
+                                .expect("checked variant");
+                            let payload_ty = variants[tag]
+                                .payload
+                                .clone()
+                                .expect("payload constructor is a call");
+                            code.push(OP_I64_CONST);
+                            sleb(code, tag as i64);
+                            code.push(GC_PREFIX);
+                            code.push(GC_STRUCT_NEW);
+                            uleb(code, TY_BOXI64 as u64);
+                            self.compile_expr(code, &args[0], ctx, Some(&payload_ty))?;
+                            box_value(code, &payload_ty);
+                            code.push(GC_PREFIX);
+                            code.push(GC_ARRAY_NEW_FIXED);
+                            uleb(code, TY_ANYARR as u64);
+                            uleb(code, 2);
+                            return Ok(());
+                        }
+                    }
+                    // struct constructor: fields boxed into an $anyarr
+                    if let Some(fields) = self.structs.get(name).cloned() {
+                        for (fld, a) in fields.iter().zip(args.iter()) {
+                            self.compile_expr(code, a, ctx, Some(&fld.ty))?;
+                            box_value(code, &fld.ty);
+                        }
+                        code.push(GC_PREFIX);
+                        code.push(GC_ARRAY_NEW_FIXED);
+                        uleb(code, TY_ANYARR as u64);
+                        uleb(code, fields.len() as u64);
+                        return Ok(());
+                    }
                     let idx = *self
                         .func_index
                         .get(name)
@@ -1188,8 +1840,202 @@ impl Compiler {
                     uleb(code, idx as u64);
                 }
             },
-            ExprKind::Lambda(_) => return Err(e070("closures", expr.span)),
-            ExprKind::Match(_) => return Err(e070("match expressions", expr.span)),
+            ExprKind::Lambda(l) => {
+                // build the closure: [box(table slot), boxed captures...]
+                let mut captures: Vec<(String, Type)> = Vec::new();
+                for n in l.free_names() {
+                    if let Some((_, ty)) = ctx.lookup(&n) {
+                        captures.push((n, ty));
+                    }
+                }
+                self.lambda_captures.insert(l.id, captures.clone());
+                let slot = self.lambda_slot[&l.id];
+                code.push(OP_I64_CONST);
+                sleb(code, slot as i64);
+                code.push(GC_PREFIX);
+                code.push(GC_STRUCT_NEW);
+                uleb(code, TY_BOXI64 as u64);
+                for (name, ty) in &captures {
+                    let (idx, _) = ctx.lookup(name).expect("capture in scope");
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, idx as u64);
+                    box_value(code, ty);
+                }
+                code.push(GC_PREFIX);
+                code.push(GC_ARRAY_NEW_FIXED);
+                uleb(code, TY_ANYARR as u64);
+                uleb(code, (1 + captures.len()) as u64);
+            }
+            ExprKind::Match(m) => {
+                // scrutinee into a temp, nested ifs set a result local
+                let scrut_ty = self.expr_type(&m.scrutinee, ctx)?;
+                let scrut_enc = valtype(&scrut_ty, expr.span)?
+                    .ok_or_else(|| e070("matching on unit", expr.span))?;
+                self.compile_expr(code, &m.scrutinee, ctx, None)?;
+                let scrut_local = ctx.add_temp(scrut_enc);
+                code.push(OP_LOCAL_SET);
+                uleb(code, scrut_local as u64);
+
+                let result_ty = match expected {
+                    Some(t) => t.clone(),
+                    None => self.expr_type(expr, ctx)?,
+                };
+                let result_local = match valtype(&result_ty, expr.span)? {
+                    Some(enc) => Some(ctx.add_temp(enc)),
+                    None => None,
+                };
+
+                let mut opened_ifs = 0;
+                for (arm_idx, arm) in m.arms.iter().enumerate() {
+                    let is_last = arm_idx == m.arms.len() - 1;
+                    let has_check =
+                        !matches!(arm.pattern, Pattern::Wildcard | Pattern::Var(_));
+                    if has_check && !is_last {
+                        self.compile_pattern_check(
+                            code,
+                            &arm.pattern,
+                            scrut_local,
+                            &scrut_ty,
+                            ctx,
+                        )?;
+                        code.push(OP_IF);
+                        code.push(0x40);
+                        opened_ifs += 1;
+                    }
+                    ctx.scopes.push(HashMap::new());
+                    self.bind_pattern_vars(code, &arm.pattern, scrut_local, &scrut_ty, ctx)?;
+                    self.compile_expr(code, &arm.body, ctx, Some(&result_ty))?;
+                    ctx.scopes.pop();
+                    if let Some(r) = result_local {
+                        code.push(OP_LOCAL_SET);
+                        uleb(code, r as u64);
+                    }
+                    if has_check && !is_last {
+                        code.push(OP_ELSE);
+                    }
+                }
+                for _ in 0..opened_ifs {
+                    code.push(OP_END);
+                }
+                if let Some(r) = result_local {
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, r as u64);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Leaves an i32 (0/1) on the stack: does the scrutinee match?
+    fn compile_pattern_check(
+        &mut self,
+        code: &mut Vec<u8>,
+        pattern: &Pattern,
+        scrut_local: u32,
+        scrut_ty: &Type,
+        ctx: &mut Ctx,
+    ) -> Result<(), Diagnostic> {
+        let _ = ctx;
+        match pattern {
+            Pattern::Wildcard | Pattern::Var(_) => {
+                code.push(OP_I32_CONST);
+                sleb(code, 1);
+            }
+            Pattern::Int(v) => {
+                code.push(OP_LOCAL_GET);
+                uleb(code, scrut_local as u64);
+                code.push(OP_I64_CONST);
+                sleb(code, *v);
+                code.push(OP_I64_EQ);
+            }
+            Pattern::Bool(v) => {
+                code.push(OP_LOCAL_GET);
+                uleb(code, scrut_local as u64);
+                code.push(OP_I32_CONST);
+                sleb(code, if *v { 1 } else { 0 });
+                code.push(OP_I32_EQ);
+            }
+            Pattern::Str(s) => {
+                code.push(OP_LOCAL_GET);
+                uleb(code, scrut_local as u64);
+                let seg = self.intern_string(s);
+                code.push(OP_I32_CONST);
+                sleb(code, 0);
+                code.push(OP_I32_CONST);
+                sleb(code, s.len() as i64);
+                code.push(GC_PREFIX);
+                code.push(GC_ARRAY_NEW_DATA);
+                uleb(code, TY_BYTES as u64);
+                uleb(code, seg as u64);
+                code.push(OP_CALL);
+                uleb(code, HELP_STREQ as u64);
+            }
+            Pattern::Variant(_, variant_name)
+            | Pattern::VariantPayload(_, variant_name, _) => {
+                let Type::Enum(enum_name) = scrut_ty else {
+                    unreachable!("checked: variant pattern on enum scrutinee");
+                };
+                let tag = self.enums[enum_name]
+                    .iter()
+                    .position(|v| v.name == *variant_name)
+                    .expect("checked variant");
+                code.push(OP_LOCAL_GET);
+                uleb(code, scrut_local as u64);
+                code.push(OP_I32_CONST);
+                sleb(code, 0);
+                code.push(GC_PREFIX);
+                code.push(GC_ARRAY_GET);
+                uleb(code, TY_ANYARR as u64);
+                unbox_value(code, &Type::Int);
+                code.push(OP_I64_CONST);
+                sleb(code, tag as i64);
+                code.push(OP_I64_EQ);
+            }
+        }
+        Ok(())
+    }
+
+    /// Binds pattern variables as fresh locals in the current scope frame.
+    fn bind_pattern_vars(
+        &mut self,
+        code: &mut Vec<u8>,
+        pattern: &Pattern,
+        scrut_local: u32,
+        scrut_ty: &Type,
+        ctx: &mut Ctx,
+    ) -> Result<(), Diagnostic> {
+        match pattern {
+            Pattern::Var(name) => {
+                let enc = valtype(scrut_ty, Span::new(0, 0))?.unwrap();
+                let idx = ctx.add_local(name, scrut_ty.clone(), enc);
+                code.push(OP_LOCAL_GET);
+                uleb(code, scrut_local as u64);
+                code.push(OP_LOCAL_SET);
+                uleb(code, idx as u64);
+            }
+            Pattern::VariantPayload(enum_name, variant_name, inner) => {
+                let variants = self.enums[enum_name].clone();
+                let variant = variants
+                    .iter()
+                    .find(|v| v.name == *variant_name)
+                    .expect("checked variant");
+                if let Some(payload_ty) = &variant.payload {
+                    let enc = valtype(payload_ty, Span::new(0, 0))?.unwrap();
+                    let payload_local = ctx.add_temp(enc);
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, scrut_local as u64);
+                    code.push(OP_I32_CONST);
+                    sleb(code, 1);
+                    code.push(GC_PREFIX);
+                    code.push(GC_ARRAY_GET);
+                    uleb(code, TY_ANYARR as u64);
+                    unbox_value(code, payload_ty);
+                    code.push(OP_LOCAL_SET);
+                    uleb(code, payload_local as u64);
+                    self.bind_pattern_vars(code, inner, payload_local, payload_ty, ctx)?;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1202,6 +2048,7 @@ impl Compiler {
             self.body_substr(),
             self.body_push(TY_ARR_I64, I64),
             self.body_push(TY_ARR_F64, F64),
+            self.body_push(TY_ANYARR, ANYREF),
             self.body_str_len(),
             self.body_str_at(),
         ]

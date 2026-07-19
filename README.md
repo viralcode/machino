@@ -104,13 +104,16 @@ A new language starts with zero corpus, which is the real moat and the real risk
 
 ## How it works
 
-The whole pipeline is ~8,500 lines of dependency-free Rust — small enough to read in a day:
+The whole pipeline is ~15,000 lines of dependency-free Rust — small enough to read in a weekend:
 
 | Path | What it is |
 |---|---|
 | `src/lexer.rs` → `src/parser.rs` → `src/checker.rs` | frontend: newline-terminated grammar, full static typing, stable `E0xx` diagnostics |
 | `src/interp.rs` | reference interpreter + native runtime: files, stdin, env, TCP sockets (`run`, `test`) |
-| `src/wasm.rs` | WebAssembly **binary emitter**: hand-rolled encoding, closures, and a mark-sweep GC — no LLVM, no external toolchain |
+| `src/wasm.rs` | WebAssembly **binary emitter**: hand-rolled encoding, closures, threads, and a mark-sweep GC — no LLVM, no external toolchain |
+| `src/wasmgc.rs` | second backend targeting the **WASM-GC proposal** (`build --gc`): the host's collector manages memory |
+| `src/mono.rs` | monomorphization: generic templates become concrete functions before codegen |
+| `src/smt.rs` | static contract verification with Z3 (`check --verify`) |
 | `src/pkg.rs` | the package system: manifest, installer, lockfile |
 | `src/std.mno` | the standard prelude, written in machino itself |
 | `src/synth.rs` | verified-corpus generator |
@@ -135,14 +138,14 @@ The `machino run` interpreter doubles as a **native runtime** with files, stdin,
 ## Language at a glance
 
 - **Types:** `int` (i64, checked arithmetic), `float` (f64), `bool`, `str`, `[T]`, structs, enums, `fn(T...) -> R` function values — no implicit conversions, ever
-- **Generics:** `fn<T: Ord> max2(a: T, b: T) -> T` with call-site type inference and constraint bounds (`Eq`, `Ord`, `Num`), monomorphized at compile time so both backends stay simple
+- **Generics:** `fn<T: Ord> max2(a: T, b: T) -> T` with call-site type inference, constraint bounds (`Eq`, `Ord`, `Num`), `+` for multiple bounds, and `where` clauses — monomorphized at compile time so both backends stay simple
 - **Data modeling:** nominal `struct`s with positional constructors and field assignment, sum types (`enum`) with pattern matching — including recursive enums (`JArr([Json])`)
 - **Pattern matching:** exhaustive `match` expressions over enums and literals with compile-time coverage checks
 - **Closures:** lambdas capture enclosing variables by value — `fn(x: int) -> int { return x + n }` — compiled to lifted functions + closure objects, GC-managed
 - **Memory:** precise mark-sweep garbage collector compiled *into* every binary; allocation-heavy programs run in bounded memory on any WASM host
 - **Control flow:** `if` / `else`, `while`, `for i in a..b`, `break`, `continue`, `return`
 - **Contracts:** `requires` (checked at entry), `ensures` (checks `result` at exit) — enforced in the interpreter *and* in compiled WASM, with identical messages; `machino check --verify` proves a decidable subset statically with Z3
-- **Concurrency:** `spawn(f, args...)` runs a function on its own OS thread with deep-copied arguments (tasks share nothing); `join_int`/`join_float`/`join_bool`/`join_str` retrieve results — interpreter only
+- **Concurrency:** `spawn(f, args...)` runs a function on its own OS thread with deep-copied arguments (tasks share nothing); `join_int`/`join_float`/`join_bool`/`join_str` retrieve results — in the interpreter *and* in compiled WASM (shared-nothing worker threads)
 - **Std prelude, written in machino itself:** strings (`split`/`join`/`trim`/`find`/…), numbers (`sqrt`, `pow_int`, `pow_float`, `floor`/`ceil`/`round`, `parse_int`, `str_of_float`), **JSON parse + serialize** (`json_parse`, `json_serialize`), ISO-8601 time (`time_iso`, `time_from_ms`), `StrMap` and `IntMap`, sorting — dead-code-eliminated from compiled binaries
 - **Modules and packages:** `import "lib/util.mno"`, namespaced imports `import "geometry.mno" as geo` (then `geo::dist(...)`, `geo::Point`, `geo::Quadrant::First`), plus a package system — `machino pkg add mathx ../mathx` (or a git URL), then `import "pkg:mathx/mathx.mno"`, with transitive flattening, a lockfile, and `pkg publish`
 - **Testing:** `test` blocks with `assert`, snapshot tests (`test "x" expects "1\n2" { ... }` compares print output), plus `machino fuzz` for contract-driven property testing
@@ -158,7 +161,7 @@ Full details in [SPEC.md](SPEC.md), the formal grammar in [docs/grammar.ebnf](do
 | `machino check [--json] [--verify]` | typecheck; `--verify` statically proves contracts with Z3 (build with `--features smt`) |
 | `machino test [--json]` | run `test` blocks, including `expects` snapshots |
 | `machino run [--trace]` | interpret; `--trace` streams `{"event":"call",...}` JSON per user function call to stderr |
-| `machino build [-o out.wasm] [--gc]` | compile to WebAssembly; `--gc` targets the WASM-GC proposal instead of linear memory |
+| `machino build [-o out.wasm] [--gc] [--stack-mib N] [--no-cache]` | compile to WebAssembly (content-hash cached); `--gc` targets the WASM-GC proposal instead of linear memory |
 | `machino fmt [--check\|--stdout]` | canonical formatter; refuses any edit that would change the token stream |
 | `machino query file.mno [name]` | machine-readable signatures, generics, contracts of every top-level item |
 | `machino fuzz [--runs N]` | random-input property testing driven by `requires`/`ensures` |
@@ -167,11 +170,20 @@ Full details in [SPEC.md](SPEC.md), the formal grammar in [docs/grammar.ebnf](do
 
 ## Status and roadmap
 
-This is **v0.7**. Everything above is implemented and covered by the end-to-end suite (39 tests): interpreter/WASM byte-for-byte output parity for every language feature, generics, SMT verification, both WASM backends, namespaced imports, JSON/time/math/IntMap std modules, spawn/join concurrency, snapshot tests, formatter idempotence, trace and query output shapes.
+This is **v1.0**. Everything above is implemented and covered by the end-to-end suite (42 tests): interpreter/WASM byte-for-byte output parity for every language feature — on **both** backends — generics with `where` clauses, SMT verification, compiled spawn/join concurrency, namespaced imports, JSON/time/math/IntMap std modules, snapshot tests, formatter idempotence, trace and query output shapes.
 
-**Design limits (bounds, not gaps):** structs cap at 60 fields (GC bitmap), compiled memory at 1 GiB, call depth at 4096 (`MACHINO_MAX_DEPTH` overrides); `spawn`/`join` are interpreter-only (`build` rejects them with `E072`); the WASM-GC backend covers scalars/strings/arrays but not yet structs, enums, or closures (`E070`); SMT verification handles loop-free, call-free int/bool contracts.
+What 1.0 closed out:
 
-Planned next: a hosted package registry, threads in compiled WASM, `where` clauses, incremental compilation.
+- **Structs of any size** — large structs (>60 fields) switch to a multi-word GC bitmap in the data segment; no field cap.
+- **4 GiB compiled memory** — the full wasm32 address space (was 1 GiB).
+- **Configurable call depth** — `machino build --stack-mib N` sizes the compiled shadow stack (default 16 MiB); the interpreter honors `MACHINO_MAX_DEPTH`.
+- **Threads in compiled WASM** — `spawn`/`join` compile to shared-nothing worker threads (each task runs a fresh instance of the module; argument graphs are deep-copied by the host). Spawn targets must be named top-level functions (`E074`); the Node runner implements the task protocol with `worker_threads` + `Atomics`.
+- **WASM-GC backend at full parity** — structs, enums, closures, match, arrays of references, and contracts all compile with `--gc`; the reference GC host runs the same programs the linear backend does.
+- **Expanded SMT verification** — `machino check --verify` now inlines non-recursive int/bool calls (depth ≤ 8) and unrolls constant-bound `for` loops (≤ 128 iterations), so contracts over helper functions and fixed loops are proven statically.
+- **`where` clauses and `+` bounds** — `fn<T, U> f(...) where T: Ord + Num, U: Eq`.
+- **Incremental compilation** — `machino build` caches output keyed by a content hash of the whole source bundle, compiler version, and flags; unchanged builds are instant (`--no-cache` bypasses).
+
+**Remaining bounds:** SMT verification covers int/bool contracts (floats, strings, and unbounded loops fall back to always-on runtime enforcement); compiled spawn targets must be named top-level functions; the WASM-GC backend wraps on integer overflow (the linear backend traps) and needs a GC-capable host (Node 22+). A hosted package registry is the one roadmap item that stays out of the toolchain — `pkg publish` speaks the protocol; running a server is deliberately not the compiler's job.
 
 ## License
 

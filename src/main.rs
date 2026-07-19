@@ -24,19 +24,25 @@ const STD_PRELUDE: &str = include_str!("std.mno");
 const USAGE: &str = "machino — an AI-first language that compiles to WebAssembly
 
 USAGE:
-  machino check <file.mno> [--json]      type-check; emit structured diagnostics
-  machino test  <file.mno> [--json]      run test blocks (contracts enforced)
-  machino run   <file.mno> [args...]     run fn main() in the native runtime
-  machino build <file.mno> [-o out.wasm] compile to a portable .wasm module
+  machino check <file.mno> [--json] [--verify]   type-check; --verify proves contracts with Z3
+  machino test  <file.mno> [--json]              run test blocks (contracts enforced)
+  machino run   <file.mno> [args...] [--trace]   run fn main(); --trace emits JSON call events
+  machino build <file.mno> [-o out.wasm]         compile to a portable .wasm module
+                [--gc] [--stack-mib N] [--no-cache]
+  machino query <file.mno>                       JSON signatures of every top-level item
+  machino fmt   <file.mno> [--check]             canonical formatter
+  machino fuzz  <file.mno> [--runs N] [--seed S] contract-driven property testing
   machino synth [--count N] [--seed S] [--out DIR]  generate a verified corpus
 
   machino pkg init <name>                create a machino.pkg manifest here
   machino pkg add <name> <source> [ref]  add a dependency (path or git URL)
   machino pkg sync                       install deps into machino_modules/
+  machino pkg publish [--registry URL]   upload this package to a registry
 
 Import from packages with:  import \"pkg:<name>/<file>.mno\"
 
-Run .wasm output anywhere: browsers, Node (see runners/run.mjs), wasmtime, etc.";
+Run .wasm output anywhere: browsers, Node (see runners/run.mjs), wasmtime, etc.
+Built with --gc, output targets the WASM-GC proposal (runners/run-gc.mjs, Node 22+).";
 
 fn main() -> ExitCode {
     // the tree-walking interpreter recurses on the Rust stack; give it room
@@ -598,8 +604,19 @@ fn cmd_run(rest: &[String]) -> ExitCode {
     }
 }
 
+/// FNV-1a 64-bit content hash, used as the incremental build cache key.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 fn cmd_build(rest: &[String]) -> ExitCode {
     let use_gc = rest.iter().any(|a| a == "--gc");
+    let no_cache = rest.iter().any(|a| a == "--no-cache");
     let stack_mib: u32 = rest
         .iter()
         .position(|a| a == "--stack-mib")
@@ -667,6 +684,31 @@ fn cmd_build(rest: &[String]) -> ExitCode {
         eprintln!("{}", loaded.render_error(&d));
         return ExitCode::FAILURE;
     }
+    // incremental compilation: the cache key covers the whole source bundle
+    // (entry file + imports + std), compiler version, backend, and flags
+    let cache_key = {
+        let mut input = loaded.bundle.clone().into_bytes();
+        input.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
+        input.extend_from_slice(if use_gc { b"gc" } else { b"linear" });
+        input.extend_from_slice(&stack_mib.to_le_bytes());
+        fnv1a64(&input)
+    };
+    let cache_dir = std::env::temp_dir().join("machino-build-cache");
+    let cache_file = cache_dir.join(format!("{:016x}.wasm", cache_key));
+    if !no_cache {
+        if let Ok(bytes) = std::fs::read(&cache_file) {
+            return match std::fs::write(&out_path, &bytes) {
+                Ok(()) => {
+                    println!("wrote {} ({} bytes, cached)", out_path, bytes.len());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: cannot write '{}': {}", out_path, e);
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    }
     let bytes = if use_gc {
         match wasmgc::compile(&loaded.program) {
             Ok(b) => b,
@@ -678,6 +720,11 @@ fn cmd_build(rest: &[String]) -> ExitCode {
     } else {
         wasm::compile_with_stack(&loaded.program, &loaded.bundle, stack_mib * 1024 * 1024)
     };
+    if !no_cache {
+        // best-effort: a failed cache write must not fail the build
+        let _ = std::fs::create_dir_all(&cache_dir)
+            .and_then(|()| std::fs::write(&cache_file, &bytes));
+    }
     match std::fs::write(&out_path, &bytes) {
         Ok(()) => {
             println!("wrote {} ({} bytes)", out_path, bytes.len());

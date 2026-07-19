@@ -62,7 +62,8 @@ fn safe_div(a: int, b: int) -> int
 }
 
 # generics: constraints are Eq (== !=), Ord (< <= > >=), Num (+ - * /);
-# type arguments are inferred at each call site
+# type arguments are inferred at each call site; combine bounds with +
+# or a where clause: fn<T> f(x: T) -> T where T: Ord + Num { ... }
 fn<T: Ord> max2(a: T, b: T) -> T {
     if a > b {
         return a
@@ -157,8 +158,9 @@ test "output" expects "hello\n5" {
 `print(x)`, `len(x)`, `push(xs, v)`, `to_float(i)`, `to_int(f)`,
 `char_at(s, i)` (byte as int), `substr(s, a, b)`, `chr(byte)`,
 `spawn(f, args...)` -> task handle, `join_int(h)` / `join_float(h)` /
-`join_bool(h)` / `join_str(h)` (concurrency; interpreter only — `machino
-build` rejects them)
+`join_bool(h)` / `join_str(h)` (shared-nothing concurrency; works in the
+interpreter and in compiled WASM — compiled spawn targets must be named
+top-level functions)
 
 ## Standard prelude (always available, names reserved)
 
@@ -242,9 +244,10 @@ imported names stay global (collisions are errors).
 - `machino fuzz file.mno [--runs N]` — random-input testing driven by
   contracts; reports the failing input when a contract or trap fires
 - `machino check file.mno --verify` — static contract proofs with Z3 for
-  loop-free, call-free int/bool functions (build with `--features smt`)
-- `machino build file.mno --gc` — experimental WASM-GC backend (scalars,
-  strings, arrays; no structs/enums/closures yet, E070)
+  int/bool functions; calls are inlined and constant `for` loops unrolled
+  (build with `--features smt`)
+- `machino build file.mno --gc` — WASM-GC backend, full language support;
+  run with `node runners/run-gc.mjs` (Node 22+)
 
 ## Error codes you will see most
 
@@ -271,5 +274,5 @@ compiled binary, with the same messages as the interpreter.
 
 The compiled module includes a mark-sweep garbage collector: loops that
 allocate freely (string building, `push` in a loop, closures) run in bounded
-memory. Memory is capped at 1 GiB; a program whose *live* data exceeds that
+memory. Memory is capped at 4 GiB; a program whose *live* data exceeds that
 traps with `out of memory`.

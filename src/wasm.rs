@@ -458,7 +458,6 @@ const IMP_PRINT_I64: u32 = 1;
 const IMP_PRINT_F64: u32 = 2;
 const IMP_PRINT_BOOL: u32 = 3;
 const IMP_PRINT_STR: u32 = 4;
-const N_RUNTIME_IMPORTS: u32 = 5;
 const N_HELPERS: u32 = 21;
 
 pub struct WasmCompiler<'a> {
@@ -550,10 +549,6 @@ impl FnCtx {
 enum Saved {
     Scalar(u32),
     Ptr(u32),
-}
-
-pub fn compile(program: &Program, source: &str) -> Vec<u8> {
-    compile_with_stack(program, source, DEFAULT_SHADOW_BYTES)
 }
 
 /// Compile with an explicit shadow-stack size (for `--stack-mib`).

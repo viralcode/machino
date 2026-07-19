@@ -2056,22 +2056,6 @@ pub fn always_returns(stmts: &[Stmt]) -> bool {
     false
 }
 
-/// Extract variable bindings from a pattern.
-/// The type is determined contextually by the scrutinee type.
-fn pattern_bindings_with_type(pat: &Pattern, ty: &Type) -> Vec<(String, Type)> {
-    match pat {
-        Pattern::Wildcard => vec![],
-        Pattern::Var(name) => vec![(name.clone(), ty.clone())],
-        Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => vec![],
-        Pattern::Variant(_, _) => vec![],
-        Pattern::VariantPayload(_enum_name, _variant_name, inner) => {
-            // the inner pattern binds to the payload type
-            // we need to look up the payload type, but for now we'll handle it in the caller
-            pattern_bindings_with_type(inner, ty)
-        }
-    }
-}
-
 /// Check if a set of patterns exhaustively covers a type.
 /// Simplified exhaustiveness checking:
 /// - For int/float/str/bool: only accept if there's a wildcard or var

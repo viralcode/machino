@@ -348,6 +348,7 @@ pub struct Contract {
 pub struct TypeParam {
     pub name: String,
     pub bounds: Vec<String>,
+    #[allow(dead_code)]
     pub span: Span,
 }
 
@@ -383,6 +384,7 @@ pub struct EnumDef {
     /// Generic type parameters (e.g., [T] for enum<T>).
     pub type_params: Vec<TypeParam>,
     pub variants: Vec<EnumVariant>,
+    #[allow(dead_code)]
     pub is_std: bool,
     pub span: Span,
 }

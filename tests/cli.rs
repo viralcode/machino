@@ -225,6 +225,45 @@ fn wasm_output_matches_interpreter_in_node() {
     }
 }
 
+#[test]
+fn wasm_gc_backend_matches_interpreter_in_node() {
+    // WASM-GC needs Node 22+; skipped silently if node is not installed
+    if Command::new("node").arg("--version").output().is_err() {
+        return;
+    }
+    for ex in ["fib", "sort", "structs", "higher_order", "closures"] {
+        let wasm = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("gc_{}.wasm", ex));
+        let out = machino(&[
+            "build",
+            "--gc",
+            &format!("examples/{}.mno", ex),
+            "-o",
+            wasm.to_str().unwrap(),
+        ]);
+        assert!(
+            out.status.success(),
+            "gc build failed for {}: {}",
+            ex,
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let interp_out = stdout(&machino(&["run", &format!("examples/{}.mno", ex)]));
+        let node_out = Command::new("node")
+            .arg("runners/run-gc.mjs")
+            .arg(wasm.to_str().unwrap())
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            interp_out,
+            String::from_utf8_lossy(&node_out.stdout),
+            "wasm-gc/interpreter divergence for {}: {}",
+            ex,
+            String::from_utf8_lossy(&node_out.stderr)
+        );
+    }
+}
+
 // ---- v0.2 features ----
 
 /// Runs a program in the interpreter AND as compiled wasm under Node,
@@ -851,16 +890,45 @@ fn main() {
 }
 
 #[test]
-fn build_rejects_concurrency() {
+fn build_compiles_concurrency_and_runs_it() {
     let path = write_temp(
         "spawnbuild.mno",
-        "fn f(n: int) -> int {\n    return n\n}\n\nfn main() {\n    let h = spawn(f, 1)\n    print(join_int(h))\n}\n",
+        "fn f(n: int) -> int {\n    return n * 2\n}\n\nfn main() {\n    let h = spawn(f, 21)\n    print(join_int(h))\n}\n",
     );
     let wasm = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("spawnbuild.wasm");
     let out = machino(&["build", path.to_str().unwrap(), "-o", wasm.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // skipped silently if node is not installed
+    if Command::new("node").arg("--version").output().is_ok() {
+        let run = Command::new("node")
+            .args(["runners/run.mjs", wasm.to_str().unwrap()])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(stdout(&run), "42\n");
+    }
+}
+
+#[test]
+fn build_rejects_lambda_spawn_target() {
+    let path = write_temp(
+        "spawnlambda.mno",
+        "fn main() {\n    let f = fn(n: int) -> int {\n        return n\n    }\n    let h = spawn(f, 1)\n    print(join_int(h))\n}\n",
+    );
+    let wasm = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("spawnlambda.wasm");
+    let out = machino(&["build", path.to_str().unwrap(), "-o", wasm.to_str().unwrap()]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(err.contains("E072"), "{}", err);
+    assert!(err.contains("E074"), "{}", err);
 }
 
 #[test]
