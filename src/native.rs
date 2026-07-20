@@ -2149,17 +2149,36 @@ pub fn compile_native(
     let _ = std::fs::copy(&rt_h, &hdr_dst);
 
     let clang = std::env::var("MACHINO_CC").unwrap_or_else(|_| "clang".into());
+    // On Windows, clang often appends .exe only when the output looks like a
+    // basename; normalize so tests and users get a real runnable path.
+    let out_exe_buf;
+    let out_exe = if cfg!(windows)
+        && out_exe
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("exe"))
+            != Some(true)
+    {
+        out_exe_buf = out_exe.with_extension("exe");
+        out_exe_buf.as_path()
+    } else {
+        out_exe
+    };
     let mut compile_args = vec![
         "-O3".to_string(),
         "-ffunction-sections".to_string(),
         "-fdata-sections".to_string(),
-        "-pthread".to_string(),
         "-std=c11".to_string(),
         "-o".to_string(),
         out_exe.to_str().unwrap_or("a.out").to_string(),
         c_path.to_str().unwrap_or("program.c").to_string(),
         rt_c.to_str().unwrap_or("machino_rt.c").to_string(),
     ];
+    if cfg!(windows) {
+        compile_args.push("-lws2_32".to_string());
+    } else {
+        compile_args.insert(3, "-pthread".to_string());
+    }
     // LTO when supported (see native_lto_supported). Override with MACHINO_LTO=0/1.
     if native_lto_supported(&clang) {
         compile_args.insert(1, "-flto".to_string());
@@ -2207,20 +2226,21 @@ pub fn compile_native(
 
     // Also emit LLVM IR for the program TU (inspection / tooling).
     let ll_path = work.join("program.ll");
-    let ll_status = Command::new(&clang)
-        .args([
-            "-O3",
-            "-pthread",
-            "-std=c11",
-            "-S",
-            "-emit-llvm",
-            "-o",
-            ll_path.to_str().unwrap_or("program.ll"),
-            c_path.to_str().unwrap_or("program.c"),
-            "-I",
-            work.to_str().unwrap_or("."),
-        ])
-        .status();
+    let mut ll_args = vec![
+        "-O3".to_string(),
+        "-std=c11".to_string(),
+        "-S".to_string(),
+        "-emit-llvm".to_string(),
+        "-o".to_string(),
+        ll_path.to_str().unwrap_or("program.ll").to_string(),
+        c_path.to_str().unwrap_or("program.c").to_string(),
+        "-I".to_string(),
+        work.to_str().unwrap_or(".").to_string(),
+    ];
+    if !cfg!(windows) {
+        ll_args.insert(1, "-pthread".to_string());
+    }
+    let ll_status = Command::new(&clang).args(&ll_args).status();
     let ll_path = match ll_status {
         Ok(s) if s.success() => Some(ll_path),
         _ => None,

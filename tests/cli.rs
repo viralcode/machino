@@ -1094,6 +1094,15 @@ fn main() {}
     );
 }
 
+fn native_exe_path(bin: &str) -> PathBuf {
+    let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(bin);
+    if cfg!(windows) {
+        p.with_extension("exe")
+    } else {
+        p
+    }
+}
+
 #[test]
 fn build_native_llvm_smoke() {
     if Command::new("clang").arg("--version").output().is_err() {
@@ -1103,7 +1112,7 @@ fn build_native_llvm_smoke() {
         "native_llvm.mno",
         "fn main() {\n    print(1 + 1)\n}\n",
     );
-    let exe = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native_llvm_bin");
+    let exe = native_exe_path("native_llvm_bin");
     let _ = std::fs::remove_file(&exe);
     let out = machino(&[
         "build",
@@ -1127,7 +1136,7 @@ fn build_native_llvm_smoke() {
 fn native_build_run(src: &str, bin: &str) -> (bool, String, String) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let path = dir.join(src);
-    let exe = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(bin);
+    let exe = native_exe_path(bin);
     let _ = std::fs::remove_file(&exe);
     let out = machino(&[
         "build",
@@ -1181,7 +1190,7 @@ fn main() {
 }
 "#,
     );
-    let exe = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native_cycle_gc_bin");
+    let exe = native_exe_path("native_cycle_gc_bin");
     let _ = std::fs::remove_file(&exe);
     let out = machino(&[
         "build",
@@ -1284,7 +1293,7 @@ fn build_native_target_host_triple() {
         return;
     }
     let path = write_temp("native_tgt.mno", "fn main() {\n    print(9)\n}\n");
-    let exe = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native_tgt_bin");
+    let exe = native_exe_path("native_tgt_bin");
     let _ = std::fs::remove_file(&exe);
     // Use the compiler's default target via an explicit empty skip — pass
     // a known-good apple/linux host triple from `clang -dumpmachine`.

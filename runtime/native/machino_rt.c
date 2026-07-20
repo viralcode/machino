@@ -8,25 +8,150 @@
 
 #include "machino_rt.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <math.h>
-#include <netinet/in.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <io.h>
+#include <process.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")
+#endif
+typedef SOCKET mno_sock_t;
+#define MNO_INVALID_SOCK INVALID_SOCKET
+typedef HANDLE mno_thread_t;
+typedef CRITICAL_SECTION mno_mutex_t;
+typedef CONDITION_VARIABLE mno_cond_t;
+typedef long long mno_ssize_t;
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <time.h>
 #include <unistd.h>
+typedef int mno_sock_t;
+#define MNO_INVALID_SOCK (-1)
+typedef pthread_t mno_thread_t;
+typedef pthread_mutex_t mno_mutex_t;
+typedef pthread_cond_t mno_cond_t;
+typedef ssize_t mno_ssize_t;
+#endif
 
 const char *mno_fail_msg = NULL;
 
 static int g_argc = 0;
 static char **g_argv = NULL;
+
+/* ---- platform threading / IO ---- */
+
+#ifdef _WIN32
+typedef struct {
+    void *(*fn)(void *);
+    void *arg;
+} MnoThreadLaunch;
+
+static DWORD WINAPI mno_thread_trampoline(LPVOID p) {
+    MnoThreadLaunch launch = *(MnoThreadLaunch *)p;
+    free(p);
+    launch.fn(launch.arg);
+    return 0;
+}
+
+static int mno_thread_spawn_impl(mno_thread_t *out, void *(*fn)(void *), void *arg) {
+    MnoThreadLaunch *launch = (MnoThreadLaunch *)malloc(sizeof(MnoThreadLaunch));
+    if (!launch) {
+        return -1;
+    }
+    launch->fn = fn;
+    launch->arg = arg;
+    HANDLE th = CreateThread(NULL, 0, mno_thread_trampoline, launch, 0, NULL);
+    if (!th) {
+        free(launch);
+        return -1;
+    }
+    *out = th;
+    return 0;
+}
+
+static int mno_thread_join(mno_thread_t th) {
+    DWORD rc = WaitForSingleObject(th, INFINITE);
+    CloseHandle(th);
+    return rc == WAIT_OBJECT_0 ? 0 : -1;
+}
+
+static int mno_mutex_init(mno_mutex_t *m) {
+    InitializeCriticalSection(m);
+    return 0;
+}
+
+static void mno_mutex_lock(mno_mutex_t *m) { EnterCriticalSection(m); }
+
+static void mno_mutex_unlock(mno_mutex_t *m) { LeaveCriticalSection(m); }
+
+static int mno_cond_init(mno_cond_t *c) {
+    InitializeConditionVariable(c);
+    return 0;
+}
+
+static void mno_cond_wait(mno_cond_t *c, mno_mutex_t *m) {
+    (void)SleepConditionVariableCS(c, m, INFINITE);
+}
+
+static void mno_cond_signal(mno_cond_t *c) { WakeConditionVariable(c); }
+
+static void mno_cond_broadcast(mno_cond_t *c) { WakeAllConditionVariable(c); }
+
+static int mno_file_accessible(const char *path) { return _access(path, 0) == 0; }
+
+static FILE *mno_popen_cmd(const char *cmd) { return _popen(cmd, "r"); }
+
+static int mno_pclose_cmd(FILE *f) { return _pclose(f); }
+
+static void mno_sock_close(mno_sock_t s) { closesocket(s); }
+#else
+static int mno_thread_spawn_impl(mno_thread_t *out, void *(*fn)(void *), void *arg) {
+    return pthread_create(out, NULL, fn, arg);
+}
+
+static int mno_thread_join(mno_thread_t th) { return pthread_join(th, NULL); }
+
+static int mno_mutex_init(mno_mutex_t *m) { return pthread_mutex_init(m, NULL); }
+
+static void mno_mutex_lock(mno_mutex_t *m) { (void)pthread_mutex_lock(m); }
+
+static void mno_mutex_unlock(mno_mutex_t *m) { (void)pthread_mutex_unlock(m); }
+
+static int mno_cond_init(mno_cond_t *c) { return pthread_cond_init(c, NULL); }
+
+static void mno_cond_wait(mno_cond_t *c, mno_mutex_t *m) {
+    (void)pthread_cond_wait(c, m);
+}
+
+static void mno_cond_signal(mno_cond_t *c) { (void)pthread_cond_signal(c); }
+
+static void mno_cond_broadcast(mno_cond_t *c) { (void)pthread_cond_broadcast(c); }
+
+static int mno_file_accessible(const char *path) { return access(path, F_OK) == 0; }
+
+static FILE *mno_popen_cmd(const char *cmd) { return popen(cmd, "r"); }
+
+static int mno_pclose_cmd(FILE *f) { return pclose(f); }
+
+static void mno_sock_close(mno_sock_t s) { (void)close(s); }
+#endif
 
 /* ---- object tags (low 3 bits of meta word 0) ---- */
 enum {
@@ -263,6 +388,18 @@ void mno_fail(const char *msg) {
 void mno_init(int argc, char **argv) {
     g_argc = argc;
     g_argv = argv;
+#ifdef _WIN32
+    {
+        static int wsa_ready = 0;
+        if (!wsa_ready) {
+            WSADATA wsa;
+            if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+                mno_fail("runtime error: WSAStartup failed");
+            }
+            wsa_ready = 1;
+        }
+    }
+#endif
 }
 
 /* ---- checked integer arithmetic ---- */
@@ -872,10 +1009,10 @@ mno_i64 mno_value_clone(mno_i64 v, char kind) {
     }
 }
 
-/* ---- tasks (pthreads) ---- */
+/* ---- tasks ---- */
 
 typedef struct {
-    pthread_t thread;
+    mno_thread_t thread;
     int in_use;
     int joined;
     int spawn_ok;
@@ -966,7 +1103,7 @@ mno_i64 mno_task_spawn(
     slot->argc = argc;
     slot->ret_kind = ret_kind;
     slot->argv = mno_task_argv_copy(argv, argc, arg_kinds);
-    slot->spawn_ok = (pthread_create(&slot->thread, NULL, mno_task_entry, slot) == 0);
+    slot->spawn_ok = (mno_thread_spawn_impl(&slot->thread, mno_task_entry, slot) == 0);
     if (!slot->spawn_ok) {
         free(slot->argv);
         slot->argv = NULL;
@@ -984,7 +1121,7 @@ static mno_i64 mno_task_do_join(mno_i64 h, const char *op) {
     if (!slot->spawn_ok) {
         mno_fail("runtime error: task spawn failed");
     }
-    int rc = pthread_join(slot->thread, NULL);
+    int rc = mno_thread_join(slot->thread);
     if (rc != 0) {
         slot->in_use = 0;
         mno_fail("runtime error: task join failed");
@@ -1044,8 +1181,8 @@ typedef struct MnoChanNode {
 typedef struct {
     int in_use;
     int closed;
-    pthread_mutex_t mu;
-    pthread_cond_t not_empty;
+    mno_mutex_t mu;
+    mno_cond_t not_empty;
     MnoChanNode *head;
     MnoChanNode *tail;
 } MnoChanSlot;
@@ -1058,8 +1195,7 @@ static mno_i64 mno_chan_alloc(void) {
         if (!g_chans[i].in_use) {
             MnoChanSlot *slot = &g_chans[i];
             memset(slot, 0, sizeof(MnoChanSlot));
-            if (pthread_mutex_init(&slot->mu, NULL) != 0 ||
-                pthread_cond_init(&slot->not_empty, NULL) != 0) {
+            if (mno_mutex_init(&slot->mu) != 0 || mno_cond_init(&slot->not_empty) != 0) {
                 mno_fail("runtime error: channel init failed");
             }
             slot->in_use = 1;
@@ -1110,7 +1246,7 @@ static void mno_chan_enqueue(MnoChanSlot *slot, char kind, mno_i64 payload) {
         slot->head = node;
     }
     slot->tail = node;
-    pthread_cond_signal(&slot->not_empty);
+    mno_cond_signal(&slot->not_empty);
 }
 
 static MnoChanNode *mno_chan_dequeue(MnoChanSlot *slot) {
@@ -1130,93 +1266,93 @@ mno_i64 mno_chan_new(void) { return mno_chan_alloc(); }
 
 void mno_chan_close(mno_i64 id) {
     MnoChanSlot *slot = mno_chan_slot(id, "chan_close");
-    pthread_mutex_lock(&slot->mu);
+    mno_mutex_lock(&slot->mu);
     slot->closed = 1;
-    pthread_cond_broadcast(&slot->not_empty);
-    pthread_mutex_unlock(&slot->mu);
+    mno_cond_broadcast(&slot->not_empty);
+    mno_mutex_unlock(&slot->mu);
 }
 
 static void mno_chan_send_locked(MnoChanSlot *slot, char kind, mno_i64 payload, const char *op) {
     if (slot->closed) {
-        pthread_mutex_unlock(&slot->mu);
+        mno_mutex_unlock(&slot->mu);
         mno_chan_fail_closed(op);
     }
     mno_chan_enqueue(slot, kind, payload);
-    pthread_mutex_unlock(&slot->mu);
+    mno_mutex_unlock(&slot->mu);
 }
 
 void mno_chan_send_i64(mno_i64 id, mno_i64 v) {
     MnoChanSlot *slot = mno_chan_slot(id, "chan_send_i64");
-    pthread_mutex_lock(&slot->mu);
+    mno_mutex_lock(&slot->mu);
     mno_chan_send_locked(slot, CHAN_VAL_I64, v, "chan_send_i64");
 }
 
 void mno_chan_send_f64(mno_i64 id, mno_f64 v) {
     MnoChanSlot *slot = mno_chan_slot(id, "chan_send_f64");
-    pthread_mutex_lock(&slot->mu);
+    mno_mutex_lock(&slot->mu);
     mno_chan_send_locked(slot, CHAN_VAL_F64, mno_f64_to_bits(v), "chan_send_f64");
 }
 
 void mno_chan_send_str(mno_i64 id, mno_i64 s) {
     MnoChanSlot *slot = mno_chan_slot(id, "chan_send_str");
     mno_i64 owned = s ? mno_str_clone(s) : 0;
-    pthread_mutex_lock(&slot->mu);
+    mno_mutex_lock(&slot->mu);
     mno_chan_send_locked(slot, CHAN_VAL_STR, owned, "chan_send_str");
 }
 
 static MnoChanNode *mno_chan_recv_wait(MnoChanSlot *slot, const char *op) {
     while (!slot->head) {
         if (slot->closed) {
-            pthread_mutex_unlock(&slot->mu);
+            mno_mutex_unlock(&slot->mu);
             mno_chan_fail_recv_closed(op);
         }
-        pthread_cond_wait(&slot->not_empty, &slot->mu);
+        mno_cond_wait(&slot->not_empty, &slot->mu);
     }
     return mno_chan_dequeue(slot);
 }
 
 mno_i64 mno_chan_recv_i64(mno_i64 id) {
     MnoChanSlot *slot = mno_chan_slot(id, "chan_recv_i64");
-    pthread_mutex_lock(&slot->mu);
+    mno_mutex_lock(&slot->mu);
     MnoChanNode *node = mno_chan_recv_wait(slot, "chan_recv_i64");
     if (node->kind != CHAN_VAL_I64) {
         free(node);
-        pthread_mutex_unlock(&slot->mu);
+        mno_mutex_unlock(&slot->mu);
         mno_fail("runtime error: channel receive kind mismatch");
     }
     mno_i64 out = node->payload;
     free(node);
-    pthread_mutex_unlock(&slot->mu);
+    mno_mutex_unlock(&slot->mu);
     return out;
 }
 
 mno_f64 mno_chan_recv_f64(mno_i64 id) {
     MnoChanSlot *slot = mno_chan_slot(id, "chan_recv_f64");
-    pthread_mutex_lock(&slot->mu);
+    mno_mutex_lock(&slot->mu);
     MnoChanNode *node = mno_chan_recv_wait(slot, "chan_recv_f64");
     if (node->kind != CHAN_VAL_F64) {
         free(node);
-        pthread_mutex_unlock(&slot->mu);
+        mno_mutex_unlock(&slot->mu);
         mno_fail("runtime error: channel receive kind mismatch");
     }
     mno_f64 out = mno_bits_to_f64(node->payload);
     free(node);
-    pthread_mutex_unlock(&slot->mu);
+    mno_mutex_unlock(&slot->mu);
     return out;
 }
 
 mno_i64 mno_chan_recv_str(mno_i64 id) {
     MnoChanSlot *slot = mno_chan_slot(id, "chan_recv_str");
-    pthread_mutex_lock(&slot->mu);
+    mno_mutex_lock(&slot->mu);
     MnoChanNode *node = mno_chan_recv_wait(slot, "chan_recv_str");
     if (node->kind != CHAN_VAL_STR) {
         free(node);
-        pthread_mutex_unlock(&slot->mu);
+        mno_mutex_unlock(&slot->mu);
         mno_fail("runtime error: channel receive kind mismatch");
     }
     mno_i64 out = node->payload;
     free(node);
-    pthread_mutex_unlock(&slot->mu);
+    mno_mutex_unlock(&slot->mu);
     return out;
 }
 
@@ -1423,7 +1559,7 @@ mno_i64 mno_getenv(mno_i64 name) {
 
 mno_i64 mno_clock_ms(void) {
     struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+    if (timespec_get(&ts, TIME_UTC) != TIME_UTC) {
         return 0;
     }
     return (mno_i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
@@ -1433,11 +1569,15 @@ void mno_sleep_ms(mno_i64 ms) {
     if (ms <= 0) {
         return;
     }
+#ifdef _WIN32
+    Sleep((DWORD)(ms > (mno_i64)0xffffffff ? 0xffffffff : ms));
+#else
     struct timespec req;
     req.tv_sec = (time_t)(ms / 1000);
     req.tv_nsec = (long)(ms % 1000) * 1000000L;
     while (nanosleep(&req, &req) != 0 && errno == EINTR) {
     }
+#endif
 }
 
 static mno_i64 mno_read_all(FILE *f, size_t initial) {
@@ -1497,7 +1637,7 @@ mno_i64 mno_write_file(mno_i64 path, mno_i64 data) {
 
 mno_i64 mno_file_exists(mno_i64 path) {
     char *p = mno_cstr_from_str(path);
-    int ok = access(p, F_OK) == 0;
+    int ok = mno_file_accessible(p);
     free(p);
     return ok ? 1 : 0;
 }
@@ -1559,21 +1699,25 @@ mno_i64 mno_http_get(mno_i64 url) {
     char escaped[8192];
     mno_shell_escape(u, escaped, sizeof(escaped));
     char cmd[8704];
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "curl -sfL --max-time 30 %s 2>NUL", escaped);
+#else
     snprintf(cmd, sizeof(cmd), "curl -sfL --max-time 30 %s 2>/dev/null", escaped);
-    FILE *p = popen(cmd, "r");
+#endif
+    FILE *p = mno_popen_cmd(cmd);
     free(u);
     if (!p) {
         return mno_str_from_bytes("", 0);
     }
     mno_i64 body = mno_read_all(p, 4096);
-    pclose(p);
+    (void)mno_pclose_cmd(p);
     return body;
 }
 
-/* ---- TCP (POSIX sockets) ---- */
+/* ---- TCP ---- */
 
 typedef struct {
-    int fd;
+    mno_sock_t fd;
     int is_listener;
     int in_use;
 } MnoTcpSlot;
@@ -1581,7 +1725,17 @@ typedef struct {
 static MnoTcpSlot *g_tcp = NULL;
 static size_t g_tcp_cap = 0;
 
-static mno_i64 mno_tcp_alloc(int fd, int is_listener) {
+static const char *mno_sock_err(void) {
+#ifdef _WIN32
+    static char buf[64];
+    snprintf(buf, sizeof(buf), "WSA error %d", WSAGetLastError());
+    return buf;
+#else
+    return strerror(errno);
+#endif
+}
+
+static mno_i64 mno_tcp_alloc(mno_sock_t fd, int is_listener) {
     for (size_t i = 1; i < g_tcp_cap; i++) {
         if (!g_tcp[i].in_use) {
             g_tcp[i].fd = fd;
@@ -1594,7 +1748,7 @@ static mno_i64 mno_tcp_alloc(int fd, int is_listener) {
     g_tcp = (MnoTcpSlot *)mno_xrealloc(g_tcp, new_cap * sizeof(MnoTcpSlot));
     for (size_t i = g_tcp_cap; i < new_cap; i++) {
         g_tcp[i].in_use = 0;
-        g_tcp[i].fd = -1;
+        g_tcp[i].fd = MNO_INVALID_SOCK;
         g_tcp[i].is_listener = 0;
     }
     g_tcp_cap = new_cap;
@@ -1621,15 +1775,19 @@ mno_i64 mno_tcp_listen(mno_i64 port) {
         snprintf(msg, sizeof(msg), "tcp_listen: cannot bind port %" PRId64 ": invalid port", port);
         mno_fail(msg);
     }
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    mno_sock_t fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd == MNO_INVALID_SOCK) {
         char msg[128];
         snprintf(msg, sizeof(msg), "tcp_listen: cannot bind port %" PRId64 ": %s", port,
-                 strerror(errno));
+                 mno_sock_err());
         mno_fail(msg);
     }
     int yes = 1;
+#ifdef _WIN32
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+#else
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#endif
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -1638,15 +1796,15 @@ mno_i64 mno_tcp_listen(mno_i64 port) {
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         char msg[128];
         snprintf(msg, sizeof(msg), "tcp_listen: cannot bind port %" PRId64 ": %s", port,
-                 strerror(errno));
-        close(fd);
+                 mno_sock_err());
+        mno_sock_close(fd);
         mno_fail(msg);
     }
     if (listen(fd, 128) != 0) {
         char msg[128];
         snprintf(msg, sizeof(msg), "tcp_listen: cannot bind port %" PRId64 ": %s", port,
-                 strerror(errno));
-        close(fd);
+                 mno_sock_err());
+        mno_sock_close(fd);
         mno_fail(msg);
     }
     return mno_tcp_alloc(fd, 1);
@@ -1655,11 +1813,15 @@ mno_i64 mno_tcp_listen(mno_i64 port) {
 mno_i64 mno_tcp_accept(mno_i64 listener) {
     MnoTcpSlot *slot = mno_tcp_slot(listener, 1, "tcp_accept");
     struct sockaddr_in peer;
+#ifdef _WIN32
+    int plen = (int)sizeof(peer);
+#else
     socklen_t plen = sizeof(peer);
-    int cfd = accept(slot->fd, (struct sockaddr *)&peer, &plen);
-    if (cfd < 0) {
+#endif
+    mno_sock_t cfd = accept(slot->fd, (struct sockaddr *)&peer, &plen);
+    if (cfd == MNO_INVALID_SOCK) {
         char msg[256];
-        snprintf(msg, sizeof(msg), "tcp_accept: %s", strerror(errno));
+        snprintf(msg, sizeof(msg), "tcp_accept: %s", mno_sock_err());
         mno_fail(msg);
     }
     return mno_tcp_alloc(cfd, 0);
@@ -1668,10 +1830,10 @@ mno_i64 mno_tcp_accept(mno_i64 listener) {
 mno_i64 mno_tcp_read(mno_i64 conn) {
     MnoTcpSlot *slot = mno_tcp_slot(conn, 0, "tcp_read");
     char buf[65536];
-    ssize_t n = recv(slot->fd, buf, sizeof(buf), 0);
+    mno_ssize_t n = (mno_ssize_t)recv(slot->fd, buf, sizeof(buf), 0);
     if (n < 0) {
         char msg[256];
-        snprintf(msg, sizeof(msg), "tcp_read: %s", strerror(errno));
+        snprintf(msg, sizeof(msg), "tcp_read: %s", mno_sock_err());
         mno_fail(msg);
     }
     if (n == 0) {
@@ -1686,10 +1848,10 @@ mno_i64 mno_tcp_write(mno_i64 conn, mno_i64 data) {
     const char *bytes = mno_str_bytes(data, &len);
     size_t off = 0;
     while (off < (size_t)len) {
-        ssize_t n = send(slot->fd, bytes + off, (size_t)len - off, 0);
+        mno_ssize_t n = (mno_ssize_t)send(slot->fd, bytes + off, (size_t)len - off, 0);
         if (n < 0) {
             char msg[256];
-            snprintf(msg, sizeof(msg), "tcp_write: %s", strerror(errno));
+            snprintf(msg, sizeof(msg), "tcp_write: %s", mno_sock_err());
             mno_fail(msg);
         }
         off += (size_t)n;
@@ -1701,7 +1863,7 @@ void mno_tcp_close(mno_i64 handle) {
     if (handle <= 0 || (size_t)handle >= g_tcp_cap || !g_tcp[handle].in_use) {
         return;
     }
-    close(g_tcp[handle].fd);
+    mno_sock_close(g_tcp[handle].fd);
     g_tcp[handle].in_use = 0;
-    g_tcp[handle].fd = -1;
+    g_tcp[handle].fd = MNO_INVALID_SOCK;
 }

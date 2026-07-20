@@ -73,7 +73,8 @@ The following mirror `machino run` / WASM host imports (declare with
 - `mno_closure_*`, `mno_value_clone`, `mno_task_*`, `mno_chan_*` (closures, deep copy,
   pthread tasks, and channels — require `-pthread`)
 
-Requires POSIX (macOS, Linux). No dependencies beyond libc and libpthread.
+Supports macOS, Linux, and Windows (Winsock2 + Win32 threads). Link with
+`-pthread` on Unix and `-lws2_32` on Windows.
 
 ## Smoke test
 
